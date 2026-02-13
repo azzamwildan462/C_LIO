@@ -6,6 +6,7 @@
  * University of California, Los Angeles                   *
  *                                                         *
  * Authors: Kenny J. Chen, Ryan Nemiroff, Brett T. Lopez   *
+ *          Azzam Wildan M (SCLC extensions)               *
  * Contact: {kennyjchen, ryguyn, btlopez}@ucla.edu         *
  *                                                         *
  ***********************************************************/
@@ -14,6 +15,7 @@
 
 // ROS
 #include "rclcpp/rclcpp.hpp"
+#include <direct_lidar_inertial_odometry/msg/keyframe_stamped.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/pose_array.hpp>
@@ -38,17 +40,17 @@
 #include <pcl/surface/convex_hull.h>
 #include <pcl_conversions/pcl_conversions.h>
 
-class dlio::OdomNode: public rclcpp::Node {
+class dlio::OdomNode : public rclcpp::Node
+{
 
 public:
-
-  OdomNode();
+  explicit OdomNode(const rclcpp::NodeOptions &options = rclcpp::NodeOptions());
   ~OdomNode();
 
   void start();
+  bool saveKeyframeDatabase(); // public for atexit handler
 
 private:
-
   struct State;
   struct ImuMeas;
 
@@ -62,9 +64,12 @@ private:
   void publishToROS(pcl::PointCloud<PointType>::ConstPtr published_cloud, Eigen::Matrix4f T_cloud);
   void publishCloud(pcl::PointCloud<PointType>::ConstPtr published_cloud, Eigen::Matrix4f T_cloud);
   void publishKeyframe(std::pair<std::pair<Eigen::Vector3f, Eigen::Quaternionf>,
-                       pcl::PointCloud<PointType>::ConstPtr> kf, rclcpp::Time timestamp);
+                                 pcl::PointCloud<PointType>::ConstPtr>
+                           kf,
+                       rclcpp::Time timestamp,
+                       pcl::PointCloud<PointType>::ConstPtr local_cloud);
 
-  void getScanFromROS(const sensor_msgs::msg::PointCloud2::SharedPtr& pc);
+  void getScanFromROS(const sensor_msgs::msg::PointCloud2::SharedPtr &pc);
   void preprocessPoints();
   void deskewPointcloud();
   void initializeInputTarget();
@@ -74,16 +79,16 @@ private:
 
   void getNextPose();
   bool imuMeasFromTimeRange(double start_time, double end_time,
-                            boost::circular_buffer<ImuMeas>::reverse_iterator& begin_imu_it,
-                            boost::circular_buffer<ImuMeas>::reverse_iterator& end_imu_it);
+                            boost::circular_buffer<ImuMeas>::reverse_iterator &begin_imu_it,
+                            boost::circular_buffer<ImuMeas>::reverse_iterator &end_imu_it);
   std::vector<Eigen::Matrix4f, Eigen::aligned_allocator<Eigen::Matrix4f>>
-    integrateImu(double start_time, Eigen::Quaternionf q_init, Eigen::Vector3f p_init, Eigen::Vector3f v_init,
-                 const std::vector<double>& sorted_timestamps);
+  integrateImu(double start_time, Eigen::Quaternionf q_init, Eigen::Vector3f p_init, Eigen::Vector3f v_init,
+               const std::vector<double> &sorted_timestamps);
   std::vector<Eigen::Matrix4f, Eigen::aligned_allocator<Eigen::Matrix4f>>
-    integrateImuInternal(Eigen::Quaternionf q_init, Eigen::Vector3f p_init, Eigen::Vector3f v_init,
-                         const std::vector<double>& sorted_timestamps,
-                         boost::circular_buffer<ImuMeas>::reverse_iterator begin_imu_it,
-                         boost::circular_buffer<ImuMeas>::reverse_iterator end_imu_it);
+  integrateImuInternal(Eigen::Quaternionf q_init, Eigen::Vector3f p_init, Eigen::Vector3f v_init,
+                       const std::vector<double> &sorted_timestamps,
+                       boost::circular_buffer<ImuMeas>::reverse_iterator begin_imu_it,
+                       boost::circular_buffer<ImuMeas>::reverse_iterator end_imu_it);
   void propagateGICP();
 
   void propagateState();
@@ -96,7 +101,7 @@ private:
   void computeSpaciousness();
   void computeDensity();
 
-  sensor_msgs::msg::Imu::SharedPtr transformImu(const sensor_msgs::msg::Imu::SharedPtr& imu);
+  sensor_msgs::msg::Imu::SharedPtr transformImu(const sensor_msgs::msg::Imu::SharedPtr &imu);
 
   void updateKeyframes();
   void computeConvexHull();
@@ -105,6 +110,33 @@ private:
   void buildSubmap(State vehicle_state);
   void buildKeyframesAndSubmap(State vehicle_state);
   void pauseSubmapBuildIfNeeded();
+
+  void loadPriorMap();
+
+  // Scan Context Relocalization
+  static constexpr int SC_NR = 20;               // number of rings
+  static constexpr int SC_NS = 60;               // number of sectors
+  using ScanContextDescriptor = Eigen::MatrixXf; // NR x NS
+  using RingKey = Eigen::VectorXf;               // NR
+
+  struct ScanContextEntry
+  {
+    ScanContextDescriptor descriptor;
+    RingKey ring_key;
+    Eigen::Vector3f position;
+    Eigen::Quaternionf orientation;
+  };
+
+  ScanContextDescriptor computeScanContext(pcl::PointCloud<PointType>::ConstPtr cloud, float max_range);
+  RingKey computeRingKey(const ScanContextDescriptor &desc);
+  void buildScanContextDatabase();
+  std::pair<float, int> computeScanContextDistance(const ScanContextDescriptor &a, const ScanContextDescriptor &b);
+  bool runRelocalization(pcl::PointCloud<PointType>::ConstPtr scan);
+
+  // Keyframe Database (KFDB) — save real SC descriptors during mapping
+  std::string getKfdbPath() const;
+  void computeAndStoreKeyframeSC();
+  bool loadKeyframeDatabase();
 
   void debug();
 
@@ -122,6 +154,7 @@ private:
   rclcpp::Publisher<geometry_msgs::msg::PoseArray>::SharedPtr kf_pose_pub;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr kf_cloud_pub;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr deskewed_pub;
+  rclcpp::Publisher<direct_lidar_inertial_odometry::msg::KeyframeStamped>::SharedPtr kf_stamped_pub;
 
   // TF
   std::shared_ptr<tf2_ros::TransformBroadcaster> br;
@@ -154,7 +187,8 @@ private:
 
   // Keyframes
   std::vector<std::pair<std::pair<Eigen::Vector3f, Eigen::Quaternionf>,
-                        pcl::PointCloud<PointType>::ConstPtr>> keyframes;
+                        pcl::PointCloud<PointType>::ConstPtr>>
+      keyframes;
   std::vector<rclcpp::Time> keyframe_timestamps;
   std::vector<std::shared_ptr<const nano_gicp::CovarianceList>> keyframe_normals;
   std::vector<Eigen::Matrix4f, Eigen::aligned_allocator<Eigen::Matrix4f>> keyframe_transformations;
@@ -223,8 +257,10 @@ private:
 
   Eigen::Vector3f origin;
 
-  struct Extrinsics {
-    struct SE3 {
+  struct Extrinsics
+  {
+    struct SE3
+    {
       Eigen::Vector3f t;
       Eigen::Matrix3f R;
     };
@@ -232,7 +268,8 @@ private:
     SE3 baselink2lidar;
     Eigen::Matrix4f baselink2imu_T;
     Eigen::Matrix4f baselink2lidar_T;
-  }; Extrinsics extrinsics;
+  };
+  Extrinsics extrinsics;
 
   // IMU
   rclcpp::Time imu_stamp;
@@ -240,23 +277,27 @@ private:
   double prev_imu_stamp;
   double imu_dp, imu_dq_deg;
 
-  struct ImuMeas {
+  struct ImuMeas
+  {
     double stamp;
     double dt; // defined as the difference between the current and the previous measurement
     Eigen::Vector3f ang_vel;
     Eigen::Vector3f lin_accel;
-  }; ImuMeas imu_meas;
+  };
+  ImuMeas imu_meas;
 
   boost::circular_buffer<ImuMeas> imu_buffer;
   std::mutex mtx_imu;
   std::condition_variable cv_imu_stamp;
 
-  static bool comparatorImu(ImuMeas m1, ImuMeas m2) {
+  static bool comparatorImu(ImuMeas m1, ImuMeas m2)
+  {
     return (m1.stamp < m2.stamp);
   };
 
   // Geometric Observer
-  struct Geo {
+  struct Geo
+  {
     bool first_opt_done;
     std::mutex mtx;
     double dp;
@@ -264,43 +305,52 @@ private:
     Eigen::Vector3f prev_p;
     Eigen::Quaternionf prev_q;
     Eigen::Vector3f prev_vel;
-  }; Geo geo;
+  };
+  Geo geo;
 
   // State Vector
-  struct ImuBias {
+  struct ImuBias
+  {
     Eigen::Vector3f gyro;
     Eigen::Vector3f accel;
   };
 
-  struct Frames {
+  struct Frames
+  {
     Eigen::Vector3f b;
     Eigen::Vector3f w;
   };
 
-  struct Velocity {
+  struct Velocity
+  {
     Frames lin;
     Frames ang;
   };
 
-  struct State {
-    Eigen::Vector3f p; // position in world frame
+  struct State
+  {
+    Eigen::Vector3f p;    // position in world frame
     Eigen::Quaternionf q; // orientation in world frame
     Velocity v;
     ImuBias b; // imu biases in body frame
-  }; State state;
+  };
+  State state;
 
-  struct Pose {
-    Eigen::Vector3f p; // position in world frame
+  struct Pose
+  {
+    Eigen::Vector3f p;    // position in world frame
     Eigen::Quaternionf q; // orientation in world frame
   };
   Pose lidarPose;
   Pose imuPose;
 
   // Metrics
-  struct Metrics {
+  struct Metrics
+  {
     std::vector<float> spaciousness;
     std::vector<float> density;
-  }; Metrics metrics;
+  };
+  Metrics metrics;
 
   std::string cpu_type;
   std::vector<double> cpu_percents;
@@ -363,4 +413,34 @@ private:
   double geo_abias_max_;
   double geo_gbias_max_;
 
+  bool debug_;
+  bool debug_print_;
+
+  // Map load/save
+  std::string map_mode_;
+  std::string map_path_;
+  double map_voxel_size_;
+  double map_chunk_size_;
+  bool use_prior_map_;
+  Eigen::Vector3f initial_position_;
+  float initial_yaw_;
+  bool prior_map_pose_set_;
+  int num_prior_keyframes_;
+
+  // Scan Context Relocalization
+  bool relocalize_;
+  bool relocalized_;
+  float sc_max_range_;
+  int sc_num_candidates_;
+  double sc_distance_threshold_;
+  int sc_max_attempts_;
+  int sc_attempt_count_;
+  std::vector<ScanContextEntry> sc_database_;
+  pcl::PointCloud<PointType>::Ptr prior_map_cloud_;
+  std::shared_ptr<nanoflann::KdTreeFLANN<PointType>> prior_map_kdtree_;
+
+  // KFDB entries accumulated during mapping
+  std::vector<ScanContextEntry> kfdb_entries_;
+  std::mutex kfdb_mutex_;
+  Eigen::Quaternionf kfdb_gravity_q_{1.f, 0.f, 0.f, 0.f}; // gravity quaternion for KFDB SC frame
 };

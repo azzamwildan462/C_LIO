@@ -6,6 +6,7 @@
  * University of California, Los Angeles                   *
  *                                                         *
  * Authors: Kenny J. Chen, Ryan Nemiroff, Brett T. Lopez   *
+ *          Azzam Wildan M (SCLC extensions)               *
  * Contact: {kennyjchen, ryguyn, btlopez}@ucla.edu         *
  *                                                         *
  ***********************************************************/
@@ -26,10 +27,11 @@ class dlio::MapNode: public rclcpp::Node {
 
 public:
 
-  MapNode();
+  explicit MapNode(const rclcpp::NodeOptions& options = rclcpp::NodeOptions());
   ~MapNode();
 
   void start();
+  void saveOnShutdown();
 
 private:
 
@@ -40,17 +42,24 @@ private:
   void savePCD(std::shared_ptr<direct_lidar_inertial_odometry::srv::SavePCD::Request> req,
                std::shared_ptr<direct_lidar_inertial_odometry::srv::SavePCD::Response> res);
 
+  void loadPriorMap();
+  void autoSave();
 
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr keyframe_sub;
   rclcpp::CallbackGroup::SharedPtr keyframe_cb_group, save_pcd_cb_group;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr map_pub;
 
   rclcpp::Service<direct_lidar_inertial_odometry::srv::SavePCD>::SharedPtr save_pcd_srv;
+  rclcpp::TimerBase::SharedPtr auto_save_timer;
 
   pcl::PointCloud<PointType>::Ptr dlio_map;
   pcl::VoxelGrid<PointType> voxelgrid;
 
   std::string odom_frame;
+  std::string map_mode_;
+  std::string map_path_;
+  double map_voxel_size_;
+  double auto_save_interval_;
 
   double leaf_size_;
 

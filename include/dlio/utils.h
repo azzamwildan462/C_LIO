@@ -6,6 +6,7 @@
  * University of California, Los Angeles                   *
  *                                                         *
  * Authors: Kenny J. Chen, Ryan Nemiroff, Brett T. Lopez   *
+ *          Azzam Wildan M (SCLC extensions)               *
  * Contact: {kennyjchen, ryguyn, btlopez}@ucla.edu         *
  *                                                         *
  ***********************************************************/

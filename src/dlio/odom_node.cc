@@ -6,6 +6,7 @@
  * University of California, Los Angeles                   *
  *                                                         *
  * Authors: Kenny J. Chen, Ryan Nemiroff, Brett T. Lopez   *
+ *          Azzam Wildan M (SCLC extensions)               *
  * Contact: {kennyjchen, ryguyn, btlopez}@ucla.edu         *
  *                                                         *
  ***********************************************************/
@@ -15,7 +16,7 @@
 int main(int argc, char** argv) {
 
   rclcpp::init(argc, argv);
-  auto node = std::make_shared<dlio::OdomNode>();
+  auto node = std::make_shared<dlio::OdomNode>(rclcpp::NodeOptions());
   rclcpp::executors::MultiThreadedExecutor executor;
   executor.add_node(node);
   executor.spin();

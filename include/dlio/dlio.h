@@ -6,6 +6,7 @@
  * University of California, Los Angeles                   *
  *                                                         *
  * Authors: Kenny J. Chen, Ryan Nemiroff, Brett T. Lopez   *
+ *          Azzam Wildan M (SCLC extensions)               *
  * Contact: {kennyjchen, ryguyn, btlopez}@ucla.edu         *
  *                                                         *
  ***********************************************************/
@@ -55,6 +56,7 @@ namespace dlio {
 
   class OdomNode;
   class MapNode;
+  class GraphSlamNode;
 
   struct Point {
     Point(): data{0.f, 0.f, 0.f, 1.f} {}

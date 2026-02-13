@@ -11,12 +11,12 @@
  *                                                         *
  ***********************************************************/
 
-#include "dlio/map.h"
+#include "dlio/graph_slam.h"
 
 int main(int argc, char** argv) {
 
   rclcpp::init(argc, argv);
-  auto node = std::make_shared<dlio::MapNode>(rclcpp::NodeOptions());
+  auto node = std::make_shared<dlio::GraphSlamNode>(rclcpp::NodeOptions());
   rclcpp::executors::MultiThreadedExecutor executor;
   executor.add_node(node);
   executor.spin();

@@ -1,0 +1,20 @@
+/**:
+  ros__parameters:
+    loop_detection_period_ms: 2000
+    voxel_leaf_size: 0.2
+    search_submap_num: 3
+
+    loop_closure/range: 10.0
+    loop_closure/min_keyframe_gap: 15
+    loop_closure/fitness_score_threshold: 0.3
+
+    gicp/k_correspondences: 20
+    gicp/max_correspondence_distance: 2.0
+    gicp/max_iterations: 64
+    gicp/transformation_epsilon: 0.01
+    gicp/rotation_epsilon: 0.01
+
+    pose_graph/num_adjacent_constraints: 5
+    pose_graph/optimization_iterations: 20
+    pose_graph/odom_edge_info_scale: 10.0
+    pose_graph/loop_edge_info_scale: 10.0

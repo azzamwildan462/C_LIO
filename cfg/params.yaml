@@ -13,6 +13,11 @@
 /**:
   ros__parameters:
     use_sim_time: true
+
+    debug/odom: false
+    debug/graph_slam: false
+    debug/print_odom: false # Activate this to print odometry like default DLIO
+
     frames/odom: odom
     frames/baselink: base_link
     frames/lidar: lidar
@@ -21,6 +26,21 @@
     map/waitUntilMove: true
     map/dense/filtered: false
     map/sparse/leafSize: 0.25
+
+    map/mode: "mapping"
+    map/path: ""
+    map/voxel_size: 0.25
+    map/chunk_size: 20.0
+    map/auto_save_interval: 30.0
+    map/initial_pose/x: 0.0
+    map/initial_pose/y: 0.0
+    map/initial_pose/z: 0.0
+    map/initial_pose/yaw: 0.0
+    map/relocalize: false
+    map/relocalize/sc_max_range: 40.0
+    map/relocalize/sc_num_candidates: 50
+    map/relocalize/sc_distance_threshold: 0.6
+    map/relocalize/sc_max_attempts: 10
 
     odom/gravity: 9.80665
     odom/computeTimeOffset: true
@@ -34,8 +54,8 @@
     odom/preprocessing/cropBoxFilter/size: 1.0
     odom/preprocessing/voxelFilter/res: 0.25
 
-    odom/keyframe/threshD: 1.0
-    odom/keyframe/threshR: 45.0
+    odom/keyframe/threshD: 0.3
+    odom/keyframe/threshR: 10.0
 
     odom/submap/keyframe/knn: 10
     odom/submap/keyframe/kcv: 10
@@ -46,7 +66,7 @@
     odom/gicp/maxIterations: 32
     odom/gicp/transformationEpsilon: 0.01
     odom/gicp/rotationEpsilon: 0.01
-    odom/gicp/initLambdaFactor: 1e-9
+    odom/gicp/initLambdaFactor: 0.000000001
 
     odom/geo/Kp: 4.5
     odom/geo/Kv: 11.25

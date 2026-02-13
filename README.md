@@ -1,108 +1,209 @@
-# Direct LiDAR-Inertial Odometry: Lightweight LIO with Continuous-Time Motion Correction
+# DLIO-SCLC: Direct LiDAR-Inertial Odometry with Scan Context Loop Closure
 
-#### [[ IEEE ICRA ](https://ieeexplore.ieee.org/document/10160508)] [[ arXiv ](https://arxiv.org/abs/2203.03749)] [[ Video ](https://www.youtube.com/watch?v=4-oXjG8ow10)] [[ Presentation ](https://www.youtube.com/watch?v=Hmiw66KZ1tU)]
+An extended version of [Direct LiDAR-Inertial Odometry (DLIO)](https://github.com/vectr-ucla/direct_lidar_inertial_odometry) with **Graph SLAM loop closure**, **Scan Context relocalization**, and **prior map localization** support.
 
-DLIO is a new lightweight LiDAR-inertial odometry algorithm with a novel coarse-to-fine approach in constructing continuous-time trajectories for precise motion correction. It features several algorithmic improvements over its predecessor, [DLO](https://github.com/vectr-ucla/direct_lidar_odometry), and was presented at the IEEE International Conference on Robotics and Automation (ICRA) in London, UK in 2023.
+## What's New
 
-<br>
-<p align='center'>
-    <img src="./doc/img/dlio.png" alt="drawing" width="720"/>
-</p>
+This fork adds three major capabilities on top of the original DLIO:
 
-## Instructions
+| Feature | Description |
+|---------|-------------|
+| **Graph SLAM** | Pose graph optimization with automatic loop closure detection using GICP + g2o |
+| **Scan Context Relocalization** | Automatic initial pose estimation when loading a prior map, using Scan Context descriptors + GICP refinement |
+| **Keyframe Database (KFDB)** | Persistent storage of real keyframe Scan Context descriptors for accurate relocalization |
+| **Prior Map Localization** | Load a previously built map and localize against it |
+| **Composable Nodes** | All nodes run in a single process with intra-process communication for lower latency |
 
-### Sensor Setup
-DLIO has been extensively tested using a variety of sensor configurations and currently supports Ouster, Velodyne, and Hesai LiDARs. The point cloud should be of input type `sensor_msgs::PointCloud2` and the 6-axis IMU input type of `sensor_msgs::Imu`.
+## Architecture
 
-For best performance, extrinsic calibration between the LiDAR/IMU sensors and the robot's center-of-gravity should be inputted into `cfg/dlio.yaml`. If the exact values of these are unavailable, a rough LiDAR-to-IMU extrinsics can also be used (note however that performance will be degraded).
+```
+┌──────────────────────────────────────────────────────────────┐
+│                   component_container_mt                      │
+│                                                              │
+│  ┌──────────────┐   ┌──────────────┐   ┌─────────────────┐  │
+│  │   OdomNode   │──>│   MapNode    │   │  GraphSlamNode  │  │
+│  │              │   │              │   │                 │  │
+│  │ - IMU fusion │   │ - Map accum  │   │ - Loop detect   │  │
+│  │ - GICP align │   │ - Auto-save  │   │ - Pose graph    │  │
+│  │ - Relocalize │   │ - PCD I/O    │   │ - g2o optimize  │  │
+│  │ - KFDB save  │   │              │   │                 │  │
+│  └──────────────┘   └──────────────┘   └─────────────────┘  │
+│        IPC              pub/sub              IPC             │
+└──────────────────────────────────────────────────────────────┘
+```
 
-IMU intrinsics are also necessary for best performance, and there are several open-source calibration tools to get these values. These values should also go into `cfg/dlio.yaml`. In practice however, if you are just testing this work, using the default ideal values and performing the initial calibration procedure should be fine.
+All three nodes run as composable components in a single multi-threaded container, with intra-process communication (IPC) enabled for OdomNode and GraphSlamNode.
 
-Also note that the LiDAR and IMU sensors _need_ to be properly time-synchronized, otherwise DLIO will not work. We recommend using a LiDAR with an integrated IMU (such as an Ouster) for simplicity of extrinsics and synchronization.
-
-### Dependencies
-The following has been verified to be compatible, although other configurations may work too:
+## Dependencies
 
 - Ubuntu 22.04
-- ROS Humble (`rclcpp`, `std_msgs`, `sensor_msgs`, `geometry_msgs`, `nav_msgs`, `pcl_ros`)
-- C++ 14
-- CMake >= `3.12.4`
-- OpenMP >= `4.5`
-- Point Cloud Library >= `1.10.0`
-- Eigen >= `3.3.7`
+- ROS 2 Humble
+- C++ 17
+- Point Cloud Library >= 1.10.0
+- Eigen >= 3.3.7
+- g2o (via `ros-humble-libg2o`)
+- OpenMP >= 4.5
 
-```sh
-sudo apt install libomp-dev libpcl-dev libeigen3-dev
+```bash
+sudo apt install libomp-dev libpcl-dev libeigen3-dev ros-humble-libg2o ros-humble-pcl-ros
 ```
 
-DLIO currently supports `ROS 1` and `ROS 2`!
+## Build
 
-### Compiling
-Compile using the [`catkin_tools`](https://catkin-tools.readthedocs.io/en/latest/) package via:
-
-```sh
-mkdir ~/ros2_ws && cd ~/ros2_ws && mkdir src && cd src
-```
-```sh
-git clone https://github.com/vectr-ucla/direct_lidar_inertial_odometry -b feature/ros2
-```
-```sh
-cd ~/ros2_ws
-```
-```sh
-colcon build --symlink-install --packages-select direct_lidar_inertial_odometry
+```bash
+cd <your_ws>
+colcon build --packages-select direct_lidar_inertial_odometry
+source install/setup.bash
 ```
 
-### Execution
+## Usage
 
-<details>
-<summary> After compiling, don't forget to source before ROS commands.</summary>
+### Mapping
 
-``` bash
-source ~/ros2_ws/install/setup.bash
-```
-</details>
+Build a map from a rosbag:
 
-Execute via:
-
-```sh
-roslaunch direct_lidar_inertial_odometry dlio.launch \
-  rviz:={true, false} \
-  pointcloud_topic:=/robot/lidar \
-  imu_topic:=/robot/imu
+```bash
+ros2 launch direct_lidar_inertial_odometry dlio.launch.py \
+  map_mode:=mapping \
+  map_path:=/path/to/my_map.pcd \
+  pointcloud_topic:=/ouster/points \
+  imu_topic:=/ouster/imu
 ```
 
-<details>
-<summary> Example command: </summary>
+This produces two files:
+- `my_map.pcd` — the point cloud map
+- `my_map.kfdb` — keyframe database for relocalization
 
-``` bash
-ros2 launch direct_lidar_inertial_odometry dlio.launch.py rviz:=true pointcloud_topic:=/lexus3/os_center/points imu_topic:=/lexus3/os_center/imu
-```
-</details>
+### Localization (known initial pose)
 
-Be sure to change the topic names to your corresponding topics. Alternatively, edit the launch file directly if desired. If successful, you should see the following output in your terminal:
-<br>
-<p align='center'>
-    <img src="./doc/img/terminal.png" alt="drawing" width="480"/>
-</p>
-
-### Services
-To save DLIO's generated map into `.pcd` format, call the following service:
-
-```sh
-ros2 service call /save_pcd direct_lidar_inertial_odometry/srv/SavePCD "{'leaf_size': 0.2, 'save_path': '~/map'}"
+```bash
+ros2 launch direct_lidar_inertial_odometry dlio.launch.py \
+  map_mode:=localization \
+  map_path:=/path/to/my_map.pcd \
+  pointcloud_topic:=/ouster/points \
+  imu_topic:=/ouster/imu
 ```
 
-### Test Data
-For your convenience, we provide test data [here](https://drive.google.com/file/d/1Sp_Mph4rekXKY2euxYxv6SD6WIzB-wVU/view?usp=sharing) (1.2GB, 1m 13s, Ouster OS1-32) of an aggressive motion to test our motion correction scheme, and [here](https://drive.google.com/file/d/1HbmF5gTHxCAMqBkEd5PTxDNQvcI8tKXn/view?usp=sharing) (16.5GB, 4m 21s, Ouster OSDome) of a longer trajectory outside with lots of trees. Try these two datasets with both deskewing on and off!
+### Localization with Relocalization (unknown initial pose)
 
-<br>
-<p align='center'>
-    <img src="./doc/gif/aggressive.gif" alt="drawing" width="720"/>
-</p>
+```bash
+ros2 launch direct_lidar_inertial_odometry dlio.launch.py \
+  map_mode:=localization \
+  map_path:=/path/to/my_map.pcd \
+  relocalize:=true \
+  pointcloud_topic:=/ouster/points \
+  imu_topic:=/ouster/imu
+```
 
-## Citation
-If you found this work useful, please cite our manuscript:
+The system will automatically determine the initial pose using Scan Context matching + GICP refinement before starting odometry tracking.
+
+### Launch Arguments
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `map_mode` | `mapping` | `mapping` or `localization` |
+| `map_path` | `""` | Path to PCD map file (save/load) |
+| `relocalize` | `false` | Enable Scan Context relocalization |
+| `pointcloud_topic` | `points_raw` | Input point cloud topic |
+| `imu_topic` | `imu_raw` | Input IMU topic |
+| `rviz` | `false` | Launch RViz |
+
+## Features in Detail
+
+### Graph SLAM with Loop Closure
+
+A dedicated `GraphSlamNode` runs alongside odometry and mapping:
+
+1. Receives keyframes (pose + cloud) from the odometry node via `KeyframeStamped` messages
+2. Detects loop closure candidates based on spatial proximity and temporal gap
+3. Validates candidates using GICP alignment against a local submap
+4. Optimizes the full pose graph using g2o (SE3 vertices + edges)
+5. Publishes corrected trajectory, keyframe poses, and corrected map
+
+Configuration in `cfg/graph_slam.yaml`:
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `loop_closure/range` | `10.0` | Max distance (m) for loop candidates |
+| `loop_closure/min_keyframe_gap` | `15` | Min keyframe index gap |
+| `loop_closure/fitness_score_threshold` | `0.3` | GICP fitness threshold for acceptance |
+| `pose_graph/optimization_iterations` | `20` | g2o Levenberg-Marquardt iterations |
+| `pose_graph/num_adjacent_constraints` | `5` | Sequential odometry edges per keyframe |
+
+### Scan Context Relocalization
+
+When `relocalize:=true`, the system determines the initial pose automatically:
+
+1. Computes a **Scan Context descriptor** (20 rings x 60 sectors) from the incoming LiDAR scan, rotated to gravity-aligned frame
+2. Matches against the **Keyframe Database (KFDB)** loaded from the `.kfdb` file
+3. Takes the **top-50 candidates** and tries **6 yaw hypotheses** per candidate (0°, 60°, 120°, 180°, 240°, 300°)
+4. For each hypothesis, extracts a **50m-radius local map** and refines with **GICP alignment**
+5. Accepts the best result if GICP fitness < 0.5, early-exits if < 0.3
+
+Configuration in `cfg/params.yaml`:
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `map/relocalize/sc_max_range` | `40.0` | Max LiDAR range for SC descriptor (m) |
+| `map/relocalize/sc_num_candidates` | `50` | Top-K SC candidates to try |
+| `map/relocalize/sc_max_attempts` | `10` | Max scans before falling back to initial pose |
+
+### Keyframe Database (KFDB)
+
+During mapping, each keyframe's Scan Context descriptor is computed from the **raw sensor-frame scan** (rotated to gravity-aligned frame using IMU calibration data) and stored in a compact binary file (`.kfdb`, ~5 KB per keyframe).
+
+The KFDB v2 format stores:
+- **Header**: magic, version, SC dimensions (NR/NS), `sc_max_range`, gravity quaternion
+- **Per keyframe**: SC descriptor, ring key, position, orientation
+
+This ensures relocalization uses **real viewpoint-dependent descriptors** rather than synthetic ones generated from the dense map, dramatically improving matching accuracy.
+
+The KFDB is auto-saved every 20 keyframes and on shutdown.
+
+### Prior Map Loading
+
+Both modes support loading a prior map from PCD:
+
+- **Mapping mode**: Loads existing map as a starting point, continues accumulating
+- **Localization mode**: Loads map, builds KdTree + spatial chunks, tracks against it
+
+The prior map is spatially chunked (20m grid cells), with each chunk contributing a virtual keyframe for submap building.
+
+## Published Topics
+
+| Topic | Type | Description |
+|-------|------|-------------|
+| `dlio/odom_node/odom` | `nav_msgs/Odometry` | Odometry estimate |
+| `dlio/odom_node/pose` | `geometry_msgs/PoseStamped` | Current pose |
+| `dlio/odom_node/path` | `nav_msgs/Path` | Trajectory path |
+| `dlio/odom_node/pointcloud/deskewed` | `sensor_msgs/PointCloud2` | Deskewed scan in world frame |
+| `dlio/odom_node/pointcloud/keyframe` | `sensor_msgs/PointCloud2` | Keyframe cloud |
+| `dlio/odom_node/keyframes` | `geometry_msgs/PoseArray` | All keyframe poses |
+| `dlio/graph_slam/corrected_path` | `nav_msgs/Path` | Loop-closure corrected path |
+| `dlio/graph_slam/corrected_map` | `sensor_msgs/PointCloud2` | Corrected full map |
+| `dlio/graph_slam/corrected_kf_poses` | `geometry_msgs/PoseArray` | Corrected keyframe poses |
+| `dlio/graph_slam/loop_closures` | `visualization_msgs/MarkerArray` | Loop closure visualization |
+
+## Subscribed Topics
+
+| Topic | Type | Description |
+|-------|------|-------------|
+| `pointcloud` | `sensor_msgs/PointCloud2` | Input LiDAR scan (remapped via launch arg) |
+| `imu` | `sensor_msgs/Imu` | Input IMU data (remapped via launch arg) |
+
+## Key Changes from Original DLIO
+
+- **Composable node architecture**: All nodes in a single process with IPC, replacing separate executables
+- **C++ 17** (was C++ 14)
+- **g2o dependency** for pose graph optimization
+- **Custom `KeyframeStamped` message** for passing keyframe data between nodes
+- **nanoflann `radiusSearch` bugfix**: Original used incorrect return value from `findNeighbors()`
+- **TF/Path publishing fix**: Uses GICP-corrected `lidarPose` instead of raw `state` for consistent transforms
+- **`length_traversed` fix**: Now updated in main loop instead of only in debug function (was preventing deskewed cloud publishing when `waitUntilMove: true`)
+
+## Based On
+
+This project is built on top of **Direct LiDAR-Inertial Odometry (DLIO)** by the [Verifiable & Control-Theoretic Robotics (VECTR) Lab](https://vectr.ucla.edu/) at UCLA.
 
 ```bibtex
 @article{chen2022dlio,
@@ -115,22 +216,16 @@ If you found this work useful, please cite our manuscript:
 }
 ```
 
+Original repository: [https://github.com/vectr-ucla/direct_lidar_inertial_odometry](https://github.com/vectr-ucla/direct_lidar_inertial_odometry)
+
 ## Acknowledgements
 
-We thank the authors of the [FastGICP](https://github.com/SMRT-AIST/fast_gicp) and [NanoFLANN](https://github.com/jlblancoc/nanoflann) open-source packages:
-
-- Kenji Koide, Masashi Yokozuka, Shuji Oishi, and Atsuhiko Banno, “Voxelized GICP for Fast and Accurate 3D Point Cloud Registration,” in _IEEE International Conference on Robotics and Automation (ICRA)_, IEEE, 2021, pp. 11 054–11 059.
-- Jose Luis Blanco and Pranjal Kumar Rai, “NanoFLANN: a C++ Header-Only Fork of FLANN, A Library for Nearest Neighbor (NN) with KD-Trees,” https://github.com/jlblancoc/nanoflann, 2014.
-
-We would also like to thank Helene Levy and David Thorne for their help with data collection.
+- [DLIO](https://github.com/vectr-ucla/direct_lidar_inertial_odometry) — Kenny J. Chen, Ryan Nemiroff, Brett T. Lopez (UCLA VECTR Lab)
+- [FastGICP](https://github.com/SMRT-AIST/fast_gicp) — Kenji Koide et al.
+- [NanoFLANN](https://github.com/jlblancoc/nanoflann) — Jose Luis Blanco and Pranjal Kumar Rai
+- [Scan Context](https://github.com/irapkaist/scancontext) — Giseop Kim and Ayoung Kim (KAIST)
+- [g2o](https://github.com/RainerKuemmerle/g2o) — Rainer Kuemmerle et al.
 
 ## License
-This work is licensed under the terms of the MIT license.
 
-<br>
-<p align='center'>
-    <img src="./doc/img/ucla.png" alt="drawing" width="720"/>
-</p>
-<p align='center'>
-    <img src="./doc/img/trees.png" alt="drawing" width="720"/>
-</p>
+This work is licensed under the terms of the MIT license.
