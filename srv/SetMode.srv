@@ -1,0 +1,6 @@
+string mode      # "mapping" or "localization"
+string map_path  # optional: new map path (empty = keep current)
+---
+bool success
+string message
+string current_mode

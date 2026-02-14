@@ -23,6 +23,13 @@
 #include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <tf2_ros/transform_broadcaster.h>
+#include <direct_lidar_inertial_odometry/srv/set_mode.hpp>
+#include <direct_lidar_inertial_odometry/srv/relocalize.hpp>
+#include <direct_lidar_inertial_odometry/srv/set_pose.hpp>
+#include <direct_lidar_inertial_odometry/srv/get_state.hpp>
+#include <direct_lidar_inertial_odometry/srv/new_map.hpp>
+#include <direct_lidar_inertial_odometry/srv/new_map_w_zero.hpp>
+#include <direct_lidar_inertial_odometry/srv/save_pcd.hpp>
 
 // BOOST
 #include <boost/format.hpp>
@@ -138,6 +145,23 @@ private:
   void computeAndStoreKeyframeSC();
   bool loadKeyframeDatabase();
 
+  // Runtime control services
+  void srvSetMode(std::shared_ptr<direct_lidar_inertial_odometry::srv::SetMode::Request> req,
+                  std::shared_ptr<direct_lidar_inertial_odometry::srv::SetMode::Response> res);
+  void srvRelocalize(std::shared_ptr<direct_lidar_inertial_odometry::srv::Relocalize::Request> req,
+                     std::shared_ptr<direct_lidar_inertial_odometry::srv::Relocalize::Response> res);
+  void srvSetPose(std::shared_ptr<direct_lidar_inertial_odometry::srv::SetPose::Request> req,
+                  std::shared_ptr<direct_lidar_inertial_odometry::srv::SetPose::Response> res);
+  void srvGetState(std::shared_ptr<direct_lidar_inertial_odometry::srv::GetState::Request> req,
+                   std::shared_ptr<direct_lidar_inertial_odometry::srv::GetState::Response> res);
+  void srvNewMap(std::shared_ptr<direct_lidar_inertial_odometry::srv::NewMap::Request> req,
+                 std::shared_ptr<direct_lidar_inertial_odometry::srv::NewMap::Response> res);
+  void srvNewMapWZero(std::shared_ptr<direct_lidar_inertial_odometry::srv::NewMapWZero::Request> req,
+                      std::shared_ptr<direct_lidar_inertial_odometry::srv::NewMapWZero::Response> res);
+  void reloadPriorMapForRelocalization();
+  void clearAllMapData();
+  bool callSavePCD();
+
   void debug();
 
   rclcpp::TimerBase::SharedPtr publish_timer;
@@ -146,6 +170,17 @@ private:
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr lidar_sub;
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub;
   rclcpp::CallbackGroup::SharedPtr lidar_cb_group, imu_cb_group;
+
+  // Services
+  rclcpp::Service<direct_lidar_inertial_odometry::srv::SetMode>::SharedPtr set_mode_srv_;
+  rclcpp::Service<direct_lidar_inertial_odometry::srv::Relocalize>::SharedPtr relocalize_srv_;
+  rclcpp::Service<direct_lidar_inertial_odometry::srv::SetPose>::SharedPtr set_pose_srv_;
+  rclcpp::Service<direct_lidar_inertial_odometry::srv::GetState>::SharedPtr get_state_srv_;
+  rclcpp::Service<direct_lidar_inertial_odometry::srv::NewMap>::SharedPtr new_map_srv_;
+  rclcpp::Service<direct_lidar_inertial_odometry::srv::NewMapWZero>::SharedPtr new_map_w_zero_srv_;
+  rclcpp::Client<direct_lidar_inertial_odometry::srv::SavePCD>::SharedPtr save_pcd_client_;
+  rclcpp::CallbackGroup::SharedPtr service_cb_group_;
+  std::mutex state_mtx_;
 
   // Publishers
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_pub;
@@ -435,6 +470,7 @@ private:
   double sc_distance_threshold_;
   int sc_max_attempts_;
   int sc_attempt_count_;
+  double last_reloc_fitness_;
   std::vector<ScanContextEntry> sc_database_;
   pcl::PointCloud<PointType>::Ptr prior_map_cloud_;
   std::shared_ptr<nanoflann::KdTreeFLANN<PointType>> prior_map_kdtree_;

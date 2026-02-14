@@ -75,6 +75,12 @@ link_directories(
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/KeyframeStamped.msg"
   "srv/SavePCD.srv"
+  "srv/SetMode.srv"
+  "srv/Relocalize.srv"
+  "srv/SetPose.srv"
+  "srv/GetState.srv"
+  "srv/NewMap.srv"
+  "srv/NewMapWZero.srv"
   DEPENDENCIES std_msgs sensor_msgs geometry_msgs
 )
 rosidl_get_typesupport_target(cpp_typesupport_target

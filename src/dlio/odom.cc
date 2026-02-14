@@ -204,12 +204,44 @@ dlio::OdomNode::OdomNode(const rclcpp::NodeOptions &options)
   }
   fclose(file);
 
+  // Runtime control services
+  this->service_cb_group_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+  this->set_mode_srv_ = this->create_service<direct_lidar_inertial_odometry::srv::SetMode>(
+      "dlio_odom/set_mode",
+      std::bind(&dlio::OdomNode::srvSetMode, this, std::placeholders::_1, std::placeholders::_2),
+      rmw_qos_profile_services_default, this->service_cb_group_);
+  this->relocalize_srv_ = this->create_service<direct_lidar_inertial_odometry::srv::Relocalize>(
+      "dlio_odom/relocalize",
+      std::bind(&dlio::OdomNode::srvRelocalize, this, std::placeholders::_1, std::placeholders::_2),
+      rmw_qos_profile_services_default, this->service_cb_group_);
+  this->set_pose_srv_ = this->create_service<direct_lidar_inertial_odometry::srv::SetPose>(
+      "dlio_odom/set_pose",
+      std::bind(&dlio::OdomNode::srvSetPose, this, std::placeholders::_1, std::placeholders::_2),
+      rmw_qos_profile_services_default, this->service_cb_group_);
+  this->get_state_srv_ = this->create_service<direct_lidar_inertial_odometry::srv::GetState>(
+      "dlio_odom/get_state",
+      std::bind(&dlio::OdomNode::srvGetState, this, std::placeholders::_1, std::placeholders::_2),
+      rmw_qos_profile_services_default, this->service_cb_group_);
+  this->new_map_srv_ = this->create_service<direct_lidar_inertial_odometry::srv::NewMap>(
+      "dlio_odom/new_map",
+      std::bind(&dlio::OdomNode::srvNewMap, this, std::placeholders::_1, std::placeholders::_2),
+      rmw_qos_profile_services_default, this->service_cb_group_);
+  this->new_map_w_zero_srv_ = this->create_service<direct_lidar_inertial_odometry::srv::NewMapWZero>(
+      "dlio_odom/new_map_w_zero",
+      std::bind(&dlio::OdomNode::srvNewMapWZero, this, std::placeholders::_1, std::placeholders::_2),
+      rmw_qos_profile_services_default, this->service_cb_group_);
+
+  // SavePCD client (calls MapNode's save_pcd service)
+  this->save_pcd_client_ = this->create_client<direct_lidar_inertial_odometry::srv::SavePCD>(
+      "save_pcd_map", rmw_qos_profile_services_default, this->service_cb_group_);
+
   // Map load
   this->prior_map_pose_set_ = false;
   this->num_prior_keyframes_ = 0;
   this->use_prior_map_ = false;
   this->relocalized_ = false;
   this->sc_attempt_count_ = 0;
+  this->last_reloc_fitness_ = -1.0;
 
   if (!this->map_path_.empty())
   {
@@ -855,6 +887,7 @@ accept_result:
   this->state.p = best_pos;
   this->origin = best_pos;
   this->state.q = best_q;
+  this->last_reloc_fitness_ = best_fitness;
 
   float refined_yaw = std::atan2(
       2.f * (best_q.w() * best_q.z() + best_q.x() * best_q.y()),
@@ -1261,8 +1294,17 @@ void dlio::OdomNode::getParams()
   dlio::declare_param(this, "odom/geo/gbias_max", this->geo_gbias_max_, 1.0);
 
   // Map load/save
-  dlio::declare_param(this, "map/mode", this->map_mode_, std::string("mapping"));
+  dlio::declare_param(this, "map/mode", this->map_mode_, std::string("localization"));
   dlio::declare_param(this, "map/path", this->map_path_, std::string(""));
+  if (this->map_path_.empty())
+  {
+    const char *home = std::getenv("HOME");
+    if (home)
+    {
+      this->map_path_ = std::string(home) + "/.ros/dlio_map.pcd";
+      RCLCPP_INFO(this->get_logger(), "map/path not set, defaulting to: %s", this->map_path_.c_str());
+    }
+  }
   dlio::declare_param(this, "map/voxel_size", this->map_voxel_size_, 0.25);
   dlio::declare_param(this, "map/chunk_size", this->map_chunk_size_, 20.0);
 
@@ -1985,7 +2027,10 @@ void dlio::OdomNode::callbackPointCloud(const sensor_msgs::msg::PointCloud2::Sha
   }
 
   // Get the next pose via IMU + S2M + GEO
-  this->getNextPose();
+  {
+    std::lock_guard<std::mutex> state_lock(this->state_mtx_);
+    this->getNextPose();
+  }
 
   // Update current keyframe poses and map
   this->updateKeyframes();
@@ -3114,6 +3159,421 @@ void dlio::OdomNode::pauseSubmapBuildIfNeeded()
   std::unique_lock<decltype(this->main_loop_running_mutex)> lock(this->main_loop_running_mutex);
   this->submap_build_cv.wait(lock, [this]
                              { return !this->main_loop_running; });
+}
+
+// ---- Runtime Control Services ----
+
+void dlio::OdomNode::srvSetMode(
+    std::shared_ptr<direct_lidar_inertial_odometry::srv::SetMode::Request> req,
+    std::shared_ptr<direct_lidar_inertial_odometry::srv::SetMode::Response> res)
+{
+  if (req->mode != "mapping" && req->mode != "localization")
+  {
+    res->success = false;
+    res->message = "Invalid mode '" + req->mode + "'. Must be 'mapping' or 'localization'.";
+    res->current_mode = this->map_mode_;
+    return;
+  }
+
+  std::string old_mode = this->map_mode_;
+
+  // If switching from mapping to localization: save map PCD + KFDB
+  if (old_mode == "mapping" && req->mode == "localization")
+  {
+    if (!this->map_path_.empty())
+    {
+      // Save PCD via MapNode service
+      if (this->callSavePCD())
+      {
+        RCLCPP_INFO(this->get_logger(), "[SetMode] Saved map PCD before switching to localization");
+      }
+      // Save KFDB
+      this->saveKeyframeDatabase();
+      RCLCPP_INFO(this->get_logger(), "[SetMode] Saved KFDB before switching to localization");
+    }
+  }
+
+  // Update map_path if provided
+  if (!req->map_path.empty())
+  {
+    this->map_path_ = req->map_path;
+    RCLCPP_INFO(this->get_logger(), "[SetMode] Updated map_path to: %s", this->map_path_.c_str());
+  }
+
+  // If switching to localization and we have a map_path, ensure prior map is loaded
+  if (req->mode == "localization" && !this->map_path_.empty() && !this->use_prior_map_)
+  {
+    std::ifstream f(this->map_path_);
+    if (f.good())
+    {
+      f.close();
+      this->use_prior_map_ = true;
+      this->loadPriorMap();
+      RCLCPP_INFO(this->get_logger(), "[SetMode] Loaded prior map for localization");
+    }
+    else
+    {
+      res->success = false;
+      res->message = "Map file not found: " + this->map_path_;
+      res->current_mode = this->map_mode_;
+      return;
+    }
+  }
+
+  this->map_mode_ = req->mode;
+
+  // Update atexit handler for mapping mode
+  if (req->mode == "mapping" && !this->map_path_.empty())
+  {
+    g_odom_node.store(this);
+  }
+  else
+  {
+    g_odom_node.store(nullptr);
+  }
+
+  res->success = true;
+  res->message = "Mode changed from '" + old_mode + "' to '" + req->mode + "'";
+  res->current_mode = this->map_mode_;
+  RCLCPP_INFO(this->get_logger(), "[SetMode] %s", res->message.c_str());
+}
+
+void dlio::OdomNode::reloadPriorMapForRelocalization()
+{
+  if (this->prior_map_cloud_ && this->prior_map_cloud_->size() > 0)
+  {
+    // Resources still available, just reload SC database if needed
+    if (this->sc_database_.empty())
+    {
+      if (!this->loadKeyframeDatabase())
+      {
+        this->buildScanContextDatabase();
+      }
+    }
+    return;
+  }
+
+  // Need to reload from disk
+  RCLCPP_INFO(this->get_logger(), "[Relocalize] Reloading prior map from: %s", this->map_path_.c_str());
+
+  pcl::PointCloud<PointType>::Ptr cloud = std::make_shared<pcl::PointCloud<PointType>>();
+  if (pcl::io::loadPCDFile(this->map_path_, *cloud) == -1)
+  {
+    RCLCPP_ERROR(this->get_logger(), "[Relocalize] Failed to load PCD file: %s", this->map_path_.c_str());
+    return;
+  }
+
+  // Voxel filter
+  pcl::VoxelGrid<PointType> vg;
+  vg.setLeafSize(this->map_voxel_size_, this->map_voxel_size_, this->map_voxel_size_);
+  vg.setInputCloud(cloud);
+  vg.filter(*cloud);
+
+  this->prior_map_cloud_ = std::make_shared<pcl::PointCloud<PointType>>(*cloud);
+  this->prior_map_kdtree_ = std::make_shared<nanoflann::KdTreeFLANN<PointType>>();
+  this->prior_map_kdtree_->setInputCloud(this->prior_map_cloud_);
+
+  RCLCPP_INFO(this->get_logger(), "[Relocalize] Prior map reloaded: %zu pts, KdTree built",
+              this->prior_map_cloud_->size());
+
+  // Load SC database
+  this->sc_database_.clear();
+  if (!this->loadKeyframeDatabase())
+  {
+    this->buildScanContextDatabase();
+  }
+  RCLCPP_INFO(this->get_logger(), "[Relocalize] SC database: %zu entries", this->sc_database_.size());
+}
+
+void dlio::OdomNode::srvRelocalize(
+    std::shared_ptr<direct_lidar_inertial_odometry::srv::Relocalize::Request> /*req*/,
+    std::shared_ptr<direct_lidar_inertial_odometry::srv::Relocalize::Response> res)
+{
+  if (this->map_mode_ != "localization")
+  {
+    res->success = false;
+    res->message = "Must be in localization mode to relocalize (current: " + this->map_mode_ + ")";
+    return;
+  }
+
+  if (this->map_path_.empty())
+  {
+    res->success = false;
+    res->message = "No map_path set. Use SetMode service to set map_path first.";
+    return;
+  }
+
+  RCLCPP_INFO(this->get_logger(), "[Relocalize] Service called, reloading resources...");
+
+  // Reload prior map and SC database if freed
+  this->reloadPriorMapForRelocalization();
+
+  if (!this->prior_map_cloud_ || this->prior_map_cloud_->empty())
+  {
+    res->success = false;
+    res->message = "Failed to load prior map from: " + this->map_path_;
+    return;
+  }
+
+  // Reset relocalization flags — callbackPointCloud will handle the actual SC+GICP
+  this->use_prior_map_ = true;
+  this->relocalize_ = true;
+  this->relocalized_ = false;
+  this->prior_map_pose_set_ = false;
+  this->sc_attempt_count_ = 0;
+  this->last_reloc_fitness_ = -1.0;
+
+  RCLCPP_INFO(this->get_logger(), "[Relocalize] Flags reset, waiting for relocalization...");
+
+  // Poll for relocalization result (up to 30 seconds)
+  auto start = std::chrono::steady_clock::now();
+  while (!this->relocalized_)
+  {
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    auto elapsed = std::chrono::steady_clock::now() - start;
+    if (std::chrono::duration_cast<std::chrono::seconds>(elapsed).count() > 30)
+    {
+      res->success = false;
+      res->message = "Relocalization timed out after 30 seconds (" +
+                     std::to_string(this->sc_attempt_count_) + " attempts)";
+      return;
+    }
+  }
+
+  // Return result
+  res->success = true;
+  float yaw = std::atan2(
+      2.f * (this->state.q.w() * this->state.q.z() + this->state.q.x() * this->state.q.y()),
+      1.f - 2.f * (this->state.q.y() * this->state.q.y() + this->state.q.z() * this->state.q.z()));
+  res->x = this->state.p[0];
+  res->y = this->state.p[1];
+  res->z = this->state.p[2];
+  res->yaw_deg = yaw * 180.0 / M_PI;
+  res->fitness_score = this->last_reloc_fitness_;
+  res->message = "Relocalized successfully after " + std::to_string(this->sc_attempt_count_) + " attempt(s)";
+
+  RCLCPP_INFO(this->get_logger(), "[Relocalize] %s — pos=[%.1f,%.1f,%.1f] yaw=%.1f fitness=%.4f",
+              res->message.c_str(), res->x, res->y, res->z, res->yaw_deg, res->fitness_score);
+}
+
+void dlio::OdomNode::srvSetPose(
+    std::shared_ptr<direct_lidar_inertial_odometry::srv::SetPose::Request> req,
+    std::shared_ptr<direct_lidar_inertial_odometry::srv::SetPose::Response> res)
+{
+  std::lock_guard<std::mutex> state_lock(this->state_mtx_);
+
+  Eigen::Vector3f new_pos(req->x, req->y, req->z);
+  float yaw_rad = req->yaw_deg * M_PI / 180.0;
+
+  // Keep current roll/pitch from IMU, only override yaw
+  // Extract current roll/pitch from state.q
+  Eigen::Matrix3f R = this->state.q.toRotationMatrix();
+  float roll = std::atan2(R(2, 1), R(2, 2));
+  float pitch = std::asin(-R(2, 0));
+
+  // Reconstruct quaternion with new yaw
+  Eigen::Quaternionf new_q =
+      Eigen::AngleAxisf(yaw_rad, Eigen::Vector3f::UnitZ()) *
+      Eigen::AngleAxisf(pitch, Eigen::Vector3f::UnitY()) *
+      Eigen::AngleAxisf(roll, Eigen::Vector3f::UnitX());
+
+  this->state.p = new_pos;
+  this->state.q = new_q;
+  this->origin = new_pos;
+
+  this->T = Eigen::Matrix4f::Identity();
+  this->T.block<3, 3>(0, 0) = new_q.toRotationMatrix();
+  this->T.block<3, 1>(0, 3) = new_pos;
+  this->T_prior = this->T;
+
+  this->lidarPose.p = new_pos;
+  this->lidarPose.q = new_q;
+
+  this->prior_map_pose_set_ = true;
+  this->relocalized_ = true;
+
+  // Rebuild submap around new pose
+  this->main_loop_running = false;
+  this->buildSubmap(this->state);
+  this->submap_hasChanged = true;
+  this->new_submap_is_ready = true;
+
+  res->success = true;
+  res->message = "Pose set to [" + std::to_string(req->x) + ", " + std::to_string(req->y) + ", " +
+                 std::to_string(req->z) + "] yaw=" + std::to_string(req->yaw_deg) + " deg";
+
+  RCLCPP_INFO(this->get_logger(), "[SetPose] %s", res->message.c_str());
+}
+
+void dlio::OdomNode::srvGetState(
+    std::shared_ptr<direct_lidar_inertial_odometry::srv::GetState::Request> /*req*/,
+    std::shared_ptr<direct_lidar_inertial_odometry::srv::GetState::Response> res)
+{
+  res->mode = this->map_mode_;
+  res->relocalized = this->relocalized_;
+  res->x = this->state.p[0];
+  res->y = this->state.p[1];
+  res->z = this->state.p[2];
+
+  // Extract roll/pitch/yaw from quaternion
+  Eigen::Matrix3f R = this->state.q.toRotationMatrix();
+  float roll = std::atan2(R(2, 1), R(2, 2));
+  float pitch = std::asin(-R(2, 0));
+  float yaw = std::atan2(R(1, 0), R(0, 0));
+
+  res->roll_deg = roll * 180.0 / M_PI;
+  res->pitch_deg = pitch * 180.0 / M_PI;
+  res->yaw_deg = yaw * 180.0 / M_PI;
+  res->length_traversed = this->length_traversed;
+  res->num_keyframes = static_cast<int32_t>(this->keyframes.size());
+}
+
+bool dlio::OdomNode::callSavePCD()
+{
+  if (!this->save_pcd_client_->wait_for_service(std::chrono::seconds(2)))
+  {
+    RCLCPP_WARN(this->get_logger(), "[SavePCD] MapNode save_pcd service not available");
+    return false;
+  }
+
+  auto request = std::make_shared<direct_lidar_inertial_odometry::srv::SavePCD::Request>();
+  request->leaf_size = static_cast<float>(this->map_voxel_size_);
+
+  // Extract directory from map_path_ (e.g. "/home/user/.ros/dlio_map.pcd" -> "/home/user/.ros")
+  std::filesystem::path p(this->map_path_);
+  request->save_path = p.parent_path().string();
+
+  RCLCPP_INFO(this->get_logger(), "[SavePCD] Calling save_pcd: path='%s', leaf=%.2f",
+              request->save_path.c_str(), request->leaf_size);
+
+  auto future = this->save_pcd_client_->async_send_request(request);
+  if (future.wait_for(std::chrono::seconds(30)) != std::future_status::ready)
+  {
+    RCLCPP_WARN(this->get_logger(), "[SavePCD] Timed out waiting for save_pcd response");
+    return false;
+  }
+
+  auto result = future.get();
+  if (result->success)
+  {
+    RCLCPP_INFO(this->get_logger(), "[SavePCD] Map saved successfully");
+  }
+  else
+  {
+    RCLCPP_WARN(this->get_logger(), "[SavePCD] Map save failed");
+  }
+  return result->success;
+}
+
+void dlio::OdomNode::clearAllMapData()
+{
+  std::lock_guard<std::mutex> state_lock(this->state_mtx_);
+  std::lock_guard<std::mutex> kf_lock(this->keyframes_mutex);
+
+  // Clear keyframes
+  this->keyframes.clear();
+  this->keyframe_timestamps.clear();
+  this->keyframe_normals.clear();
+  this->keyframe_transformations.clear();
+  this->num_processed_keyframes = 0;
+  this->num_prior_keyframes_ = 0;
+
+  // Clear submap
+  this->submap_kf_idx_curr.clear();
+  this->submap_kf_idx_prev.clear();
+  this->keyframe_convex.clear();
+  this->keyframe_concave.clear();
+
+  // Clear SC/relocalization data
+  this->sc_database_.clear();
+  {
+    std::lock_guard<std::mutex> kfdb_lock(this->kfdb_mutex_);
+    this->kfdb_entries_.clear();
+  }
+
+  // Clear prior map
+  this->prior_map_cloud_.reset();
+  this->prior_map_kdtree_.reset();
+  this->use_prior_map_ = false;
+  this->relocalize_ = false;
+  this->relocalized_ = false;
+  this->prior_map_pose_set_ = false;
+  this->sc_attempt_count_ = 0;
+
+  // Clear trajectory
+  this->trajectory.clear();
+  this->length_traversed = 0.0;
+
+  // Delete map files
+  std::string pcd_path = this->map_path_;
+  std::string kfdb_path = this->getKfdbPath();
+  if (!pcd_path.empty() && std::filesystem::exists(pcd_path))
+  {
+    std::filesystem::remove(pcd_path);
+    RCLCPP_INFO(this->get_logger(), "[NewMap] Deleted: %s", pcd_path.c_str());
+  }
+  if (!kfdb_path.empty() && std::filesystem::exists(kfdb_path))
+  {
+    std::filesystem::remove(kfdb_path);
+    RCLCPP_INFO(this->get_logger(), "[NewMap] Deleted: %s", kfdb_path.c_str());
+  }
+
+  RCLCPP_INFO(this->get_logger(), "[NewMap] All map data cleared");
+}
+
+void dlio::OdomNode::srvNewMap(
+    std::shared_ptr<direct_lidar_inertial_odometry::srv::NewMap::Request> /*req*/,
+    std::shared_ptr<direct_lidar_inertial_odometry::srv::NewMap::Response> res)
+{
+  RCLCPP_INFO(this->get_logger(), "[NewMap] Clearing all map data and switching to mapping mode...");
+
+  this->clearAllMapData();
+  this->map_mode_ = "mapping";
+
+  // Update atexit handler
+  if (!this->map_path_.empty())
+  {
+    g_odom_node.store(this);
+  }
+
+  res->success = true;
+  res->message = "All map data cleared, switched to mapping mode. Map will save to: " + this->map_path_;
+  RCLCPP_INFO(this->get_logger(), "[NewMap] %s", res->message.c_str());
+}
+
+void dlio::OdomNode::srvNewMapWZero(
+    std::shared_ptr<direct_lidar_inertial_odometry::srv::NewMapWZero::Request> /*req*/,
+    std::shared_ptr<direct_lidar_inertial_odometry::srv::NewMapWZero::Response> res)
+{
+  RCLCPP_INFO(this->get_logger(), "[NewMapWZero] Clearing all map data, resetting pose, switching to mapping...");
+
+  this->clearAllMapData();
+  this->map_mode_ = "mapping";
+
+  // Reset pose to origin
+  this->state.p = Eigen::Vector3f(0., 0., 0.);
+  this->state.q = Eigen::Quaternionf(1., 0., 0., 0.);
+  this->state.v.lin.b = Eigen::Vector3f(0., 0., 0.);
+  this->state.v.lin.w = Eigen::Vector3f(0., 0., 0.);
+  this->state.v.ang.b = Eigen::Vector3f(0., 0., 0.);
+  this->state.v.ang.w = Eigen::Vector3f(0., 0., 0.);
+  this->origin = Eigen::Vector3f(0., 0., 0.);
+
+  this->T = Eigen::Matrix4f::Identity();
+  this->T_prior = Eigen::Matrix4f::Identity();
+  this->T_corr = Eigen::Matrix4f::Identity();
+  this->lidarPose.p = Eigen::Vector3f(0., 0., 0.);
+  this->lidarPose.q = Eigen::Quaternionf(1., 0., 0., 0.);
+
+  // Update atexit handler
+  if (!this->map_path_.empty())
+  {
+    g_odom_node.store(this);
+  }
+
+  res->success = true;
+  res->message = "All map data cleared, pose reset to zero, switched to mapping mode. Map will save to: " + this->map_path_;
+  RCLCPP_INFO(this->get_logger(), "[NewMapWZero] %s", res->message.c_str());
 }
 
 void dlio::OdomNode::debug()

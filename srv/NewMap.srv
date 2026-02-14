@@ -1,0 +1,5 @@
+# Clear all keyframes, map data, and delete map files (.pcd + .kfdb)
+# Then switch to mapping mode
+---
+bool success
+string message

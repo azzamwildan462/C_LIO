@@ -23,9 +23,9 @@ def generate_launch_description():
     rviz = LaunchConfiguration('rviz', default='false')
     pointcloud_topic = LaunchConfiguration('pointcloud_topic', default='points_raw')
     imu_topic = LaunchConfiguration('imu_topic', default='imu_raw')
-    map_mode = LaunchConfiguration('map_mode', default='mapping')
+    map_mode = LaunchConfiguration('map_mode', default='localization')
     map_path = LaunchConfiguration('map_path', default='')
-    relocalize = LaunchConfiguration('relocalize', default='false')
+    relocalize = LaunchConfiguration('relocalize', default='true')
 
     # Define arguments
     declare_rviz_arg = DeclareLaunchArgument(
@@ -91,6 +91,13 @@ def generate_launch_description():
                     ('kf_cloud', 'dlio/odom_node/pointcloud/keyframe'),
                     ('kf_stamped', 'dlio/odom_node/keyframe_stamped'),
                     ('deskewed', 'dlio/odom_node/pointcloud/deskewed'),
+                    ('dlio_odom/set_mode', 'dlio/odom_node/set_mode'),
+                    ('dlio_odom/relocalize', 'dlio/odom_node/relocalize'),
+                    ('dlio_odom/set_pose', 'dlio/odom_node/set_pose'),
+                    ('dlio_odom/get_state', 'dlio/odom_node/get_state'),
+                    ('dlio_odom/new_map', 'dlio/odom_node/new_map'),
+                    ('dlio_odom/new_map_w_zero', 'dlio/odom_node/new_map_w_zero'),
+                    ('save_pcd_map', 'dlio/map_node/save_pcd'),
                 ],
                 extra_arguments=[{'use_intra_process_comms': True}],
             ),
@@ -102,6 +109,8 @@ def generate_launch_description():
                 parameters=[dlio_yaml_path, dlio_params_yaml_path, map_params],
                 remappings=[
                     ('keyframes', 'dlio/odom_node/pointcloud/keyframe'),
+                    ('map', 'dlio/map_node/map'),
+                    ('save_pcd', 'dlio/map_node/save_pcd'),
                 ],
                 extra_arguments=[{'use_intra_process_comms': False}],
             ),

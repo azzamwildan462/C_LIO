@@ -27,8 +27,8 @@
     map/dense/filtered: false
     map/sparse/leafSize: 0.25
 
-    map/mode: "mapping"
-    map/path: ""
+    map/mode: "localization"
+    map/path: "" # empty = defaults to $HOME/.ros/dlio_map.pcd
     map/voxel_size: 0.25
     map/chunk_size: 20.0
     map/auto_save_interval: 30.0
@@ -36,7 +36,7 @@
     map/initial_pose/y: 0.0
     map/initial_pose/z: 0.0
     map/initial_pose/yaw: 0.0
-    map/relocalize: false
+    map/relocalize: true
     map/relocalize/sc_max_range: 40.0
     map/relocalize/sc_num_candidates: 50
     map/relocalize/sc_distance_threshold: 0.6

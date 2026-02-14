@@ -1,0 +1,11 @@
+---
+string mode
+bool relocalized
+float64 x
+float64 y
+float64 z
+float64 roll_deg
+float64 pitch_deg
+float64 yaw_deg
+float64 length_traversed
+int32 num_keyframes

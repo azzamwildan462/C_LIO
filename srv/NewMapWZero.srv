@@ -1,0 +1,4 @@
+# Same as NewMap but also resets pose to origin [0,0,0] yaw=0
+---
+bool success
+string message

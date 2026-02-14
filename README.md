@@ -101,12 +101,93 @@ The system will automatically determine the initial pose using Scan Context matc
 
 | Argument | Default | Description |
 |----------|---------|-------------|
-| `map_mode` | `mapping` | `mapping` or `localization` |
-| `map_path` | `""` | Path to PCD map file (save/load) |
-| `relocalize` | `false` | Enable Scan Context relocalization |
+| `map_mode` | `localization` | `mapping` or `localization` |
+| `map_path` | `""` | Path to PCD map file (empty = `$HOME/.ros/dlio_map.pcd`) |
+| `relocalize` | `true` | Enable Scan Context relocalization |
 | `pointcloud_topic` | `points_raw` | Input point cloud topic |
 | `imu_topic` | `imu_raw` | Input IMU topic |
 | `rviz` | `false` | Launch RViz |
+
+## Runtime Services
+
+All services are available under the `/dlio/odom_node/` namespace for runtime control without restarting the system.
+
+### Get State
+
+Query current mode, pose, orientation, and statistics.
+
+```bash
+ros2 service call /dlio/odom_node/get_state direct_lidar_inertial_odometry/srv/GetState
+```
+
+Response includes: `mode`, `relocalized`, `x`, `y`, `z`, `roll_deg`, `pitch_deg`, `yaw_deg`, `length_traversed`, `num_keyframes`.
+
+### Set Mode
+
+Switch between mapping and localization at runtime. When switching from mapping to localization, the map PCD and KFDB are auto-saved.
+
+```bash
+# Switch to mapping
+ros2 service call /dlio/odom_node/set_mode direct_lidar_inertial_odometry/srv/SetMode "{mode: 'mapping'}"
+
+# Switch to localization with a specific map
+ros2 service call /dlio/odom_node/set_mode direct_lidar_inertial_odometry/srv/SetMode \
+  "{mode: 'localization', map_path: '/path/to/map.pcd'}"
+```
+
+### Set Pose
+
+Manually set the robot pose (keeps current roll/pitch from IMU, overrides yaw).
+
+```bash
+ros2 service call /dlio/odom_node/set_pose direct_lidar_inertial_odometry/srv/SetPose \
+  "{x: 1.0, y: 2.0, z: 0.0, yaw_deg: 90.0}"
+```
+
+### Relocalize
+
+Trigger SC+GICP relocalization. Blocks until relocalization succeeds or times out (30s). Returns the resulting pose and GICP fitness score.
+
+```bash
+ros2 service call /dlio/odom_node/relocalize direct_lidar_inertial_odometry/srv/Relocalize
+```
+
+### New Map
+
+Clear all keyframes, map data in memory, and delete the map files (`.pcd` + `.kfdb`), then switch to mapping mode.
+
+```bash
+ros2 service call /dlio/odom_node/new_map direct_lidar_inertial_odometry/srv/NewMap
+```
+
+### New Map with Zero Pose
+
+Same as New Map, but also resets the robot pose to origin `[0, 0, 0]` with yaw = 0.
+
+```bash
+ros2 service call /dlio/odom_node/new_map_w_zero direct_lidar_inertial_odometry/srv/NewMapWZero
+```
+
+### Save PCD (MapNode)
+
+Manually trigger a map save via the MapNode.
+
+```bash
+ros2 service call /dlio/map_node/save_pcd direct_lidar_inertial_odometry/srv/SavePCD \
+  "{leaf_size: 0.25, save_path: '/path/to/output'}"
+```
+
+### Service Summary
+
+| Service | Topic | Description |
+|---------|-------|-------------|
+| `GetState` | `/dlio/odom_node/get_state` | Query current state and pose |
+| `SetMode` | `/dlio/odom_node/set_mode` | Switch mapping/localization mode |
+| `SetPose` | `/dlio/odom_node/set_pose` | Manually set robot pose |
+| `Relocalize` | `/dlio/odom_node/relocalize` | Trigger SC+GICP relocalization |
+| `NewMap` | `/dlio/odom_node/new_map` | Clear everything, start fresh mapping |
+| `NewMapWZero` | `/dlio/odom_node/new_map_w_zero` | Clear everything + reset pose to zero |
+| `SavePCD` | `/dlio/map_node/save_pcd` | Save current map to PCD file |
 
 ## Features in Detail
 
@@ -179,6 +260,7 @@ The prior map is spatially chunked (20m grid cells), with each chunk contributin
 | `dlio/odom_node/pointcloud/deskewed` | `sensor_msgs/PointCloud2` | Deskewed scan in world frame |
 | `dlio/odom_node/pointcloud/keyframe` | `sensor_msgs/PointCloud2` | Keyframe cloud |
 | `dlio/odom_node/keyframes` | `geometry_msgs/PoseArray` | All keyframe poses |
+| `dlio/map_node/map` | `sensor_msgs/PointCloud2` | Accumulated map (prior + live keyframes) |
 | `dlio/graph_slam/corrected_path` | `nav_msgs/Path` | Loop-closure corrected path |
 | `dlio/graph_slam/corrected_map` | `sensor_msgs/PointCloud2` | Corrected full map |
 | `dlio/graph_slam/corrected_kf_poses` | `geometry_msgs/PoseArray` | Corrected keyframe poses |

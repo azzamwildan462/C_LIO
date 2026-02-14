@@ -103,7 +103,7 @@ void dlio::MapNode::getParams() {
 
   this->declare_parameter<std::string>("odom/odom_frame", "odom");
   this->declare_parameter<double>("map/sparse/leafSize", 0.5);
-  this->declare_parameter<std::string>("map/mode", "mapping");
+  this->declare_parameter<std::string>("map/mode", "localization");
   this->declare_parameter<std::string>("map/path", "");
   this->declare_parameter<double>("map/voxel_size", 0.25);
   this->declare_parameter<double>("map/auto_save_interval", 30.0);
@@ -112,6 +112,15 @@ void dlio::MapNode::getParams() {
   this->get_parameter("map/sparse/leafSize", this->leaf_size_);
   this->get_parameter("map/mode", this->map_mode_);
   this->get_parameter("map/path", this->map_path_);
+  if (this->map_path_.empty())
+  {
+    const char *home = std::getenv("HOME");
+    if (home)
+    {
+      this->map_path_ = std::string(home) + "/.ros/dlio_map.pcd";
+      RCLCPP_INFO(this->get_logger(), "[map] map/path not set, defaulting to: %s", this->map_path_.c_str());
+    }
+  }
   this->get_parameter("map/voxel_size", this->map_voxel_size_);
   this->get_parameter("map/auto_save_interval", this->auto_save_interval_);
 }
@@ -133,6 +142,15 @@ void dlio::MapNode::loadPriorMap()
 
   RCLCPP_INFO(this->get_logger(), "[map] Loaded prior map: %zu points from %s",
               prior_cloud->points.size(), this->map_path_.c_str());
+
+  // Publish loaded map immediately for RViz visualization
+  sensor_msgs::msg::PointCloud2 map_ros;
+  pcl::toROSMsg(*this->dlio_map, map_ros);
+  map_ros.header.stamp = this->now();
+  map_ros.header.frame_id = this->odom_frame;
+  this->map_pub->publish(map_ros);
+  RCLCPP_INFO(this->get_logger(), "[map] Published prior map (%zu pts) for visualization",
+              this->dlio_map->points.size());
 }
 
 void dlio::MapNode::autoSave()
