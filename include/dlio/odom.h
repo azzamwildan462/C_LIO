@@ -162,6 +162,9 @@ private:
   void clearAllMapData();
   bool callSavePCD();
 
+  // Continuous localization (map→odom TF correction)
+  void continuousLocalize();
+
   void debug();
 
   rclcpp::TimerBase::SharedPtr publish_timer;
@@ -479,4 +482,26 @@ private:
   std::vector<ScanContextEntry> kfdb_entries_;
   std::mutex kfdb_mutex_;
   Eigen::Quaternionf kfdb_gravity_q_{1.f, 0.f, 0.f, 0.f}; // gravity quaternion for KFDB SC frame
+
+  // Continuous localization — Bayesian filter (RTAB-Map style)
+  bool continuous_localize_;
+  double continuous_localize_interval_;
+  double continuous_localize_fitness_thresh_;
+  double continuous_localize_max_correction_;
+  std::string map_frame_;
+
+  // Bayesian state
+  float bayes_virtual_place_prior_;   // P(new place) prior, default 0.9
+  float bayes_loop_threshold_;        // posterior threshold to accept, default 0.5
+  int bayes_min_consecutive_;         // required consecutive accepts, default 2
+  int bayes_consecutive_accepts_;     // current consecutive count
+  std::vector<float> bayes_posterior_; // [0]=virtual place, [1..N]=keyframes
+
+  Eigen::Matrix4f T_map_odom_;     // TF: map→odom correction
+  std::mutex continuous_localize_mtx_;
+  rclcpp::TimerBase::SharedPtr continuous_localize_timer_;
+  pcl::PointCloud<PointType>::ConstPtr latest_scan_;  // body/sensor frame
+  Eigen::Matrix4f latest_scan_T_;                      // T at time of scan (body→odom)
+  double latest_scan_time_;                             // wall time when scan was stored
+  std::mutex latest_scan_mtx_;
 };

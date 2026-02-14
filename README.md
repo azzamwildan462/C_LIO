@@ -12,6 +12,7 @@ This fork adds three major capabilities on top of the original DLIO:
 | **Scan Context Relocalization** | Automatic initial pose estimation when loading a prior map, using Scan Context descriptors + GICP refinement |
 | **Keyframe Database (KFDB)** | Persistent storage of real keyframe Scan Context descriptors for accurate relocalization |
 | **Prior Map Localization** | Load a previously built map and localize against it |
+| **Continuous Localization** | Periodic background GICP against global prior map with `map→odom` TF correction (like RTAB-Map) |
 | **Composable Nodes** | All nodes run in a single process with intra-process communication for lower latency |
 
 ## Architecture
@@ -250,6 +251,28 @@ Both modes support loading a prior map from PCD:
 
 The prior map is spatially chunked (20m grid cells), with each chunk contributing a virtual keyframe for submap building.
 
+### Continuous Localization
+
+When enabled (`map/continuous_localize: true`), a background timer periodically runs GICP alignment of the latest scan against the **global prior map** to compute a `map→odom` TF correction. This follows the standard ROS 2 localization architecture (like RTAB-Map, AMCL):
+
+```
+TF tree:  map → odom → base_link → {imu, lidar}
+              ↑           ↑
+     continuous GICP    odometry (smooth)
+```
+
+- **`odom→base_link`**: Published by DLIO odometry (smooth, continuous)
+- **`map→odom`**: Published by continuous localization (periodic correction for global drift)
+
+External nodes that need the globally-corrected pose should look up `map→base_link` through the TF tree.
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `map/continuous_localize` | `true` | Enable periodic global GICP correction |
+| `map/continuous_localize/interval` | `2.0` | Time between corrections (seconds) |
+| `map/continuous_localize/fitness_threshold` | `0.5` | Max GICP fitness score to accept correction |
+| `frames/map` | `map` | Map frame name for TF |
+
 ## Published Topics
 
 | Topic | Type | Description |
@@ -265,6 +288,15 @@ The prior map is spatially chunked (20m grid cells), with each chunk contributin
 | `dlio/graph_slam/corrected_map` | `sensor_msgs/PointCloud2` | Corrected full map |
 | `dlio/graph_slam/corrected_kf_poses` | `geometry_msgs/PoseArray` | Corrected keyframe poses |
 | `dlio/graph_slam/loop_closures` | `visualization_msgs/MarkerArray` | Loop closure visualization |
+
+### TF Transforms
+
+| Parent | Child | Description |
+|--------|-------|-------------|
+| `map` | `odom` | Global correction from continuous localization (when enabled) |
+| `odom` | `base_link` | Odometry pose (smooth, continuous) |
+| `base_link` | `imu` | Static IMU extrinsics |
+| `base_link` | `lidar` | Static LiDAR extrinsics |
 
 ## Subscribed Topics
 
