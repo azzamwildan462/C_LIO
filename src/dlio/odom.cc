@@ -272,8 +272,37 @@ dlio::OdomNode::OdomNode(const rclcpp::NodeOptions &options)
     this->continuous_localize_timer_ = this->create_wall_timer(
         std::chrono::duration<double>(this->continuous_localize_interval_),
         std::bind(&dlio::OdomNode::continuousLocalize, this));
-    RCLCPP_INFO(this->get_logger(), "Continuous localization enabled: interval=%.1fs, fitness_thresh=%.2f",
-                this->continuous_localize_interval_, this->continuous_localize_fitness_thresh_);
+
+    // Publish confidence every tick so other nodes know alignment quality
+    this->confidence_pub_ = this->create_publisher<std_msgs::msg::Float32>("localization_confidence", 10);
+
+    // Subscriber to enable/disable global (Stage 2) correction
+    this->global_correction_sub_ = this->create_subscription<std_msgs::msg::Bool>(
+        "enable_global_correction", 10,
+        [this](const std_msgs::msg::Bool::SharedPtr msg)
+        {
+          bool prev = this->enable_global_correction_.load();
+          this->enable_global_correction_.store(msg->data);
+          if (prev != msg->data)
+          {
+            RCLCPP_INFO(this->get_logger(), "[bayes] global correction %s",
+                        msg->data ? "ENABLED" : "DISABLED (drift-only mode)");
+            if (!msg->data)
+            {
+              // Reset consecutive when disabling — prevent stale reloc state
+              this->bayes_consecutive_accepts_ = 0;
+            }
+          }
+        });
+
+    bool enable_global_default = true;
+    dlio::declare_param(this, "map/continuous_localize/enable_global_correction",
+                        enable_global_default, true);
+    this->enable_global_correction_.store(enable_global_default);
+
+    RCLCPP_INFO(this->get_logger(), "Continuous localization enabled: interval=%.1fs, fitness_thresh=%.2f, global_corr=%s",
+                this->continuous_localize_interval_, this->continuous_localize_fitness_thresh_,
+                enable_global_default ? "on" : "off");
   }
 
   // Register atexit handler for KFDB saving (mapping mode)
@@ -4147,6 +4176,15 @@ void dlio::OdomNode::continuousLocalize()
   {
     // Virtual place wins — no correction, reset consecutive
     this->bayes_consecutive_accepts_ = 0;
+
+    // Publish low confidence: P_loop scaled down (not in a recognized place)
+    this->last_confidence_ = P_loop * 0.5f;
+    if (this->confidence_pub_)
+    {
+      std_msgs::msg::Float32 msg;
+      msg.data = this->last_confidence_;
+      this->confidence_pub_->publish(msg);
+    }
     return;
   }
 
@@ -4244,7 +4282,8 @@ void dlio::OdomNode::continuousLocalize()
   }
 
   // ── Stage 2: GICP at keyframe position (relocalization fallback) ──
-  if (!gicp_ok)
+  //   Only active when enable_global_correction is true.
+  if (!gicp_ok && this->enable_global_correction_.load())
   {
     float est_kf_dist = (est_pos - kf_pos).norm();
     if (est_kf_dist > 1.0f)
@@ -4282,6 +4321,15 @@ void dlio::OdomNode::continuousLocalize()
   if (!gicp_ok)
   {
     this->bayes_consecutive_accepts_ = 0;
+
+    // Publish low confidence: P_loop is high but GICP can't match
+    this->last_confidence_ = P_loop * 0.3f;
+    if (this->confidence_pub_)
+    {
+      std_msgs::msg::Float32 msg;
+      msg.data = this->last_confidence_;
+      this->confidence_pub_->publish(msg);
+    }
     return;
   }
 
@@ -4292,18 +4340,33 @@ void dlio::OdomNode::continuousLocalize()
   Eigen::Quaternionf q_corr(delta.block<3, 3>(0, 0));
   float correction_angle = 2.f * std::acos(std::min(std::abs(q_corr.w()), 1.f)) * 180.f / M_PI;
 
+  // Confidence score: how trustworthy is this GICP correction?
+  //   fitness_conf = 1 - fitness/threshold  (1.0 = perfect match, 0.0 = at threshold)
+  //   confidence = fitness_conf × P_loop    (combined GICP + Bayesian certainty)
+  float fitness_conf = std::max(0.0f, 1.0f - fitness / static_cast<float>(this->continuous_localize_fitness_thresh_));
+  float confidence = fitness_conf * P_loop;
+
+  // Publish confidence every tick GICP succeeds
+  this->last_confidence_ = confidence;
+  if (this->confidence_pub_)
+  {
+    std_msgs::msg::Float32 msg;
+    msg.data = confidence;
+    this->confidence_pub_->publish(msg);
+  }
+
   // For normal drift correction, limit max correction.
-  // For relocalization, allow much larger corrections (robot may be far off).
-  float max_corr_dist = is_reloc ? 100.0f : this->continuous_localize_max_correction_;
-  float max_corr_angle = is_reloc ? 180.0f : (this->continuous_localize_max_correction_ * 5.0f);
+  // For relocalization, no distance/angle limit — the 3-consecutive requirement provides safety.
   int required_consecutive = is_reloc ? std::max(this->bayes_min_consecutive_, 3) : this->bayes_min_consecutive_;
 
-  if (correction_dist > max_corr_dist || correction_angle > max_corr_angle)
+  if (!is_reloc &&
+      (correction_dist > this->continuous_localize_max_correction_ ||
+       correction_angle > this->continuous_localize_max_correction_ * 5.0f))
   {
     this->bayes_consecutive_accepts_ = 0;
     RCLCPP_WARN(this->get_logger(),
-                "[bayes] correction too large (dist=%.3fm, angle=%.1f deg, reloc=%d), rejected",
-                correction_dist, correction_angle, is_reloc);
+                "[bayes] correction too large (dist=%.3fm, angle=%.1f deg), confidence=%.2f, rejected",
+                correction_dist, correction_angle, confidence);
     return;
   }
 
@@ -4311,9 +4374,8 @@ void dlio::OdomNode::continuousLocalize()
   this->bayes_consecutive_accepts_++;
 
   RCLCPP_INFO(this->get_logger(),
-              "[bayes] GICP PASS%s: kf=%d fitness=%.4f corr=[%.3f,%.3f,%.3f] dist=%.3fm angle=%.1fdeg | consecutive=%d/%d",
-              is_reloc ? " (RELOC)" : "", best_kf_idx, fitness,
-              T_map_odom_new(0, 3), T_map_odom_new(1, 3), T_map_odom_new(2, 3),
+              "[bayes] GICP PASS%s: kf=%d fitness=%.4f conf=%.2f dist=%.3fm angle=%.1fdeg | consecutive=%d/%d",
+              is_reloc ? " (RELOC)" : "", best_kf_idx, fitness, confidence,
               correction_dist, correction_angle,
               this->bayes_consecutive_accepts_, required_consecutive);
 
@@ -4335,9 +4397,9 @@ void dlio::OdomNode::continuousLocalize()
       this->bayes_posterior_.clear();
 
     RCLCPP_INFO(this->get_logger(),
-                "[bayes] >>> ACCEPTED %s correction (dist=%.3fm, angle=%.1f deg, fitness=%.4f, P_loop=%.3f)",
+                "[bayes] >>> ACCEPTED %s correction (dist=%.3fm, angle=%.1f deg, fitness=%.4f, confidence=%.2f, P_loop=%.3f)",
                 is_reloc ? "RELOCALIZATION" : "map->odom",
-                correction_dist, correction_angle, fitness, P_loop);
+                correction_dist, correction_angle, fitness, confidence, P_loop);
   }
 }
 

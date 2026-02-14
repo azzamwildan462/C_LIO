@@ -22,6 +22,8 @@
 #include <nav_msgs/msg/path.hpp>
 #include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
+#include <std_msgs/msg/float32.hpp>
+#include <std_msgs/msg/bool.hpp>
 #include <tf2_ros/transform_broadcaster.h>
 #include <direct_lidar_inertial_odometry/srv/set_mode.hpp>
 #include <direct_lidar_inertial_odometry/srv/relocalize.hpp>
@@ -504,4 +506,10 @@ private:
   Eigen::Matrix4f latest_scan_T_;                      // T at time of scan (body→odom)
   double latest_scan_time_;                             // wall time when scan was stored
   std::mutex latest_scan_mtx_;
+
+  // Confidence publisher + global correction control
+  rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr confidence_pub_;
+  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr global_correction_sub_;
+  std::atomic<bool> enable_global_correction_{true};
+  float last_confidence_{0.0f};
 };

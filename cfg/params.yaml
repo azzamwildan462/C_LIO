@@ -50,6 +50,7 @@
     map/continuous_localize/loop_threshold: 0.5
     map/continuous_localize/min_consecutive: 2
     map/continuous_localize/max_correction: 2.0
+    map/continuous_localize/enable_global_correction: true
 
     odom/gravity: 9.80665
     odom/computeTimeOffset: true
