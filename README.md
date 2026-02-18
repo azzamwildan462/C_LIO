@@ -35,6 +35,39 @@ This fork adds three major capabilities on top of the original DLIO:
 
 All three nodes run as composable components in a single multi-threaded container, with intra-process communication (IPC) enabled for OdomNode and GraphSlamNode.
 
+## Code Structure
+
+The `OdomNode` class is split across multiple source files for maintainability. All files implement methods of the same `dlio::OdomNode` class via separate translation units.
+
+```
+include/dlio/
+├── odom.h                  # OdomNode class declaration
+├── map.h                   # MapNode class declaration
+├── graph_slam.h            # GraphSlamNode class declaration
+├── scan_context.h          # Shared Scan Context utilities (header-only)
+├── kfdb_io.h               # Keyframe Database I/O interface
+├── utils.h                 # Common types and utilities
+└── dlio.h                  # Package-wide defines
+
+src/dlio/
+├── odom.cc                 # Constructor, getParams(), start()
+├── odom_callbacks.cc       # callbackPointCloud, callbackImu, deskewing, preprocessing
+├── odom_registration.cc    # GICP/NDT alignment, IMU integration, state propagation
+├── odom_keyframes.cc       # Keyframe management, submap building, metrics
+├── odom_relocalization.cc  # Prior map loading, SC database, relocalization, KFDB save/load
+├── odom_services.cc        # ROS services, publishing, continuous localization, debug
+├── kfdb_io.cc              # KFDB binary file read/write (standalone module)
+├── map.cc                  # MapNode implementation
+├── map_node.cc             # MapNode component registration
+├── graph_slam.cc           # GraphSlamNode implementation
+└── graph_slam_node.cc      # GraphSlamNode component registration
+```
+
+### Shared Modules
+
+- **`scan_context.h`** — Header-only library (`namespace dlio::sc`) containing Scan Context descriptor computation, ring key extraction, distance calculation, and gravity-aligned scan preparation. Used by both `OdomNode` and `GraphSlamNode`.
+- **`kfdb_io.h` / `kfdb_io.cc`** — Standalone KFDB binary file I/O (`namespace dlio::kfdb`). Handles reading and writing the `.kfdb` keyframe database files independently of the node class.
+
 ## Dependencies
 
 - Ubuntu 22.04
@@ -43,6 +76,7 @@ All three nodes run as composable components in a single multi-threaded containe
 - Point Cloud Library >= 1.10.0
 - Eigen >= 3.3.7
 - g2o (via `ros-humble-libg2o`)
+- [ndt_omp](https://github.com/koide3/ndt_omp) (optional NDT registration backend)
 - OpenMP >= 4.5
 
 ```bash
@@ -105,6 +139,8 @@ The system will automatically determine the initial pose using Scan Context matc
 | `map_mode` | `localization` | `mapping` or `localization` |
 | `map_path` | `""` | Path to PCD map file (empty = `$HOME/.ros/dlio_map.pcd`) |
 | `relocalize` | `true` | Enable Scan Context relocalization |
+| `use_corrected` | `true` | Load graph-optimized `_corrected` map/KFDB files in localization mode |
+| `registration_method` | `gicp` | Point cloud registration: `gicp` or `ndt` |
 | `pointcloud_topic` | `points_raw` | Input point cloud topic |
 | `imu_topic` | `imu_raw` | Input IMU topic |
 | `rviz` | `false` | Launch RViz |
@@ -307,7 +343,9 @@ External nodes that need the globally-corrected pose should look up `map→base_
 
 ## Key Changes from Original DLIO
 
+- **Modular code structure**: `OdomNode` split into 6 focused source files + shared utility modules (`scan_context.h`, `kfdb_io`)
 - **Composable node architecture**: All nodes in a single process with IPC, replacing separate executables
+- **NDT-OMP registration**: Optional NDT backend via `registration_method:=ndt` (default remains GICP)
 - **C++ 17** (was C++ 14)
 - **g2o dependency** for pose graph optimization
 - **Custom `KeyframeStamped` message** for passing keyframe data between nodes
@@ -339,6 +377,7 @@ Original repository: [https://github.com/vectr-ucla/direct_lidar_inertial_odomet
 - [NanoFLANN](https://github.com/jlblancoc/nanoflann) — Jose Luis Blanco and Pranjal Kumar Rai
 - [Scan Context](https://github.com/irapkaist/scancontext) — Giseop Kim and Ayoung Kim (KAIST)
 - [g2o](https://github.com/RainerKuemmerle/g2o) — Rainer Kuemmerle et al.
+- [NDT-OMP](https://github.com/koide3/ndt_omp) — Kenji Koide et al.
 
 ## License
 

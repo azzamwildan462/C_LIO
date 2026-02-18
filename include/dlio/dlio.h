@@ -11,6 +11,9 @@
  *                                                         *
  ***********************************************************/
 
+#ifndef DLIO_DLIO_H
+#define DLIO_DLIO_H
+
 // SYSTEM
 #include <atomic>
 
@@ -83,3 +86,5 @@ POINT_CLOUD_REGISTER_POINT_STRUCT(dlio::Point,
                                  (double, timestamp, timestamp))
 
 typedef dlio::Point PointType;
+
+#endif // DLIO_DLIO_H

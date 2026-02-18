@@ -12,6 +12,7 @@
  ***********************************************************/
 
 #include "dlio/dlio.h"
+#include "dlio/scan_context.h"
 
 // ROS
 #include "rclcpp/rclcpp.hpp"
@@ -110,7 +111,6 @@ private:
   void updateState();
 
   void setAdaptiveParams();
-  void setKeyframeCloud();
 
   void computeMetrics();
   void computeSpaciousness();
@@ -128,24 +128,8 @@ private:
 
   void loadPriorMap();
 
-  // Scan Context Relocalization
-  static constexpr int SC_NR = 20;               // number of rings
-  static constexpr int SC_NS = 60;               // number of sectors
-  using ScanContextDescriptor = Eigen::MatrixXf; // NR x NS
-  using RingKey = Eigen::VectorXf;               // NR
-
-  struct ScanContextEntry
-  {
-    ScanContextDescriptor descriptor;
-    RingKey ring_key;
-    Eigen::Vector3f position;
-    Eigen::Quaternionf orientation;
-  };
-
-  ScanContextDescriptor computeScanContext(pcl::PointCloud<PointType>::ConstPtr cloud, float max_range);
-  RingKey computeRingKey(const ScanContextDescriptor &desc);
+  // Scan Context Relocalization (types in dlio/scan_context.h)
   void buildScanContextDatabase();
-  std::pair<float, int> computeScanContextDistance(const ScanContextDescriptor &a, const ScanContextDescriptor &b);
   bool runRelocalization(pcl::PointCloud<PointType>::ConstPtr scan);
 
   // Keyframe Database (KFDB) — save real SC descriptors during mapping
@@ -328,6 +312,8 @@ private:
   double first_imu_stamp;
   double prev_imu_stamp;
   double imu_dp, imu_dq_deg;
+  double imu_transform_prev_stamp_ = 0.0;
+  Eigen::Vector3f imu_transform_ang_vel_prev_ = Eigen::Vector3f::Zero();
 
   struct ImuMeas
   {
@@ -403,6 +389,9 @@ private:
     std::vector<float> density;
   };
   Metrics metrics;
+  float spaciousness_median_prev_ = 0.f;
+  float density_prev_ = 0.f;
+  uint8_t debug_print_counter_ = 0;
 
   std::string cpu_type;
   std::vector<double> cpu_percents;
@@ -495,12 +484,12 @@ private:
   int sc_max_attempts_;
   int sc_attempt_count_;
   double last_reloc_fitness_;
-  std::vector<ScanContextEntry> sc_database_;
+  std::vector<dlio::sc::ScanContextEntry> sc_database_;
   pcl::PointCloud<PointType>::Ptr prior_map_cloud_;
   std::shared_ptr<nanoflann::KdTreeFLANN<PointType>> prior_map_kdtree_;
 
   // KFDB entries accumulated during mapping
-  std::vector<ScanContextEntry> kfdb_entries_;
+  std::vector<dlio::sc::ScanContextEntry> kfdb_entries_;
   std::mutex kfdb_mutex_;
   Eigen::Quaternionf kfdb_gravity_q_{1.f, 0.f, 0.f, 0.f}; // gravity quaternion for KFDB SC frame
 
