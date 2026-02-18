@@ -52,6 +52,8 @@ public:
   explicit GraphSlamNode(const rclcpp::NodeOptions& options = rclcpp::NodeOptions());
   ~GraphSlamNode();
 
+  void saveOnShutdown();
+
 private:
 
   // --- Keyframe storage ---
@@ -94,7 +96,9 @@ private:
   void publishCorrectedData();
   void publishLoopClosureMarkers();
 
-  // --- Save PCD service ---
+  // --- Map save ---
+  void saveGraphMaps(const std::string& save_dir, float leaf_size);
+  void autoSave();
   void savePCD(std::shared_ptr<direct_lidar_inertial_odometry::srv::SavePCD::Request> req,
                std::shared_ptr<direct_lidar_inertial_odometry::srv::SavePCD::Response> res);
 
@@ -111,6 +115,7 @@ private:
   rclcpp::CallbackGroup::SharedPtr save_pcd_cb_group;
 
   rclcpp::TimerBase::SharedPtr loop_timer;
+  rclcpp::TimerBase::SharedPtr auto_save_timer_;
 
   // --- Data ---
   std::vector<Keyframe> keyframes;
@@ -122,6 +127,7 @@ private:
   std::mutex corrected_mutex;
 
   std::atomic<bool> optimization_done;
+  std::atomic<bool> shutdown_saved_;
   int last_loop_checked_idx;
 
   // --- Frames ---
@@ -151,6 +157,12 @@ private:
   double loop_edge_info_scale_;
 
   bool debug_;
+
+  // map save
+  std::string map_mode_;
+  std::string map_path_;
+  double map_voxel_size_;
+  double auto_save_interval_;
 
 };
 

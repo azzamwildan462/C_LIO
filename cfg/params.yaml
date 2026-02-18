@@ -30,6 +30,7 @@
 
     map/mode: "localization"
     map/path: "" # empty = defaults to $HOME/.ros/dlio_map.pcd
+    map/use_corrected: true # load graph-optimized _corrected files in localization mode
     map/voxel_size: 0.25
     map/chunk_size: 20.0
     map/auto_save_interval: 30.0

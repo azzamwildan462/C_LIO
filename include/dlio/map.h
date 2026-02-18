@@ -58,6 +58,7 @@ private:
   std::string odom_frame;
   std::string map_mode_;
   std::string map_path_;
+  bool use_corrected_;
   double map_voxel_size_;
   double auto_save_interval_;
 

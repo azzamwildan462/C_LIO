@@ -231,9 +231,20 @@ dlio::OdomNode::OdomNode(const rclcpp::NodeOptions &options)
       std::bind(&dlio::OdomNode::srvNewMapWZero, this, std::placeholders::_1, std::placeholders::_2),
       rmw_qos_profile_services_default, this->service_cb_group_);
 
-  // SavePCD client (calls MapNode's save_pcd service)
+  // SavePCD clients (calls MapNode + GraphSlam save services)
   this->save_pcd_client_ = this->create_client<direct_lidar_inertial_odometry::srv::SavePCD>(
       "save_pcd_map", rmw_qos_profile_services_default, this->service_cb_group_);
+  this->save_corrected_pcd_client_ = this->create_client<direct_lidar_inertial_odometry::srv::SavePCD>(
+      "save_corrected_pcd", rmw_qos_profile_services_default, this->service_cb_group_);
+
+  // Subscribe to corrected keyframe poses from graph_slam
+  this->corrected_kf_poses_sub_ = this->create_subscription<geometry_msgs::msg::PoseArray>(
+      "corrected_kf_poses", 10,
+      [this](const geometry_msgs::msg::PoseArray::SharedPtr msg)
+      {
+        std::lock_guard<std::mutex> lock(this->corrected_kf_poses_mutex_);
+        this->corrected_kf_poses_ = msg->poses;
+      });
 
   // Map load
   this->prior_map_pose_set_ = false;
@@ -323,13 +334,30 @@ dlio::OdomNode::~OdomNode()
 
 void dlio::OdomNode::loadPriorMap()
 {
-  RCLCPP_INFO(this->get_logger(), "Loading prior map from: %s", this->map_path_.c_str());
+  // Resolve load path: try corrected file first if use_corrected is enabled
+  std::string load_path = this->map_path_;
+  if (this->use_corrected_)
+  {
+    std::filesystem::path p(this->map_path_);
+    std::string corrected = p.parent_path().string() + "/" + p.stem().string() + "_corrected.pcd";
+    if (std::filesystem::exists(corrected))
+    {
+      load_path = corrected;
+      RCLCPP_INFO(this->get_logger(), "Using corrected map: %s", corrected.c_str());
+    }
+    else
+    {
+      RCLCPP_WARN(this->get_logger(), "Corrected map not found (%s), falling back to raw", corrected.c_str());
+    }
+  }
+
+  RCLCPP_INFO(this->get_logger(), "Loading prior map from: %s", load_path.c_str());
 
   // 1. Load PCD file
   pcl::PointCloud<PointType>::Ptr cloud = std::make_shared<pcl::PointCloud<PointType>>();
-  if (pcl::io::loadPCDFile(this->map_path_, *cloud) == -1)
+  if (pcl::io::loadPCDFile(load_path, *cloud) == -1)
   {
-    RCLCPP_ERROR(this->get_logger(), "Failed to load PCD file: %s", this->map_path_.c_str());
+    RCLCPP_ERROR(this->get_logger(), "Failed to load PCD file: %s", load_path.c_str());
     this->use_prior_map_ = false;
     return;
   }
@@ -954,11 +982,18 @@ std::string dlio::OdomNode::getKfdbPath() const
     return "";
   std::string path = this->map_path_;
   size_t dot = path.rfind('.');
-  if (dot != std::string::npos && path.substr(dot) == ".pcd")
+  std::string stem = (dot != std::string::npos && path.substr(dot) == ".pcd")
+                       ? path.substr(0, dot) : path;
+
+  // If use_corrected, try corrected KFDB first
+  if (this->use_corrected_)
   {
-    return path.substr(0, dot) + ".kfdb";
+    std::string corrected = stem + "_corrected.kfdb";
+    if (std::filesystem::exists(corrected))
+      return corrected;
+    // fall back to raw
   }
-  return path + ".kfdb";
+  return stem + ".kfdb";
 }
 
 void dlio::OdomNode::computeAndStoreKeyframeSC()
@@ -1115,6 +1150,98 @@ bool dlio::OdomNode::saveKeyframeDatabase()
 
   ofs.close();
   RCLCPP_INFO(this->get_logger(), "KFDB: saved %u entries to %s", num_entries, kfdb_path.c_str());
+  return true;
+}
+
+bool dlio::OdomNode::saveCorrectedKeyframeDatabase()
+{
+  // Get corrected poses from graph_slam
+  std::vector<geometry_msgs::msg::Pose> corrected_poses;
+  {
+    std::lock_guard<std::mutex> lock(this->corrected_kf_poses_mutex_);
+    corrected_poses = this->corrected_kf_poses_;
+  }
+
+  if (corrected_poses.empty())
+  {
+    RCLCPP_INFO(this->get_logger(), "KFDB corrected: no corrected poses from graph_slam, skipping");
+    return false;
+  }
+
+  // Derive path: dlio_map.pcd → dlio_map_corrected.kfdb
+  std::string kfdb_path;
+  {
+    std::string path = this->map_path_;
+    size_t dot = path.rfind('.');
+    if (dot != std::string::npos && path.substr(dot) == ".pcd")
+      kfdb_path = path.substr(0, dot) + "_corrected.kfdb";
+    else
+      kfdb_path = path + "_corrected.kfdb";
+  }
+
+  std::lock_guard<std::mutex> lock(this->kfdb_mutex_);
+  if (this->kfdb_entries_.empty())
+    return false;
+
+  uint32_t num_entries = static_cast<uint32_t>(
+      std::min(this->kfdb_entries_.size(), corrected_poses.size()));
+
+  std::filesystem::path filepath(kfdb_path);
+  if (filepath.has_parent_path())
+    std::filesystem::create_directories(filepath.parent_path());
+
+  std::ofstream ofs(kfdb_path, std::ios::binary);
+  if (!ofs.is_open())
+  {
+    RCLCPP_ERROR(this->get_logger(), "KFDB corrected: cannot open %s for writing", kfdb_path.c_str());
+    return false;
+  }
+
+  // Same format as regular KFDB
+  uint32_t magic = 0x4B464442;
+  uint32_t version = 2;
+  uint32_t sc_nr = SC_NR;
+  uint32_t sc_ns = SC_NS;
+  float sc_max_range = this->sc_max_range_;
+
+  ofs.write(reinterpret_cast<const char *>(&magic), sizeof(magic));
+  ofs.write(reinterpret_cast<const char *>(&version), sizeof(version));
+  ofs.write(reinterpret_cast<const char *>(&sc_nr), sizeof(sc_nr));
+  ofs.write(reinterpret_cast<const char *>(&sc_ns), sizeof(sc_ns));
+  ofs.write(reinterpret_cast<const char *>(&sc_max_range), sizeof(sc_max_range));
+  ofs.write(reinterpret_cast<const char *>(&num_entries), sizeof(num_entries));
+  float gq[4] = {this->kfdb_gravity_q_.w(), this->kfdb_gravity_q_.x(),
+                 this->kfdb_gravity_q_.y(), this->kfdb_gravity_q_.z()};
+  ofs.write(reinterpret_cast<const char *>(gq), sizeof(gq));
+
+  // Write entries with corrected poses
+  for (uint32_t i = 0; i < num_entries; ++i)
+  {
+    const auto &entry = this->kfdb_entries_[i];
+    const auto &pose = corrected_poses[i];
+
+    // Corrected position
+    float pos[3] = {static_cast<float>(pose.position.x),
+                    static_cast<float>(pose.position.y),
+                    static_cast<float>(pose.position.z)};
+    ofs.write(reinterpret_cast<const char *>(pos), 3 * sizeof(float));
+
+    // Corrected orientation
+    float qdata[4] = {static_cast<float>(pose.orientation.w),
+                      static_cast<float>(pose.orientation.x),
+                      static_cast<float>(pose.orientation.y),
+                      static_cast<float>(pose.orientation.z)};
+    ofs.write(reinterpret_cast<const char *>(qdata), 4 * sizeof(float));
+
+    // SC descriptor + ring key unchanged
+    ofs.write(reinterpret_cast<const char *>(entry.descriptor.data()),
+              SC_NR * SC_NS * sizeof(float));
+    ofs.write(reinterpret_cast<const char *>(entry.ring_key.data()),
+              SC_NR * sizeof(float));
+  }
+
+  ofs.close();
+  RCLCPP_INFO(this->get_logger(), "KFDB corrected: saved %u entries to %s", num_entries, kfdb_path.c_str());
   return true;
 }
 
@@ -1350,6 +1477,7 @@ void dlio::OdomNode::getParams()
       RCLCPP_INFO(this->get_logger(), "map/path not set, defaulting to: %s", this->map_path_.c_str());
     }
   }
+  dlio::declare_param(this, "map/use_corrected", this->use_corrected_, true);
   dlio::declare_param(this, "map/voxel_size", this->map_voxel_size_, 0.25);
   dlio::declare_param(this, "map/chunk_size", this->map_chunk_size_, 20.0);
 
@@ -3331,9 +3459,15 @@ void dlio::OdomNode::srvSetMode(
       {
         RCLCPP_INFO(this->get_logger(), "[SetMode] Saved map PCD before switching to localization");
       }
-      // Save KFDB
+      // Save corrected maps via GraphSlam service (odom + corrected)
+      if (this->callSaveCorrectedPCD())
+      {
+        RCLCPP_INFO(this->get_logger(), "[SetMode] Saved corrected maps before switching to localization");
+      }
+      // Save KFDB (raw + corrected)
       this->saveKeyframeDatabase();
       RCLCPP_INFO(this->get_logger(), "[SetMode] Saved KFDB before switching to localization");
+      this->saveCorrectedKeyframeDatabase();
     }
   }
 
@@ -3610,30 +3744,55 @@ bool dlio::OdomNode::callSavePCD()
   auto request = std::make_shared<direct_lidar_inertial_odometry::srv::SavePCD::Request>();
   request->leaf_size = static_cast<float>(this->map_voxel_size_);
 
-  // Extract directory from map_path_ (e.g. "/home/user/.ros/dlio_map.pcd" -> "/home/user/.ros")
   std::filesystem::path p(this->map_path_);
   request->save_path = p.parent_path().string();
 
-  RCLCPP_INFO(this->get_logger(), "[SavePCD] Calling save_pcd: path='%s', leaf=%.2f",
+  RCLCPP_INFO(this->get_logger(), "[SavePCD] Requesting save_pcd (async): path='%s', leaf=%.2f",
               request->save_path.c_str(), request->leaf_size);
 
-  auto future = this->save_pcd_client_->async_send_request(request);
-  if (future.wait_for(std::chrono::seconds(30)) != std::future_status::ready)
+  // Use async callback to avoid deadlock (service-within-service in same executor)
+  auto logger = this->get_logger();
+  this->save_pcd_client_->async_send_request(request,
+    [logger](rclcpp::Client<direct_lidar_inertial_odometry::srv::SavePCD>::SharedFuture future) {
+      auto result = future.get();
+      if (result->success) {
+        RCLCPP_INFO(logger, "[SavePCD] Map saved successfully");
+      } else {
+        RCLCPP_WARN(logger, "[SavePCD] Map save failed");
+      }
+    });
+  return true;  // request sent, will complete asynchronously
+}
+
+bool dlio::OdomNode::callSaveCorrectedPCD()
+{
+  if (!this->save_corrected_pcd_client_->wait_for_service(std::chrono::seconds(2)))
   {
-    RCLCPP_WARN(this->get_logger(), "[SavePCD] Timed out waiting for save_pcd response");
+    RCLCPP_WARN(this->get_logger(), "[SavePCD] GraphSlam save_corrected_pcd service not available");
     return false;
   }
 
-  auto result = future.get();
-  if (result->success)
-  {
-    RCLCPP_INFO(this->get_logger(), "[SavePCD] Map saved successfully");
-  }
-  else
-  {
-    RCLCPP_WARN(this->get_logger(), "[SavePCD] Map save failed");
-  }
-  return result->success;
+  auto request = std::make_shared<direct_lidar_inertial_odometry::srv::SavePCD::Request>();
+  request->leaf_size = static_cast<float>(this->map_voxel_size_);
+
+  std::filesystem::path p(this->map_path_);
+  request->save_path = p.parent_path().string();
+
+  RCLCPP_INFO(this->get_logger(), "[SavePCD] Requesting save_corrected_pcd (async): path='%s', leaf=%.2f",
+              request->save_path.c_str(), request->leaf_size);
+
+  // Use async callback to avoid deadlock (service-within-service in same executor)
+  auto logger = this->get_logger();
+  this->save_corrected_pcd_client_->async_send_request(request,
+    [logger](rclcpp::Client<direct_lidar_inertial_odometry::srv::SavePCD>::SharedFuture future) {
+      auto result = future.get();
+      if (result->success) {
+        RCLCPP_INFO(logger, "[SavePCD] Corrected map saved successfully");
+      } else {
+        RCLCPP_WARN(logger, "[SavePCD] Corrected map save failed");
+      }
+    });
+  return true;  // request sent, will complete asynchronously
 }
 
 void dlio::OdomNode::clearAllMapData()
@@ -3661,6 +3820,10 @@ void dlio::OdomNode::clearAllMapData()
     std::lock_guard<std::mutex> kfdb_lock(this->kfdb_mutex_);
     this->kfdb_entries_.clear();
   }
+  {
+    std::lock_guard<std::mutex> lock(this->corrected_kf_poses_mutex_);
+    this->corrected_kf_poses_.clear();
+  }
 
   // Clear prior map
   this->prior_map_cloud_.reset();
@@ -3687,6 +3850,26 @@ void dlio::OdomNode::clearAllMapData()
   {
     std::filesystem::remove(kfdb_path);
     RCLCPP_INFO(this->get_logger(), "[NewMap] Deleted: %s", kfdb_path.c_str());
+  }
+
+  // Delete corrected files
+  if (!pcd_path.empty())
+  {
+    size_t dot = pcd_path.rfind('.');
+    std::string corrected_pcd = (dot != std::string::npos && pcd_path.substr(dot) == ".pcd")
+        ? pcd_path.substr(0, dot) + "_corrected.pcd" : pcd_path + "_corrected.pcd";
+    std::string corrected_kfdb = (dot != std::string::npos && pcd_path.substr(dot) == ".pcd")
+        ? pcd_path.substr(0, dot) + "_corrected.kfdb" : pcd_path + "_corrected.kfdb";
+    if (std::filesystem::exists(corrected_pcd))
+    {
+      std::filesystem::remove(corrected_pcd);
+      RCLCPP_INFO(this->get_logger(), "[NewMap] Deleted: %s", corrected_pcd.c_str());
+    }
+    if (std::filesystem::exists(corrected_kfdb))
+    {
+      std::filesystem::remove(corrected_kfdb);
+      RCLCPP_INFO(this->get_logger(), "[NewMap] Deleted: %s", corrected_kfdb.c_str());
+    }
   }
 
   RCLCPP_INFO(this->get_logger(), "[NewMap] All map data cleared");

@@ -14,6 +14,8 @@
 #include "dlio/graph_slam.h"
 #include "dlio/utils.h"
 
+#include <filesystem>
+
 dlio::GraphSlamNode::GraphSlamNode(const rclcpp::NodeOptions& options)
 : Node("dlio_graph_slam_node", options) {
 
@@ -31,7 +33,7 @@ dlio::GraphSlamNode::GraphSlamNode(const rclcpp::NodeOptions& options)
   // Publishers
   this->corrected_path_pub = this->create_publisher<nav_msgs::msg::Path>("corrected_path", 1);
   this->corrected_map_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>("corrected_map", 1);
-  this->corrected_kf_pose_pub = this->create_publisher<geometry_msgs::msg::PoseArray>("corrected_kf_poses", 1);
+  this->corrected_kf_pose_pub = this->create_publisher<geometry_msgs::msg::PoseArray>("corrected_kf_poses", 10);
   this->loop_closure_pub = this->create_publisher<visualization_msgs::msg::MarkerArray>("loop_closures", 1);
 
   // Service
@@ -49,13 +51,23 @@ dlio::GraphSlamNode::GraphSlamNode(const rclcpp::NodeOptions& options)
 
   this->optimization_done = false;
   this->last_loop_checked_idx = 0;
+  this->shutdown_saved_ = false;
+
+  // Auto-save timer — only in mapping mode
+  if (this->map_mode_ == "mapping" && !this->map_path_.empty() && this->auto_save_interval_ > 0.) {
+    this->auto_save_timer_ = this->create_wall_timer(
+        std::chrono::duration<double>(this->auto_save_interval_),
+        std::bind(&dlio::GraphSlamNode::autoSave, this));
+  }
 
   RCLCPP_INFO(this->get_logger(), "[graph] Initialized (min_gap=%d, range=%.1f, fitness_thresh=%.2f, debug=%s)",
               this->min_keyframe_gap_, this->range_of_searching_loop_, this->threshold_loop_closure_score_,
               this->debug_ ? "true" : "false");
 }
 
-dlio::GraphSlamNode::~GraphSlamNode() {}
+dlio::GraphSlamNode::~GraphSlamNode() {
+  this->saveOnShutdown();
+}
 
 void dlio::GraphSlamNode::getParams() {
 
@@ -80,6 +92,17 @@ void dlio::GraphSlamNode::getParams() {
   dlio::declare_param(this, "pose_graph/optimization_iterations", this->optimization_iterations_, 20);
   dlio::declare_param(this, "pose_graph/odom_edge_info_scale", this->odom_edge_info_scale_, 10.0);
   dlio::declare_param(this, "pose_graph/loop_edge_info_scale", this->loop_edge_info_scale_, 20.0);
+
+  // Map save params (shared with map node)
+  dlio::declare_param(this, "map/mode", this->map_mode_, std::string("localization"));
+  dlio::declare_param(this, "map/path", this->map_path_, std::string(""));
+  if (this->map_path_.empty()) {
+    const char* home = std::getenv("HOME");
+    if (home)
+      this->map_path_ = std::string(home) + "/.ros/dlio_map.pcd";
+  }
+  dlio::declare_param(this, "map/voxel_size", this->map_voxel_size_, 0.25);
+  dlio::declare_param(this, "map/auto_save_interval", this->auto_save_interval_, 30.0);
 }
 
 void dlio::GraphSlamNode::callbackKeyframe(
@@ -435,6 +458,108 @@ void dlio::GraphSlamNode::publishLoopClosureMarkers() {
   this->loop_closure_pub->publish(markers);
 }
 
+void dlio::GraphSlamNode::saveGraphMaps(const std::string& save_dir, float leaf_size) {
+
+  int num_kf = static_cast<int>(this->keyframes.size());
+  if (num_kf == 0) return;
+
+  std::filesystem::create_directories(save_dir);
+
+  pcl::VoxelGrid<PointType> vg;
+  vg.setLeafSize(leaf_size, leaf_size, leaf_size);
+
+  // Process in chunks to limit peak memory usage.
+  // Accumulate N keyframes, voxel filter, repeat, then merge filtered chunks.
+  constexpr int CHUNK_SIZE = 50;
+  pcl::PointCloud<PointType>::Ptr result = std::make_shared<pcl::PointCloud<PointType>>();
+
+  for (int start = 0; start < num_kf; start += CHUNK_SIZE) {
+    int end = std::min(start + CHUNK_SIZE, num_kf);
+
+    // Pre-count points in this chunk for reserve
+    size_t chunk_pts = 0;
+    for (int i = start; i < end; ++i)
+      chunk_pts += this->keyframes[i].cloud_local->points.size();
+
+    pcl::PointCloud<PointType>::Ptr chunk = std::make_shared<pcl::PointCloud<PointType>>();
+    chunk->points.reserve(chunk_pts);
+
+    for (int i = start; i < end; ++i) {
+      Eigen::Matrix4f T;
+      if (this->optimization_done && i < static_cast<int>(this->corrected_poses.size()))
+        T = this->corrected_poses[i].matrix().cast<float>();
+      else
+        T = this->keyframes[i].pose.matrix().cast<float>();
+
+      pcl::PointCloud<PointType> tmp;
+      pcl::transformPointCloud(*this->keyframes[i].cloud_local, tmp, T);
+      chunk->points.insert(chunk->points.end(), tmp.points.begin(), tmp.points.end());
+    }
+    chunk->width = chunk->points.size();
+    chunk->height = 1;
+
+    // Voxel filter chunk before merging into result
+    vg.setInputCloud(chunk);
+    vg.filter(*chunk);
+
+    result->points.insert(result->points.end(), chunk->points.begin(), chunk->points.end());
+  }
+
+  result->width = result->points.size();
+  result->height = 1;
+
+  // Final voxel pass to merge overlapping chunk boundaries
+  vg.setInputCloud(result);
+  vg.filter(*result);
+
+  if (result->points.empty()) {
+    std::cout << "[graph] saveGraphMaps: corrected cloud is empty, skipping" << std::endl;
+    return;
+  }
+
+  // Derive filename from map_path_ stem (e.g. "test_gs.pcd" -> "test_gs_corrected.pcd")
+  std::filesystem::path map_fp(this->map_path_);
+  std::string stem = map_fp.stem().string();
+  if (stem.empty()) stem = "dlio_map";
+  std::string corr_file = save_dir + "/" + stem + "_corrected.pcd";
+  int ret = pcl::io::savePCDFileBinary(corr_file, *result);
+  if (ret == 0) {
+    std::cout << "[graph] Saved corrected map: " << result->points.size() << " pts -> " << corr_file
+              << (this->optimization_done ? " (graph-optimized)" : " (no loop closures, same as raw)")
+              << std::endl;
+  } else {
+    std::cerr << "[graph] FAILED to save corrected map: " << corr_file << std::endl;
+  }
+}
+
+void dlio::GraphSlamNode::autoSave() {
+  std::lock_guard<std::mutex> lock1(this->corrected_mutex);
+  std::lock_guard<std::mutex> lock2(this->keyframes_mutex);
+  if (this->keyframes.empty()) return;
+
+  std::filesystem::path map_fp(this->map_path_);
+  std::string save_dir = map_fp.parent_path().string();
+  if (save_dir.empty()) save_dir = ".";
+
+  this->saveGraphMaps(save_dir, static_cast<float>(this->map_voxel_size_));
+}
+
+void dlio::GraphSlamNode::saveOnShutdown() {
+  if (this->map_mode_ != "mapping") return;
+  if (this->map_path_.empty()) return;
+  if (this->shutdown_saved_.exchange(true)) return;  // already saved
+
+  std::lock_guard<std::mutex> lock1(this->corrected_mutex);
+  std::lock_guard<std::mutex> lock2(this->keyframes_mutex);
+  if (this->keyframes.empty()) return;
+
+  std::filesystem::path map_fp(this->map_path_);
+  std::string save_dir = map_fp.parent_path().string();
+  if (save_dir.empty()) save_dir = ".";
+
+  this->saveGraphMaps(save_dir, static_cast<float>(this->map_voxel_size_));
+}
+
 void dlio::GraphSlamNode::savePCD(
     std::shared_ptr<direct_lidar_inertial_odometry::srv::SavePCD::Request> req,
     std::shared_ptr<direct_lidar_inertial_odometry::srv::SavePCD::Response> res) {
@@ -442,42 +567,14 @@ void dlio::GraphSlamNode::savePCD(
   std::lock_guard<std::mutex> lock1(this->corrected_mutex);
   std::lock_guard<std::mutex> lock2(this->keyframes_mutex);
 
-  pcl::PointCloud<PointType>::Ptr map = std::make_shared<pcl::PointCloud<PointType>>();
-
-  int num_kf = static_cast<int>(this->keyframes.size());
-  for (int i = 0; i < num_kf; ++i) {
-    Eigen::Matrix4f T;
-    if (this->optimization_done && i < static_cast<int>(this->corrected_poses.size())) {
-      T = this->corrected_poses[i].matrix().cast<float>();
-    } else {
-      T = this->keyframes[i].pose.matrix().cast<float>();
-    }
-
-    pcl::PointCloud<PointType>::Ptr transformed = std::make_shared<pcl::PointCloud<PointType>>();
-    pcl::transformPointCloud(*this->keyframes[i].cloud_local, *transformed, T);
-    *map += *transformed;
+  if (this->keyframes.empty()) {
+    RCLCPP_WARN(this->get_logger(), "[graph] No keyframes to save");
+    res->success = false;
+    return;
   }
 
-  // Voxel filter
-  float leaf_size = req->leaf_size;
-  pcl::VoxelGrid<PointType> vg;
-  vg.setLeafSize(leaf_size, leaf_size, leaf_size);
-  vg.setInputCloud(map);
-  vg.filter(*map);
-
-  std::string p = req->save_path;
-  std::string filename = p + "/dlio_graph_slam_map.pcd";
-
-  RCLCPP_INFO(this->get_logger(), "Saving corrected map to %s ...", filename.c_str());
-
-  int ret = pcl::io::savePCDFileBinary(filename, *map);
-  res->success = (ret == 0);
-
-  if (res->success) {
-    RCLCPP_INFO(this->get_logger(), "Map saved successfully (%zu points)", map->points.size());
-  } else {
-    RCLCPP_ERROR(this->get_logger(), "Failed to save map");
-  }
+  this->saveGraphMaps(req->save_path, req->leaf_size);
+  res->success = true;
 }
 
 #include "rclcpp_components/register_node_macro.hpp"

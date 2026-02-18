@@ -163,6 +163,8 @@ private:
   void reloadPriorMapForRelocalization();
   void clearAllMapData();
   bool callSavePCD();
+  bool callSaveCorrectedPCD();
+  bool saveCorrectedKeyframeDatabase();
 
   // Continuous localization (map→odom TF correction)
   void continuousLocalize();
@@ -184,6 +186,7 @@ private:
   rclcpp::Service<direct_lidar_inertial_odometry::srv::NewMap>::SharedPtr new_map_srv_;
   rclcpp::Service<direct_lidar_inertial_odometry::srv::NewMapWZero>::SharedPtr new_map_w_zero_srv_;
   rclcpp::Client<direct_lidar_inertial_odometry::srv::SavePCD>::SharedPtr save_pcd_client_;
+  rclcpp::Client<direct_lidar_inertial_odometry::srv::SavePCD>::SharedPtr save_corrected_pcd_client_;
   rclcpp::CallbackGroup::SharedPtr service_cb_group_;
   std::mutex state_mtx_;
 
@@ -459,6 +462,7 @@ private:
   // Map load/save
   std::string map_mode_;
   std::string map_path_;
+  bool use_corrected_;
   double map_voxel_size_;
   double map_chunk_size_;
   bool use_prior_map_;
@@ -484,6 +488,11 @@ private:
   std::vector<ScanContextEntry> kfdb_entries_;
   std::mutex kfdb_mutex_;
   Eigen::Quaternionf kfdb_gravity_q_{1.f, 0.f, 0.f, 0.f}; // gravity quaternion for KFDB SC frame
+
+  // Corrected keyframe poses from graph_slam (for corrected KFDB)
+  rclcpp::Subscription<geometry_msgs::msg::PoseArray>::SharedPtr corrected_kf_poses_sub_;
+  std::vector<geometry_msgs::msg::Pose> corrected_kf_poses_;
+  std::mutex corrected_kf_poses_mutex_;
 
   // Continuous localization — Bayesian filter (RTAB-Map style)
   bool continuous_localize_;

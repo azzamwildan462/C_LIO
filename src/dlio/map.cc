@@ -105,6 +105,7 @@ void dlio::MapNode::getParams() {
   this->declare_parameter<double>("map/sparse/leafSize", 0.5);
   this->declare_parameter<std::string>("map/mode", "localization");
   this->declare_parameter<std::string>("map/path", "");
+  this->declare_parameter<bool>("map/use_corrected", true);
   this->declare_parameter<double>("map/voxel_size", 0.25);
   this->declare_parameter<double>("map/auto_save_interval", 30.0);
 
@@ -112,6 +113,7 @@ void dlio::MapNode::getParams() {
   this->get_parameter("map/sparse/leafSize", this->leaf_size_);
   this->get_parameter("map/mode", this->map_mode_);
   this->get_parameter("map/path", this->map_path_);
+  this->get_parameter("map/use_corrected", this->use_corrected_);
   if (this->map_path_.empty())
   {
     const char *home = std::getenv("HOME");
@@ -127,9 +129,26 @@ void dlio::MapNode::getParams() {
 
 void dlio::MapNode::loadPriorMap()
 {
+  // Resolve load path: try corrected file first if use_corrected is enabled
+  std::string load_path = this->map_path_;
+  if (this->use_corrected_)
+  {
+    std::filesystem::path p(this->map_path_);
+    std::string corrected = p.parent_path().string() + "/" + p.stem().string() + "_corrected.pcd";
+    if (std::filesystem::exists(corrected))
+    {
+      load_path = corrected;
+      RCLCPP_INFO(this->get_logger(), "[map] Using corrected map: %s", corrected.c_str());
+    }
+    else
+    {
+      RCLCPP_WARN(this->get_logger(), "[map] Corrected map not found (%s), falling back to raw", corrected.c_str());
+    }
+  }
+
   pcl::PointCloud<PointType>::Ptr prior_cloud = std::make_shared<pcl::PointCloud<PointType>>();
-  if (pcl::io::loadPCDFile(this->map_path_, *prior_cloud) == -1) {
-    RCLCPP_ERROR(this->get_logger(), "[map] Failed to load prior map: %s", this->map_path_.c_str());
+  if (pcl::io::loadPCDFile(load_path, *prior_cloud) == -1) {
+    RCLCPP_ERROR(this->get_logger(), "[map] Failed to load prior map: %s", load_path.c_str());
     return;
   }
 
@@ -141,7 +160,7 @@ void dlio::MapNode::loadPriorMap()
   *this->dlio_map += *prior_cloud;
 
   RCLCPP_INFO(this->get_logger(), "[map] Loaded prior map: %zu points from %s",
-              prior_cloud->points.size(), this->map_path_.c_str());
+              prior_cloud->points.size(), load_path.c_str());
 
   // Publish loaded map immediately for RViz visualization
   sensor_msgs::msg::PointCloud2 map_ros;
@@ -236,10 +255,22 @@ void dlio::MapNode::savePCD(std::shared_ptr<direct_lidar_inertial_odometry::srv:
 
   pcl::PointCloud<PointType>::Ptr m = std::make_shared<pcl::PointCloud<PointType>>(*this->dlio_map);
 
+  if (!m || m->points.empty()) {
+    std::cout << "[map] SavePCD: map is empty, nothing to save" << std::endl;
+    res->success = false;
+    return;
+  }
+
   float leaf_size = req->leaf_size;
   std::string p = req->save_path;
 
-  std::cout << std::setprecision(2) << "Saving map to " << p + "/dlio_map.pcd"
+  // Derive filename from map_path_ stem (e.g. "test_gs.pcd" -> "test_gs.pcd")
+  std::filesystem::path map_fp(this->map_path_);
+  std::string filename = map_fp.filename().string();
+  if (filename.empty()) filename = "dlio_map.pcd";
+  std::string save_file = p + "/" + filename;
+
+  std::cout << std::setprecision(2) << "Saving map to " << save_file
     << " with leaf size " << to_string_with_precision(leaf_size, 2) << "... "; std::cout.flush();
 
   // voxelize map
@@ -249,7 +280,7 @@ void dlio::MapNode::savePCD(std::shared_ptr<direct_lidar_inertial_odometry::srv:
   vg.filter(*m);
 
   // save map
-  int ret = pcl::io::savePCDFileBinary(p + "/dlio_map.pcd", *m);
+  int ret = pcl::io::savePCDFileBinary(save_file, *m);
   res->success = ret == 0;
 
   if (res->success) {

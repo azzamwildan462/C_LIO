@@ -26,6 +26,7 @@ def generate_launch_description():
     map_mode = LaunchConfiguration('map_mode', default='localization')
     map_path = LaunchConfiguration('map_path', default='')
     relocalize = LaunchConfiguration('relocalize', default='true')
+    use_corrected = LaunchConfiguration('use_corrected', default='true')
 
     # Define arguments
     declare_rviz_arg = DeclareLaunchArgument(
@@ -58,6 +59,11 @@ def generate_launch_description():
         default_value=relocalize,
         description='Enable Scan Context relocalization for initial pose'
     )
+    declare_use_corrected_arg = DeclareLaunchArgument(
+        'use_corrected',
+        default_value=use_corrected,
+        description='Load graph-optimized corrected map files in localization mode'
+    )
 
     # Load parameters
     dlio_yaml_path = PathJoinSubstitution([current_pkg, 'cfg', 'dlio.yaml'])
@@ -65,7 +71,7 @@ def generate_launch_description():
     graph_slam_yaml_path = PathJoinSubstitution([current_pkg, 'cfg', 'graph_slam.yaml'])
 
     # Map params override (passed to both OdomNode and MapNode)
-    map_params = {'map/mode': map_mode, 'map/path': map_path}
+    map_params = {'map/mode': map_mode, 'map/path': map_path, 'map/use_corrected': use_corrected}
     odom_extra_params = {'map/relocalize': relocalize}
 
     # Composable Node Container (all components in one process with IPC)
@@ -98,6 +104,8 @@ def generate_launch_description():
                     ('dlio_odom/new_map', 'dlio/odom_node/new_map'),
                     ('dlio_odom/new_map_w_zero', 'dlio/odom_node/new_map_w_zero'),
                     ('save_pcd_map', 'dlio/map_node/save_pcd'),
+                    ('save_corrected_pcd', 'dlio/graph_slam/save_corrected_pcd'),
+                    ('corrected_kf_poses', 'dlio/graph_slam/corrected_kf_poses'),
                 ],
                 extra_arguments=[{'use_intra_process_comms': True}],
             ),
@@ -112,14 +120,14 @@ def generate_launch_description():
                     ('map', 'dlio/map_node/map'),
                     ('save_pcd', 'dlio/map_node/save_pcd'),
                 ],
-                extra_arguments=[{'use_intra_process_comms': False}],
+                extra_arguments=[{'use_intra_process_comms': True}],
             ),
             # DLIO Graph SLAM Component
             ComposableNode(
                 package='direct_lidar_inertial_odometry',
                 plugin='dlio::GraphSlamNode',
                 name='dlio_graph_slam',
-                parameters=[dlio_yaml_path, dlio_params_yaml_path, graph_slam_yaml_path],
+                parameters=[dlio_yaml_path, dlio_params_yaml_path, graph_slam_yaml_path, map_params],
                 remappings=[
                     ('keyframe_stamped', 'dlio/odom_node/keyframe_stamped'),
                     ('corrected_path', 'dlio/graph_slam/corrected_path'),
@@ -152,6 +160,7 @@ def generate_launch_description():
         declare_map_mode_arg,
         declare_map_path_arg,
         declare_relocalize_arg,
+        declare_use_corrected_arg,
         dlio_container,
         rviz_node
     ])
