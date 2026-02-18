@@ -319,14 +319,14 @@ Visualization Manager:
       Enabled: true
       Invert Rainbow: false
       Max Color: 255; 255; 255
-      Max Intensity: 5659.5
+      Max Intensity: 5667
       Min Color: 0; 0; 0
       Min Intensity: 1
       Name: PointCloud2
       Position Transformer: XYZ
       Selectable: true
       Size (Pixels): 3
-      Size (m): 0.009999999776482582
+      Size (m): 0.019999999552965164
       Style: Flat Squares
       Topic:
         Depth: 5

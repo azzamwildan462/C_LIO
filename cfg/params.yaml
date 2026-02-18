@@ -34,6 +34,7 @@
     map/voxel_size: 0.25
     map/chunk_size: 20.0
     map/auto_save_interval: 30.0
+    map/publish_interval: 5.0  # throttle map/corrected_map publish (seconds)
     map/initial_pose/x: 0.0
     map/initial_pose/y: 0.0
     map/initial_pose/z: 0.0
@@ -71,6 +72,13 @@
     odom/submap/keyframe/knn: 10
     odom/submap/keyframe/kcv: 10
     odom/submap/keyframe/kcc: 10
+    odom/registration_method: "gicp"  # "gicp" or "ndt"
+
+    odom/ndt/resolution: 1.0
+    odom/ndt/num_threads: 4
+    odom/ndt/search_method: "DIRECT7"  # KDTREE, DIRECT1, DIRECT7, DIRECT26
+    odom/ndt/step_size: 0.3
+
     odom/gicp/minNumPoints: 64
     odom/gicp/kCorrespondences: 16
     odom/gicp/maxCorrespondenceDistance: 0.5

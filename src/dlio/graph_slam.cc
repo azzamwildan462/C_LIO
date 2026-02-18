@@ -73,6 +73,7 @@ void dlio::GraphSlamNode::getParams() {
 
   dlio::declare_param(this, "debug/graph_slam", this->debug_, false);
   dlio::declare_param(this, "frames/odom", this->odom_frame, std::string("odom"));
+  dlio::declare_param(this, "frames/map", this->map_frame_, std::string("map"));
 
   dlio::declare_param(this, "loop_detection_period_ms", this->loop_detection_period_ms_, 2000);
   dlio::declare_param(this, "voxel_leaf_size", this->voxel_leaf_size_, 0.2);
@@ -81,6 +82,12 @@ void dlio::GraphSlamNode::getParams() {
   dlio::declare_param(this, "loop_closure/range", this->range_of_searching_loop_, 15.0);
   dlio::declare_param(this, "loop_closure/min_keyframe_gap", this->min_keyframe_gap_, 50);
   dlio::declare_param(this, "loop_closure/fitness_score_threshold", this->threshold_loop_closure_score_, 0.3);
+
+  std::string reg_method_str;
+  dlio::declare_param(this, "registration_method", reg_method_str, std::string("gicp"));
+  this->use_gicp_ = (reg_method_str == "gicp");
+  dlio::declare_param(this, "ndt/resolution", this->ndt_resolution_, 2.0);
+  dlio::declare_param(this, "ndt/num_threads", this->ndt_num_threads_, 4);
 
   dlio::declare_param(this, "gicp/k_correspondences", this->lc_gicp_k_correspondences_, 16);
   dlio::declare_param(this, "gicp/max_correspondence_distance", this->lc_gicp_max_corr_dist_, 1.0);
@@ -103,6 +110,7 @@ void dlio::GraphSlamNode::getParams() {
   }
   dlio::declare_param(this, "map/voxel_size", this->map_voxel_size_, 0.25);
   dlio::declare_param(this, "map/auto_save_interval", this->auto_save_interval_, 30.0);
+  dlio::declare_param(this, "map/publish_interval", this->publish_interval_, 5.0);
 }
 
 void dlio::GraphSlamNode::callbackKeyframe(
@@ -260,31 +268,50 @@ bool dlio::GraphSlamNode::performLoopRegistration(
                 source_cloud->points.size(), filtered_target->points.size());
   }
 
-  // Create fresh GICP instance for this registration
-  nano_gicp::NanoGICP<PointType, PointType> gicp;
-  gicp.setCorrespondenceRandomness(this->lc_gicp_k_correspondences_);
-  gicp.setMaxCorrespondenceDistance(this->lc_gicp_max_corr_dist_);
-  gicp.setMaximumIterations(this->lc_gicp_max_iter_);
-  gicp.setTransformationEpsilon(this->lc_gicp_transformation_ep_);
-  gicp.setRotationEpsilon(this->lc_gicp_rotation_ep_);
-
-  gicp.setInputSource(source_cloud);
-  gicp.setInputTarget(filtered_target);
-
+  // Create fresh registration instance
   pcl::PointCloud<PointType>::Ptr aligned = std::make_shared<pcl::PointCloud<PointType>>();
-  gicp.align(*aligned);
+  bool converged = false;
+  Eigen::Matrix4f final_T;
 
-  fitness_score = gicp.getFitnessScore();
+  if (this->use_gicp_) {
+    nano_gicp::NanoGICP<PointType, PointType> gicp;
+    gicp.setCorrespondenceRandomness(this->lc_gicp_k_correspondences_);
+    gicp.setMaxCorrespondenceDistance(this->lc_gicp_max_corr_dist_);
+    gicp.setMaximumIterations(this->lc_gicp_max_iter_);
+    gicp.setTransformationEpsilon(this->lc_gicp_transformation_ep_);
+    gicp.setRotationEpsilon(this->lc_gicp_rotation_ep_);
 
-  if (!gicp.hasConverged() || fitness_score > this->threshold_loop_closure_score_) {
+    gicp.setInputSource(source_cloud);
+    gicp.setInputTarget(filtered_target);
+    gicp.align(*aligned);
+
+    converged = gicp.hasConverged();
+    fitness_score = gicp.getFitnessScore();
+    final_T = gicp.getFinalTransformation();
+  } else {
+    pclomp::NormalDistributionsTransform<PointType, PointType> ndt_lc;
+    ndt_lc.setResolution(this->ndt_resolution_);
+    ndt_lc.setNumThreads(this->ndt_num_threads_);
+    ndt_lc.setNeighborhoodSearchMethod(pclomp::DIRECT7);
+    ndt_lc.setMaximumIterations(this->lc_gicp_max_iter_);
+    ndt_lc.setTransformationEpsilon(this->lc_gicp_transformation_ep_);
+
+    ndt_lc.setInputSource(source_cloud);
+    ndt_lc.setInputTarget(filtered_target);
+    ndt_lc.align(*aligned);
+
+    converged = ndt_lc.hasConverged();
+    fitness_score = ndt_lc.getFitnessScore();
+    final_T = ndt_lc.getFinalTransformation();
+  }
+
+  if (!converged || fitness_score > this->threshold_loop_closure_score_) {
     return false;
   }
 
-  // GICP gives T_correction that aligns source_world to target_world.
-  // T_correction * current_world_cloud ≈ candidate_world_cloud
-  // The relative pose between candidate and current in their respective body frames:
+  // T_correction aligns source_world to target_world.
   // relative = candidate_pose^-1 * T_correction * current_pose
-  Eigen::Isometry3d T_correction = Eigen::Isometry3d(gicp.getFinalTransformation().cast<double>());
+  Eigen::Isometry3d T_correction = Eigen::Isometry3d(final_T.cast<double>());
   Eigen::Isometry3d current_pose = kfs[current_idx].pose;
   Eigen::Isometry3d candidate_pose = kfs[candidate_idx].pose;
 
@@ -367,17 +394,17 @@ void dlio::GraphSlamNode::publishCorrectedData() {
   int num_kf = static_cast<int>(this->corrected_poses.size());
   int num_stored = static_cast<int>(this->keyframes.size());
 
+  // Use map frame for corrected data (graph-optimized poses are in map frame)
+  std::string frame = this->map_frame_;
+
   // Corrected path
   nav_msgs::msg::Path path;
   path.header.stamp = this->now();
-  path.header.frame_id = this->odom_frame;
+  path.header.frame_id = frame;
 
   // Corrected keyframe poses
   geometry_msgs::msg::PoseArray kf_poses;
   kf_poses.header = path.header;
-
-  // Corrected map
-  pcl::PointCloud<PointType>::Ptr corrected_map = std::make_shared<pcl::PointCloud<PointType>>();
 
   for (int i = 0; i < num_kf && i < num_stored; ++i) {
     const Eigen::Isometry3d& pose = this->corrected_poses[i];
@@ -385,7 +412,7 @@ void dlio::GraphSlamNode::publishCorrectedData() {
     // Path
     geometry_msgs::msg::PoseStamped ps;
     ps.header.stamp = this->keyframes[i].timestamp;
-    ps.header.frame_id = this->odom_frame;
+    ps.header.frame_id = frame;
     Eigen::Quaterniond q(pose.rotation());
     ps.pose.position.x = pose.translation().x();
     ps.pose.position.y = pose.translation().y();
@@ -396,28 +423,36 @@ void dlio::GraphSlamNode::publishCorrectedData() {
     ps.pose.orientation.z = q.z();
     path.poses.push_back(ps);
     kf_poses.poses.push_back(ps.pose);
-
-    // Transform local cloud with corrected pose for visualization only
-    pcl::PointCloud<PointType>::Ptr transformed = std::make_shared<pcl::PointCloud<PointType>>();
-    pcl::transformPointCloud(*this->keyframes[i].cloud_local,
-                              *transformed, pose.matrix().cast<float>());
-    *corrected_map += *transformed;
   }
 
   this->corrected_path_pub->publish(path);
   this->corrected_kf_pose_pub->publish(kf_poses);
 
-  // Voxel filter the corrected map before publishing
-  pcl::VoxelGrid<PointType> voxel;
-  voxel.setLeafSize(this->voxel_leaf_size_, this->voxel_leaf_size_, this->voxel_leaf_size_);
-  voxel.setInputCloud(corrected_map);
-  voxel.filter(*corrected_map);
+  // Throttle corrected map publish (expensive: transforms all keyframe clouds)
+  static rclcpp::Time last_map_pub_time(0, 0, RCL_ROS_TIME);
+  rclcpp::Time now = this->now();
+  if ((now - last_map_pub_time).seconds() >= this->publish_interval_) {
+    pcl::PointCloud<PointType>::Ptr corrected_map = std::make_shared<pcl::PointCloud<PointType>>();
+    for (int i = 0; i < num_kf && i < num_stored; ++i) {
+      pcl::PointCloud<PointType>::Ptr transformed = std::make_shared<pcl::PointCloud<PointType>>();
+      pcl::transformPointCloud(*this->keyframes[i].cloud_local,
+                                *transformed, this->corrected_poses[i].matrix().cast<float>());
+      *corrected_map += *transformed;
+    }
 
-  sensor_msgs::msg::PointCloud2 map_ros;
-  pcl::toROSMsg(*corrected_map, map_ros);
-  map_ros.header.stamp = this->now();
-  map_ros.header.frame_id = this->odom_frame;
-  this->corrected_map_pub->publish(map_ros);
+    pcl::VoxelGrid<PointType> voxel;
+    voxel.setLeafSize(this->voxel_leaf_size_, this->voxel_leaf_size_, this->voxel_leaf_size_);
+    voxel.setInputCloud(corrected_map);
+    voxel.filter(*corrected_map);
+
+    sensor_msgs::msg::PointCloud2 map_ros;
+    pcl::toROSMsg(*corrected_map, map_ros);
+    map_ros.header.stamp = now;
+    map_ros.header.frame_id = frame;
+    this->corrected_map_pub->publish(map_ros);
+
+    last_map_pub_time = now;
+  }
 }
 
 void dlio::GraphSlamNode::publishLoopClosureMarkers() {
@@ -428,7 +463,7 @@ void dlio::GraphSlamNode::publishLoopClosureMarkers() {
     const auto& edge = this->loop_edges[i];
 
     visualization_msgs::msg::Marker marker;
-    marker.header.frame_id = this->odom_frame;
+    marker.header.frame_id = this->map_frame_;
     marker.header.stamp = this->now();
     marker.ns = "loop_closures";
     marker.id = static_cast<int>(i);

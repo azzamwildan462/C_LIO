@@ -40,6 +40,12 @@
 #include <boost/range/adaptor/indexed.hpp>
 #include <boost/range/adaptor/adjacent_filtered.hpp>
 
+// NDT-OMP
+#include <pclomp/voxel_grid_covariance_omp.h>
+#include <pclomp/voxel_grid_covariance_omp_impl.hpp>
+#include <pclomp/ndt_omp.h>
+#include <pclomp/ndt_omp_impl.hpp>
+
 // PCL
 #include <pcl/filters/crop_box.h>
 #include <pcl/filters/voxel_grid.h>
@@ -290,9 +296,12 @@ private:
   double first_scan_stamp;
   double elapsed_time;
 
-  // GICP
+  // Registration (GICP or NDT)
+  bool use_gicp_;
   nano_gicp::NanoGICP<PointType, PointType> gicp;
   nano_gicp::NanoGICP<PointType, PointType> gicp_temp;
+  pclomp::NormalDistributionsTransform<PointType, PointType> ndt;
+  pclomp::NormalDistributionsTransform<PointType, PointType> ndt_temp;
 
   // Transformations
   Eigen::Matrix4f T, T_prior, T_corr;
@@ -447,6 +456,12 @@ private:
   double gicp_transformation_ep_;
   double gicp_rotation_ep_;
   double gicp_init_lambda_factor_;
+
+  // NDT params
+  double ndt_resolution_;
+  int ndt_num_threads_;
+  std::string ndt_search_method_;
+  double ndt_step_size_;
 
   double geo_Kp_;
   double geo_Kv_;

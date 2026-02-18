@@ -89,8 +89,8 @@ dlio::MapNode::MapNode(const rclcpp::NodeOptions& options)
     signal(SIGTERM, shutdownSave);
   }
 
-  RCLCPP_INFO(this->get_logger(), "[map] Initialized (mode=%s, leaf_size=%.2f, map=%zu pts)",
-              this->map_mode_.c_str(), this->leaf_size_, this->dlio_map->points.size());
+  RCLCPP_INFO(this->get_logger(), "[map] Initialized (mode=%s, leaf_size=%.2f, map=%zu pts, publish_interval=%.1fs)",
+              this->map_mode_.c_str(), this->leaf_size_, this->dlio_map->points.size(), this->publish_interval_);
 
 }
 
@@ -102,14 +102,17 @@ dlio::MapNode::~MapNode() {
 void dlio::MapNode::getParams() {
 
   this->declare_parameter<std::string>("odom/odom_frame", "odom");
+  this->declare_parameter<std::string>("frames/map", "map");
   this->declare_parameter<double>("map/sparse/leafSize", 0.5);
   this->declare_parameter<std::string>("map/mode", "localization");
   this->declare_parameter<std::string>("map/path", "");
   this->declare_parameter<bool>("map/use_corrected", true);
   this->declare_parameter<double>("map/voxel_size", 0.25);
   this->declare_parameter<double>("map/auto_save_interval", 30.0);
+  this->declare_parameter<double>("map/publish_interval", 5.0);
 
   this->get_parameter("odom/odom_frame", this->odom_frame);
+  this->get_parameter("frames/map", this->map_frame_);
   this->get_parameter("map/sparse/leafSize", this->leaf_size_);
   this->get_parameter("map/mode", this->map_mode_);
   this->get_parameter("map/path", this->map_path_);
@@ -125,6 +128,7 @@ void dlio::MapNode::getParams() {
   }
   this->get_parameter("map/voxel_size", this->map_voxel_size_);
   this->get_parameter("map/auto_save_interval", this->auto_save_interval_);
+  this->get_parameter("map/publish_interval", this->publish_interval_);
 }
 
 void dlio::MapNode::loadPriorMap()
@@ -162,14 +166,16 @@ void dlio::MapNode::loadPriorMap()
   RCLCPP_INFO(this->get_logger(), "[map] Loaded prior map: %zu points from %s",
               prior_cloud->points.size(), load_path.c_str());
 
-  // Publish loaded map immediately for RViz visualization
+  // Publish loaded map for RViz visualization
+  // In localization mode, use map frame (prior map IS the map reference)
+  std::string pub_frame = (this->map_mode_ == "localization") ? this->map_frame_ : this->odom_frame;
   sensor_msgs::msg::PointCloud2 map_ros;
   pcl::toROSMsg(*this->dlio_map, map_ros);
   map_ros.header.stamp = this->now();
-  map_ros.header.frame_id = this->odom_frame;
+  map_ros.header.frame_id = pub_frame;
   this->map_pub->publish(map_ros);
-  RCLCPP_INFO(this->get_logger(), "[map] Published prior map (%zu pts) for visualization",
-              this->dlio_map->points.size());
+  RCLCPP_INFO(this->get_logger(), "[map] Published prior map (%zu pts, frame=%s)",
+              this->dlio_map->points.size(), pub_frame.c_str());
 }
 
 void dlio::MapNode::autoSave()
@@ -236,18 +242,26 @@ void dlio::MapNode::callbackKeyframe(const sensor_msgs::msg::PointCloud2::ConstS
   // save filtered keyframe to map for rviz
   *this->dlio_map += *keyframe_pcl;
 
-  // publish full map
-  if (this->dlio_map->points.size() == this->dlio_map->width * this->dlio_map->height) {
-    sensor_msgs::msg::PointCloud2 map_ros;
-    pcl::toROSMsg(*this->dlio_map, map_ros);
-    map_ros.header.stamp = this->now();
-    map_ros.header.frame_id = this->odom_frame;
-    this->map_pub->publish(map_ros);
-  }
-
-  RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+  // Throttled publish of full map
+  int throttle_ms = static_cast<int>(this->publish_interval_ * 1000.0);
+  RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), throttle_ms,
     "[map] Received keyframe: %zu pts, total map: %zu pts",
     keyframe_pcl->points.size(), this->dlio_map->points.size());
+
+  // Publish full map (throttled)
+  static rclcpp::Time last_pub_time(0, 0, RCL_ROS_TIME);
+  rclcpp::Time now = this->now();
+  if ((now - last_pub_time).seconds() >= this->publish_interval_) {
+    if (this->dlio_map->points.size() == this->dlio_map->width * this->dlio_map->height) {
+      std::string pub_frame = (this->map_mode_ == "localization") ? this->map_frame_ : this->odom_frame;
+      sensor_msgs::msg::PointCloud2 map_ros;
+      pcl::toROSMsg(*this->dlio_map, map_ros);
+      map_ros.header.stamp = now;
+      map_ros.header.frame_id = pub_frame;
+      this->map_pub->publish(map_ros);
+    }
+    last_pub_time = now;
+  }
 }
 
 void dlio::MapNode::savePCD(std::shared_ptr<direct_lidar_inertial_odometry::srv::SavePCD::Request> req,

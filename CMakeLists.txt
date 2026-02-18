@@ -35,6 +35,7 @@ find_package(pcl_conversions REQUIRED)
 find_package(PCL REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(Threads REQUIRED)
+find_package(ndt_omp_ros2 REQUIRED)
 
 # g2o (from ros-humble-libg2o)
 set(g2o_DIR "/opt/ros/humble/lib/cmake/g2o")
@@ -112,7 +113,7 @@ target_link_libraries(dlio_odom_component
   ${PCL_LIBRARIES} ${OpenMP_LIBS} Threads::Threads nano_gicp ${cpp_typesupport_target}
 )
 ament_target_dependencies(dlio_odom_component
-  rclcpp rclcpp_components tf2_ros pcl_ros nav_msgs pcl_conversions sensor_msgs geometry_msgs
+  rclcpp rclcpp_components tf2_ros pcl_ros nav_msgs pcl_conversions sensor_msgs geometry_msgs ndt_omp_ros2
 )
 rclcpp_components_register_nodes(dlio_odom_component "dlio::OdomNode")
 
@@ -139,7 +140,7 @@ target_link_libraries(dlio_graph_slam_component
   g2o::core g2o::types_slam3d g2o::solver_eigen
 )
 ament_target_dependencies(dlio_graph_slam_component
-  rclcpp rclcpp_components pcl_ros pcl_conversions nav_msgs sensor_msgs geometry_msgs visualization_msgs
+  rclcpp rclcpp_components pcl_ros pcl_conversions nav_msgs sensor_msgs geometry_msgs visualization_msgs ndt_omp_ros2
 )
 rclcpp_components_register_nodes(dlio_graph_slam_component "dlio::GraphSlamNode")
 

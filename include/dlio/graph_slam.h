@@ -34,6 +34,12 @@
 // nano_gicp
 #include <nano_gicp/nano_gicp.h>
 
+// NDT-OMP
+#include <pclomp/voxel_grid_covariance_omp.h>
+#include <pclomp/voxel_grid_covariance_omp_impl.hpp>
+#include <pclomp/ndt_omp.h>
+#include <pclomp/ndt_omp_impl.hpp>
+
 // g2o
 #include "g2o/core/sparse_optimizer.h"
 #include "g2o/core/optimization_algorithm_levenberg.h"
@@ -132,6 +138,7 @@ private:
 
   // --- Frames ---
   std::string odom_frame;
+  std::string map_frame_;
 
   // --- Parameters ---
   int loop_detection_period_ms_;
@@ -143,12 +150,17 @@ private:
   int min_keyframe_gap_;
   double threshold_loop_closure_score_;
 
-  // loop closure registration (nano_gicp)
+  // loop closure registration
+  bool use_gicp_;
   int lc_gicp_k_correspondences_;
   double lc_gicp_max_corr_dist_;
   int lc_gicp_max_iter_;
   double lc_gicp_transformation_ep_;
   double lc_gicp_rotation_ep_;
+
+  // NDT params (loop closure)
+  double ndt_resolution_;
+  int ndt_num_threads_;
 
   // pose graph
   int num_adjacent_constraints_;
@@ -163,6 +175,7 @@ private:
   std::string map_path_;
   double map_voxel_size_;
   double auto_save_interval_;
+  double publish_interval_;
 
 };
 

@@ -8,6 +8,10 @@
     loop_closure/min_keyframe_gap: 15
     loop_closure/fitness_score_threshold: 0.3
 
+    registration_method: "gicp"  # "gicp" or "ndt"
+    ndt/resolution: 1.0
+    ndt/num_threads: 4
+
     gicp/k_correspondences: 20
     gicp/max_correspondence_distance: 2.0
     gicp/max_iterations: 64

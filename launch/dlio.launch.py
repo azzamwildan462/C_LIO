@@ -27,6 +27,7 @@ def generate_launch_description():
     map_path = LaunchConfiguration('map_path', default='')
     relocalize = LaunchConfiguration('relocalize', default='true')
     use_corrected = LaunchConfiguration('use_corrected', default='true')
+    registration_method = LaunchConfiguration('registration_method', default='gicp')
 
     # Define arguments
     declare_rviz_arg = DeclareLaunchArgument(
@@ -64,6 +65,11 @@ def generate_launch_description():
         default_value=use_corrected,
         description='Load graph-optimized corrected map files in localization mode'
     )
+    declare_registration_method_arg = DeclareLaunchArgument(
+        'registration_method',
+        default_value=registration_method,
+        description='Registration method: gicp or ndt'
+    )
 
     # Load parameters
     dlio_yaml_path = PathJoinSubstitution([current_pkg, 'cfg', 'dlio.yaml'])
@@ -72,7 +78,7 @@ def generate_launch_description():
 
     # Map params override (passed to both OdomNode and MapNode)
     map_params = {'map/mode': map_mode, 'map/path': map_path, 'map/use_corrected': use_corrected}
-    odom_extra_params = {'map/relocalize': relocalize}
+    odom_extra_params = {'map/relocalize': relocalize, 'odom/registration_method': registration_method}
 
     # Composable Node Container (all components in one process with IPC)
     dlio_container = ComposableNodeContainer(
@@ -161,6 +167,7 @@ def generate_launch_description():
         declare_map_path_arg,
         declare_relocalize_arg,
         declare_use_corrected_arg,
+        declare_registration_method_arg,
         dlio_container,
         rviz_node
     ])
