@@ -6,6 +6,8 @@
 #include <numeric>
 #include <unistd.h>
 
+#include <pcl/common/transforms.h>
+
 // Access global atexit pointer defined in odom.cc
 extern std::atomic<dlio::OdomNode *> g_odom_node;
 
@@ -1391,4 +1393,59 @@ void dlio::OdomNode::continuousLocalize()
                 is_reloc ? "RELOCALIZATION" : "map->odom",
                 correction_dist, correction_angle, fitness, confidence, P_loop);
   }
+}
+
+void dlio::OdomNode::publishOccupancyGrid()
+{
+  if (!this->occupancy_grid_gen_ || !this->dlio_initialized) return;
+
+  pcl::PointCloud<PointType>::ConstPtr scan;
+  Eigen::Matrix4f T_current;
+  double scan_time;
+  {
+    std::lock_guard<std::mutex> lock(this->latest_scan_mtx_);
+    if (!this->latest_scan_ || this->latest_scan_->empty()) return;
+    scan_time = this->latest_scan_time_;
+    // Skip if we already processed this scan
+    if (scan_time <= this->og_last_scan_time_) return;
+    scan = this->latest_scan_;
+    T_current = this->latest_scan_T_;
+  }
+  this->og_last_scan_time_ = scan_time;
+
+  // Transform sensor-frame scan to map frame (via odom → map correction)
+  Eigen::Matrix4f T_lidar_odom = T_current * this->extrinsics.baselink2lidar_T;
+  Eigen::Matrix4f T_lidar_map = this->T_map_odom_ * T_lidar_odom;
+  pcl::PointCloud<PointType>::Ptr scan_world(new pcl::PointCloud<PointType>);
+  pcl::transformPointCloud(*scan, *scan_world, T_lidar_map);
+
+  // Sensor origin in map frame
+  Eigen::Vector3f sensor_origin = T_lidar_map.block<3, 1>(0, 3);
+
+  // Use the scan timestamp (matches TF) for correct RViz rendering
+  rclcpp::Time scan_stamp(static_cast<int64_t>(scan_time * 1e9),
+                          this->get_clock()->get_clock_type());
+
+  // Extract robot yaw and pitch from map-frame transform
+  Eigen::Matrix3f R_map = T_lidar_map.block<3, 3>(0, 0);
+  float robot_yaw   = std::atan2(R_map(1, 0), R_map(0, 0));
+  float robot_pitch = std::asin(-R_map(2, 0));
+
+  this->occupancy_grid_gen_->update(scan_world, sensor_origin, scan_time,
+                                    robot_yaw, robot_pitch);
+  auto og_msg = this->occupancy_grid_gen_->getOccupancyGrid(scan_stamp);
+
+  // Debug: count non-unknown cells
+  int free_cells = 0, occ_cells = 0;
+  for (auto v : og_msg.data) {
+    if (v >= 0 && v < 50) free_cells++;
+    else if (v >= 50) occ_cells++;
+  }
+  RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+      "[ogm] pts=%zu origin=(%.1f,%.1f) sensor=(%.1f,%.1f,%.1f) free=%d occ=%d frame=%s",
+      scan_world->size(), og_msg.info.origin.position.x, og_msg.info.origin.position.y,
+      sensor_origin.x(), sensor_origin.y(), sensor_origin.z(),
+      free_cells, occ_cells, og_msg.header.frame_id.c_str());
+
+  this->occupancy_grid_pub_->publish(std::move(og_msg));
 }

@@ -113,6 +113,7 @@ add_library(dlio_odom_component SHARED
   src/dlio/odom_relocalization.cc
   src/dlio/odom_services.cc
   src/dlio/kfdb_io.cc
+  src/dlio/occupancy_grid.cc
 )
 target_compile_options(dlio_odom_component PRIVATE ${OpenMP_FLAGS})
 target_link_libraries(dlio_odom_component

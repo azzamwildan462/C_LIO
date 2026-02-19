@@ -575,7 +575,7 @@ void dlio::OdomNode::callbackPointCloud(const sensor_msgs::msg::PointCloud2::Sha
   // IMPORTANT: use original_scan (sensor frame), NOT current_scan (odom/world frame).
   // The SC computation in continuousLocalize() assumes body-frame input and applies
   // its own gravity rotation. Using odom-frame scans causes double-rotation → SC fails.
-  if (this->continuous_localize_)
+  if (this->continuous_localize_ || this->occupancy_grid_enabled_)
   {
     std::lock_guard<std::mutex> lock(this->latest_scan_mtx_);
     this->latest_scan_ = this->original_scan;

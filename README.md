@@ -13,6 +13,7 @@ This fork adds three major capabilities on top of the original DLIO:
 | **Keyframe Database (KFDB)** | Persistent storage of real keyframe Scan Context descriptors for accurate relocalization |
 | **Prior Map Localization** | Load a previously built map and localize against it |
 | **Continuous Localization** | Periodic background GICP against global prior map with `map→odom` TF correction (like RTAB-Map) |
+| **Occupancy Grid Map** | Probabilistic 2D occupancy grid from LiDAR scans using Bresenham ray tracing + log-odds Bayesian filter |
 | **Composable Nodes** | All nodes run in a single process with intra-process communication for lower latency |
 
 ## Architecture
@@ -46,6 +47,7 @@ include/dlio/
 ├── graph_slam.h            # GraphSlamNode class declaration
 ├── scan_context.h          # Shared Scan Context utilities (header-only)
 ├── kfdb_io.h               # Keyframe Database I/O interface
+├── occupancy_grid.h        # Probabilistic occupancy grid generator
 ├── utils.h                 # Common types and utilities
 └── dlio.h                  # Package-wide defines
 
@@ -56,6 +58,7 @@ src/dlio/
 ├── odom_keyframes.cc       # Keyframe management, submap building, metrics
 ├── odom_relocalization.cc  # Prior map loading, SC database, relocalization, KFDB save/load
 ├── odom_services.cc        # ROS services, publishing, continuous localization, debug
+├── occupancy_grid.cc       # Probabilistic occupancy grid map generator
 ├── kfdb_io.cc              # KFDB binary file read/write (standalone module)
 ├── map.cc                  # MapNode implementation
 ├── map_node.cc             # MapNode component registration
@@ -309,6 +312,35 @@ External nodes that need the globally-corrected pose should look up `map→base_
 | `map/continuous_localize/fitness_threshold` | `0.5` | Max GICP fitness score to accept correction |
 | `frames/map` | `map` | Map frame name for TF |
 
+### Occupancy Grid Map
+
+When enabled (`occupancy_grid/enabled: true`), a probabilistic 2D occupancy grid is generated from each LiDAR scan and published as `nav_msgs/OccupancyGrid`. The algorithm is inspired by [Autoware's pointcloud-based occupancy grid map](https://autowarefoundation.github.io/autoware_universe/main/perception/autoware_probabilistic_occupancy_grid_map/pointcloud-based-occupancy-grid-map/).
+
+**Algorithm** (3 steps per scan):
+
+1. **Height-based classification**: Points are split into ground and obstacle based on height relative to the sensor origin
+2. **Polar binning + Bresenham ray tracing**: Points are binned by angle (720 bins, 0.5 deg). For each bin, a ray is traced from the sensor origin marking cells as FREE, with obstacle endpoints marked OCCUPIED
+3. **Log-odds Bayesian update**: Each cell maintains a persistent log-odds value updated additively with clamping to prevent overconfidence
+
+The grid is an **ego-centric rolling window** (default 100m x 100m at 0.2m resolution) that shifts as the robot moves. Runs in a timer callback at configurable rate (default 5Hz) — independent of the LiDAR pipeline with zero impact on odometry performance.
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `occupancy_grid/enabled` | `false` | Master enable/disable |
+| `occupancy_grid/grid_size_x` | `100.0` | Grid width in meters |
+| `occupancy_grid/grid_size_y` | `100.0` | Grid height in meters |
+| `occupancy_grid/resolution` | `0.2` | Cell size in meters |
+| `occupancy_grid/ground_threshold` | `-0.3` | Height below sensor origin treated as ground (m) |
+| `occupancy_grid/obstacle_min_height` | `0.1` | Min height above sensor for obstacle (m) |
+| `occupancy_grid/obstacle_max_height` | `3.0` | Max height for obstacle (m) |
+| `occupancy_grid/p_occupied` | `0.7` | Inverse sensor model: P(occ \| obstacle) |
+| `occupancy_grid/p_free` | `0.3` | Inverse sensor model: P(occ \| free) |
+| `occupancy_grid/lo_clamped_min` | `-4.0` | Min log-odds (probability ~0.018) |
+| `occupancy_grid/lo_clamped_max` | `4.0` | Max log-odds (probability ~0.982) |
+| `occupancy_grid/decay_rate` | `0.0` | Time decay rate (0 = disabled) |
+| `occupancy_grid/obstacle_margin` | `0.3` | Extra margin around obstacles (m) |
+| `occupancy_grid/update_rate` | `5.0` | Update + publish rate (Hz) |
+
 ## Published Topics
 
 | Topic | Type | Description |
@@ -319,6 +351,7 @@ External nodes that need the globally-corrected pose should look up `map→base_
 | `dlio/odom_node/pointcloud/deskewed` | `sensor_msgs/PointCloud2` | Deskewed scan in world frame |
 | `dlio/odom_node/pointcloud/keyframe` | `sensor_msgs/PointCloud2` | Keyframe cloud |
 | `dlio/odom_node/keyframes` | `geometry_msgs/PoseArray` | All keyframe poses |
+| `dlio/odom_node/occupancy_grid` | `nav_msgs/OccupancyGrid` | 2D probabilistic occupancy grid (when enabled) |
 | `dlio/map_node/map` | `sensor_msgs/PointCloud2` | Accumulated map (prior + live keyframes) |
 | `dlio/graph_slam/corrected_path` | `nav_msgs/Path` | Loop-closure corrected path |
 | `dlio/graph_slam/corrected_map` | `sensor_msgs/PointCloud2` | Corrected full map |

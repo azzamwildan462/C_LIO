@@ -13,11 +13,13 @@
 
 #include "dlio/dlio.h"
 #include "dlio/scan_context.h"
+#include "dlio/occupancy_grid.h"
 
 // ROS
 #include "rclcpp/rclcpp.hpp"
 #include <direct_lidar_inertial_odometry/msg/keyframe_stamped.hpp>
 #include <nav_msgs/msg/odometry.hpp>
+#include <nav_msgs/msg/occupancy_grid.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/pose_array.hpp>
 #include <nav_msgs/msg/path.hpp>
@@ -525,4 +527,12 @@ private:
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr global_correction_sub_;
   std::atomic<bool> enable_global_correction_{true};
   float last_confidence_{0.0f};
+
+  // Occupancy grid
+  bool occupancy_grid_enabled_ = false;
+  std::unique_ptr<dlio::OccupancyGridGenerator> occupancy_grid_gen_;
+  rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr occupancy_grid_pub_;
+  rclcpp::TimerBase::SharedPtr occupancy_grid_timer_;
+  double og_last_scan_time_ = 0.0;
+  void publishOccupancyGrid();
 };

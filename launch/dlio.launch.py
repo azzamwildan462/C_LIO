@@ -112,6 +112,7 @@ def generate_launch_description():
                     ('save_pcd_map', 'dlio/map_node/save_pcd'),
                     ('save_corrected_pcd', 'dlio/graph_slam/save_corrected_pcd'),
                     ('corrected_kf_poses', 'dlio/graph_slam/corrected_kf_poses'),
+                    ('occupancy_grid', 'dlio/odom_node/occupancy_grid'),
                 ],
                 extra_arguments=[{'use_intra_process_comms': True}],
             ),

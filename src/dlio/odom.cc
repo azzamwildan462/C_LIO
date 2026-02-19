@@ -82,6 +82,21 @@ dlio::OdomNode::OdomNode(const rclcpp::NodeOptions &options)
   this->publish_timer = this->create_wall_timer(std::chrono::duration<double>(0.01),
                                                 std::bind(&dlio::OdomNode::publishPose, this));
 
+  // Occupancy grid publisher + timer
+  if (this->occupancy_grid_enabled_) {
+    this->occupancy_grid_pub_ = this->create_publisher<nav_msgs::msg::OccupancyGrid>(
+        "occupancy_grid", rclcpp::QoS(5));
+
+    double og_rate = 5.0;
+    dlio::declare_param(this, "occupancy_grid/update_rate", og_rate, 5.0);
+
+    this->occupancy_grid_timer_ = this->create_wall_timer(
+        std::chrono::duration<double>(1.0 / og_rate),
+        std::bind(&dlio::OdomNode::publishOccupancyGrid, this));
+
+    RCLCPP_INFO(this->get_logger(), "Occupancy grid enabled: rate=%.1fHz", og_rate);
+  }
+
   this->T = Eigen::Matrix4f::Identity();
   this->T_prior = Eigen::Matrix4f::Identity();
   this->T_corr = Eigen::Matrix4f::Identity();
@@ -552,6 +567,32 @@ void dlio::OdomNode::getParams()
   this->bayes_loop_threshold_ = static_cast<float>(loop_thr);
   dlio::declare_param(this, "map/continuous_localize/min_consecutive", this->bayes_min_consecutive_, 2);
   dlio::declare_param(this, "frames/map", this->map_frame_, std::string("map"));
+
+  // Occupancy Grid
+  dlio::declare_param(this, "occupancy_grid/enabled", this->occupancy_grid_enabled_, false);
+  if (this->occupancy_grid_enabled_) {
+    dlio::OccupancyGridGenerator::Params ogp;
+    dlio::declare_param(this, "occupancy_grid/grid_size_x", ogp.grid_size_x, 100.0);
+    dlio::declare_param(this, "occupancy_grid/grid_size_y", ogp.grid_size_y, 100.0);
+    dlio::declare_param(this, "occupancy_grid/resolution", ogp.resolution, 0.2);
+    dlio::declare_param(this, "occupancy_grid/ground_threshold", ogp.ground_threshold, -0.3);
+    dlio::declare_param(this, "occupancy_grid/obstacle_min_height", ogp.obstacle_min_height, 0.1);
+    dlio::declare_param(this, "occupancy_grid/obstacle_max_height", ogp.obstacle_max_height, 3.0);
+    dlio::declare_param(this, "occupancy_grid/p_occupied", ogp.p_occupied, 0.7);
+    dlio::declare_param(this, "occupancy_grid/p_free", ogp.p_free, 0.3);
+    dlio::declare_param(this, "occupancy_grid/p_prior", ogp.p_prior, 0.5);
+    dlio::declare_param(this, "occupancy_grid/lo_clamped_min", ogp.lo_clamped_min, -4.0);
+    dlio::declare_param(this, "occupancy_grid/lo_clamped_max", ogp.lo_clamped_max, 4.0);
+    dlio::declare_param(this, "occupancy_grid/decay_rate", ogp.decay_rate, 0.0);
+    dlio::declare_param(this, "occupancy_grid/obstacle_margin", ogp.obstacle_margin, 0.3);
+    dlio::declare_param(this, "occupancy_grid/height_offset", ogp.height_offset, 0.0);
+    dlio::declare_param(this, "occupancy_grid/adaptive_ground", ogp.adaptive_ground, false);
+    dlio::declare_param(this, "occupancy_grid/ground_slope_threshold", ogp.ground_slope_threshold, 10.0);
+    dlio::declare_param(this, "occupancy_grid/scan_angle_target", ogp.scan_angle_target, 0.0);
+    dlio::declare_param(this, "occupancy_grid/scan_angle_tolerance", ogp.scan_angle_tolerance, 180.0);
+    ogp.frame_id = this->map_frame_;
+    this->occupancy_grid_gen_ = std::make_unique<dlio::OccupancyGridGenerator>(ogp);
+  }
 }
 
 void dlio::OdomNode::start()
