@@ -24,8 +24,8 @@
 namespace dlio::sc
 {
 
-  constexpr int SC_NR = 20; // number of rings
-  constexpr int SC_NS = 60; // number of sectors
+  constexpr int SC_NR = 40;  // number of rings  (was 20)
+  constexpr int SC_NS = 120; // number of sectors (was 60)
 
   using ScanContextDescriptor = Eigen::MatrixXf; // NR x NS
   using RingKey = Eigen::VectorXf;               // NR

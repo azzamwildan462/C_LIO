@@ -15,6 +15,14 @@
 #include "dlio/scan_context.h"
 #include "dlio/occupancy_grid.h"
 
+// g2o
+#include "g2o/core/sparse_optimizer.h"
+#include "g2o/core/optimization_algorithm_levenberg.h"
+#include "g2o/core/block_solver.h"
+#include "g2o/solvers/eigen/linear_solver_eigen.h"
+#include "g2o/types/slam3d/vertex_se3.h"
+#include "g2o/types/slam3d/edge_se3.h"
+
 // ROS
 #include "rclcpp/rclcpp.hpp"
 #include <direct_lidar_inertial_odometry/msg/keyframe_stamped.hpp>
@@ -160,6 +168,12 @@ private:
 
   // Continuous localization (map→odom TF correction)
   void continuousLocalize();
+  bool verifyLoopWithG2O(int loop_kf_idx,
+                         const Eigen::Matrix4f &T_map_body_gicp,
+                         const Eigen::Matrix4f &T_odom_body,
+                         const Eigen::Matrix4f &T_map_odom_current,
+                         const std::vector<dlio::sc::ScanContextEntry> &sc_snap,
+                         double &out_chi2, int &out_num_anchors);
 
   void debug();
 
@@ -521,6 +535,11 @@ private:
   int bayes_sc_top_k_;                 // only keep top-K SC matches (0 = no filter)
   int bayes_consecutive_accepts_;      // current consecutive count
   std::vector<float> bayes_posterior_; // [0]=virtual place, [1..N]=keyframes
+
+  // g2o pose graph verification
+  bool g2o_verification_enabled_;
+  double g2o_chi2_threshold_;
+  int g2o_iterations_;
 
   Eigen::Matrix4f T_map_odom_; // TF: map→odom correction
   std::mutex continuous_localize_mtx_;

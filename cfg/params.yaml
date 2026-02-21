@@ -40,7 +40,7 @@
     map/initial_pose/z: 0.0
     map/initial_pose/yaw: 0.0
     map/relocalize: true
-    map/relocalize/sc_max_range: 100.0
+    map/relocalize/sc_max_range: 40.0
     map/relocalize/sc_num_candidates: 50
     map/relocalize/sc_distance_threshold: 2.0
     map/relocalize/sc_max_attempts: 10
@@ -48,13 +48,16 @@
     map/continuous_localize: true
     map/continuous_localize/interval: 2.0
     map/continuous_localize/fitness_threshold: 0.15
-    map/continuous_localize/virtual_place_prior: 0.7
+    map/continuous_localize/virtual_place_prior: 0.8
     map/continuous_localize/loop_threshold: 0.5
     map/continuous_localize/min_consecutive: 2
     map/continuous_localize/max_correction: 2000.0
     map/continuous_localize/enable_global_correction: true
-    map/continuous_localize/sc_distance_threshold: 0.1
-    map/continuous_localize/sc_top_k: 10
+    map/continuous_localize/sc_distance_threshold: 1.0
+    map/continuous_localize/sc_top_k: 3
+    map/continuous_localize/g2o_verification: true
+    map/continuous_localize/g2o_chi2_threshold: 50.0
+    map/continuous_localize/g2o_iterations: 10
 
     odom/gravity: 9.80665
     odom/computeTimeOffset: true

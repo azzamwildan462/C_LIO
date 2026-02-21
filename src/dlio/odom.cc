@@ -583,6 +583,9 @@ void dlio::OdomNode::getParams()
   dlio::declare_param(this, "map/continuous_localize/sc_distance_threshold", sc_dist_thr, 0.4);
   this->bayes_sc_dist_threshold_ = static_cast<float>(sc_dist_thr);
   dlio::declare_param(this, "map/continuous_localize/sc_top_k", this->bayes_sc_top_k_, 5);
+  dlio::declare_param(this, "map/continuous_localize/g2o_verification", this->g2o_verification_enabled_, true);
+  dlio::declare_param(this, "map/continuous_localize/g2o_chi2_threshold", this->g2o_chi2_threshold_, 50.0);
+  dlio::declare_param(this, "map/continuous_localize/g2o_iterations", this->g2o_iterations_, 10);
   dlio::declare_param(this, "frames/map", this->map_frame_, std::string("map"));
 
   // Occupancy Grid

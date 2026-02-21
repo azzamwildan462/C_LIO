@@ -1062,6 +1062,7 @@ void dlio::OdomNode::continuousLocalize()
   //   2. Top-K: only keep the K best matches, zero out the rest
   std::vector<float> raw_likelihood(N);
   std::vector<float> sc_distances(N);
+  std::vector<int> sc_shifts(N); // best column shift per candidate (heading alignment)
   float best_raw = 0.0f;
   int best_raw_idx = 0;
   float worst_raw = 1.0f;
@@ -1070,6 +1071,7 @@ void dlio::OdomNode::continuousLocalize()
   {
     auto [dist, shift] = dlio::sc::computeScanContextDistance(sc_desc, sc_snap[i].descriptor);
     sc_distances[i] = dist;
+    sc_shifts[i] = shift;
 
     // Filter 1: SC distance threshold — reject if too dissimilar
     if (this->bayes_sc_dist_threshold_ > 0.0f && dist > this->bayes_sc_dist_threshold_)
@@ -1238,13 +1240,14 @@ void dlio::OdomNode::continuousLocalize()
   {
     int kf_idx;
     float posterior;
+    int sc_shift; // SC column shift → heading alignment
   };
   std::vector<BayesCandidate> top_candidates;
   top_candidates.reserve(N);
   for (int i = 1; i <= N; i++)
   {
     if (bayes_snap[i] > 0.0f)
-      top_candidates.push_back({i - 1, bayes_snap[i]});
+      top_candidates.push_back({i - 1, bayes_snap[i], sc_shifts[i - 1]});
   }
   std::sort(top_candidates.begin(), top_candidates.end(),
             [](const BayesCandidate &a, const BayesCandidate &b)
@@ -1319,15 +1322,18 @@ void dlio::OdomNode::continuousLocalize()
 
     std::vector<int> nn_indices;
     std::vector<float> nn_dists;
-    prior_kdtree_snap->radiusSearch(search_pt, 50.f * 50.f, nn_indices, nn_dists);
+    prior_kdtree_snap->radiusSearch(search_pt, 35.f * 35.f, nn_indices, nn_dists);
 
-    if (nn_indices.size() < 200)
+    if (nn_indices.size() < 50)
     {
       RCLCPP_WARN(this->get_logger(),
                   "[bayes] tryGICP FAIL: too few neighbors=%zu (need 200) at [%.1f,%.1f,%.1f], prior_map=%zu pts",
                   nn_indices.size(), center[0], center[1], center[2], prior_cloud_snap->size());
       return false;
     }
+
+    RCLCPP_INFO(this->get_logger(), "[bayes] tryGICP: %zu neighbors in 35m radius at [%.1f,%.1f,%.1f]",
+                nn_indices.size(), center[0], center[1], center[2]);
 
     pcl::PointCloud<PointType>::Ptr local_map = std::make_shared<pcl::PointCloud<PointType>>();
     local_map->points.resize(nn_indices.size());
@@ -1401,6 +1407,17 @@ void dlio::OdomNode::continuousLocalize()
       return false;
     }
 
+    // Displacement check: reject if GICP moved too far from init guess
+    // GICP should refine, not jump. Large displacement = likely wrong local minimum.
+    float disp = (result_T.block<3, 1>(0, 3) - init_guess.block<3, 1>(0, 3)).norm();
+    if (disp > 10.0f)
+    {
+      RCLCPP_WARN(this->get_logger(),
+                  "[bayes] tryGICP FAIL: displacement=%.2fm > 10m from init guess at [%.1f,%.1f,%.1f]",
+                  disp, center[0], center[1], center[2]);
+      return false;
+    }
+
     return true;
   };
 
@@ -1421,9 +1438,13 @@ void dlio::OdomNode::continuousLocalize()
 
   // ── Stage 2: GICP at top keyframe candidates (relocalization fallback) ──
   //   Try multiple candidates by posterior rank until one converges.
+  //   Uses SC column shift to derive heading (yaw), tries multiple yaw offsets.
   //   Only active when enable_global_correction is true.
   if (!gicp_ok && this->enable_global_correction_.load())
   {
+    // Yaw offsets to try around the SC-derived heading (handles SC sector quantization error)
+    const std::array<float, 3> yaw_offsets = {0.f, M_PI / 3.f, -M_PI / 3.f}; // 0°, +60°, -60°
+
     for (int ci = 0; ci < max_reloc_candidates && !gicp_ok; ci++)
     {
       int kf_idx = top_candidates[ci].kf_idx;
@@ -1433,28 +1454,62 @@ void dlio::OdomNode::continuousLocalize()
       if (est_kf_dist <= 1.0f)
         continue; // too close to estimated pos, Stage 1 already tried this area
 
-      // Init guess: body rotation (trust IMU) + keyframe position, then apply lidar extrinsic
-      Eigen::Matrix4f kf_init = Eigen::Matrix4f::Identity();
-      kf_init.block<3, 3>(0, 0) = T_map_body_est.block<3, 3>(0, 0);
-      kf_init.block<3, 1>(0, 3) = kf_pos;
-      kf_init = kf_init * T_body_lidar; // body→lidar extrinsic for lidar-frame scan
+      // SC shift → yaw angle: the heading difference between current scan and this keyframe
+      float sc_yaw = static_cast<float>(top_candidates[ci].sc_shift) * 2.f * M_PI / static_cast<float>(dlio::sc::SC_NS);
 
-      gicp_ok = tryGICP(kf_pos, kf_init, T_map_lidar_gicp, fitness);
-
-      if (gicp_ok)
+      // Keyframe orientation (yaw in map frame)
+      // If orientation is Identity (chunk-based fallback, no KFDB), kf_yaw=0
+      // and sc_yaw alone acts as absolute heading estimate.
+      Eigen::Quaternionf kf_q = sc_snap[kf_idx].orientation;
+      float kf_yaw = 0.f;
+      if (std::abs(kf_q.w() - 1.0f) > 1e-4f || kf_q.vec().norm() > 1e-4f)
       {
-        is_reloc = true;
-        best_kf_idx = kf_idx; // update to the candidate that actually worked
-        RCLCPP_INFO(this->get_logger(),
-                    "[bayes] Stage2 RELOC GICP OK: fitness=%.4f at candidate #%d kf%d=[%.1f,%.1f,%.1f] "
-                    "(est was [%.1f,%.1f,%.1f], dist=%.1fm)",
-                    fitness, ci, kf_idx, kf_pos[0], kf_pos[1], kf_pos[2],
-                    est_pos[0], est_pos[1], est_pos[2], est_kf_dist);
+        Eigen::Matrix3f kf_rot = kf_q.toRotationMatrix();
+        kf_yaw = std::atan2(kf_rot(1, 0), kf_rot(0, 0));
       }
-      else
+
+      // Try multiple heading hypotheses around SC-derived yaw
+      for (const float &yaw_off : yaw_offsets)
+      {
+        if (gicp_ok)
+          break;
+
+        float candidate_yaw = kf_yaw + sc_yaw + yaw_off;
+        Eigen::Quaternionf yaw_q(Eigen::AngleAxisf(candidate_yaw, Eigen::Vector3f::UnitZ()));
+
+        // Use gravity-aligned roll/pitch from IMU, but yaw from SC
+        Eigen::Matrix3f R_est = T_map_body_est.block<3, 3>(0, 0);
+        // Extract roll/pitch from IMU estimate (gravity alignment is reliable)
+        Eigen::Vector3f euler = R_est.eulerAngles(2, 1, 0); // ZYX: yaw, pitch, roll
+        Eigen::Quaternionf rp_q = Eigen::Quaternionf(
+            Eigen::AngleAxisf(euler[1], Eigen::Vector3f::UnitY()) *
+            Eigen::AngleAxisf(euler[2], Eigen::Vector3f::UnitX()));
+        Eigen::Quaternionf init_q = yaw_q * rp_q;
+
+        Eigen::Matrix4f kf_init = Eigen::Matrix4f::Identity();
+        kf_init.block<3, 3>(0, 0) = init_q.toRotationMatrix();
+        kf_init.block<3, 1>(0, 3) = kf_pos;
+        kf_init = kf_init * T_body_lidar; // body→lidar extrinsic for lidar-frame scan
+
+        gicp_ok = tryGICP(kf_pos, kf_init, T_map_lidar_gicp, fitness);
+
+        if (gicp_ok)
+        {
+          is_reloc = true;
+          best_kf_idx = kf_idx;
+          RCLCPP_INFO(this->get_logger(),
+                      "[bayes] Stage2 RELOC GICP OK: fitness=%.4f at candidate #%d kf%d=[%.1f,%.1f,%.1f] "
+                      "sc_yaw=%.1fdeg yaw_off=%.1fdeg (est was [%.1f,%.1f,%.1f], dist=%.1fm)",
+                      fitness, ci, kf_idx, kf_pos[0], kf_pos[1], kf_pos[2],
+                      sc_yaw * 180.f / M_PI, yaw_off * 180.f / M_PI,
+                      est_pos[0], est_pos[1], est_pos[2], est_kf_dist);
+        }
+      }
+
+      if (!gicp_ok)
       {
         RCLCPP_INFO(this->get_logger(),
-                    "[bayes] Stage2 candidate #%d kf%d GICP failed at [%.1f,%.1f,%.1f]",
+                    "[bayes] Stage2 candidate #%d kf%d GICP failed at [%.1f,%.1f,%.1f] (3 yaw attempts)",
                     ci, kf_idx, kf_pos[0], kf_pos[1], kf_pos[2]);
       }
     }
@@ -1462,7 +1517,7 @@ void dlio::OdomNode::continuousLocalize()
     if (!gicp_ok)
     {
       RCLCPP_INFO(this->get_logger(),
-                  "[bayes] GICP failed at est and all %d reloc candidates", max_reloc_candidates);
+                  "[bayes] GICP failed at est and all %d reloc candidates (×3 yaw each)", max_reloc_candidates);
     }
   }
 
@@ -1535,24 +1590,67 @@ void dlio::OdomNode::continuousLocalize()
     return;
   }
 
-  // GICP passed — increment consecutive counter
-  bayes_consec++;
-
   RCLCPP_INFO(this->get_logger(),
-              "[bayes] GICP PASS%s: kf=%d fitness=%.4f conf=%.2f dist=%.3fm angle=%.1fdeg | consecutive=%d/%d",
+              "[bayes] GICP PASS%s: kf=%d fitness=%.4f conf=%.2f dist=%.3fm angle=%.1fdeg",
               is_reloc ? " (RELOC)" : "", best_kf_idx, fitness, confidence,
-              correction_dist, correction_angle,
-              bayes_consec, required_consecutive);
+              correction_dist, correction_angle);
 
-  // ── Delayed acceptance: apply only after N consecutive confirms ────────
+  // ── g2o pose graph verification ─────────────────────────────────────
+  //
+  // Build pose graph with: session keyframes (odom chain) + prior map anchors
+  // + proposed loop edge. If loop chi2 is too high → GICP matched at wrong
+  // place (contradicts odometry + map structure). Reject.
+  //
+  // Fallback to consecutive acceptance when g2o is disabled or too few keyframes.
 
-  bool accepted = (bayes_consec >= required_consecutive);
+  bool accepted = false;
+
+  if (this->g2o_verification_enabled_)
+  {
+    double chi2 = 0.0;
+    int num_anchors = 0;
+    bool g2o_ok = this->verifyLoopWithG2O(
+        best_kf_idx, T_map_body_gicp, T_odom_body,
+        T_map_odom_cur, sc_snap, chi2, num_anchors);
+
+    if (num_anchors == 0)
+    {
+      // No anchors = trajectory not yet overlapping with prior map
+      // (random init / first relocalization). g2o can't verify.
+      // Fall back to consecutive acceptance.
+      bayes_consec++;
+      accepted = (bayes_consec >= required_consecutive);
+      RCLCPP_INFO(this->get_logger(),
+                  "[bayes] g2o: no anchors (init?), fallback consecutive=%d/%d",
+                  bayes_consec, required_consecutive);
+    }
+    else if (g2o_ok)
+    {
+      accepted = true;
+      RCLCPP_INFO(this->get_logger(),
+                  "[bayes] g2o ACCEPTED (chi2=%.4f < %.1f, anchors=%d)",
+                  chi2, this->g2o_chi2_threshold_, num_anchors);
+    }
+    else
+    {
+      RCLCPP_INFO(this->get_logger(),
+                  "[bayes] g2o REJECTED (chi2=%.4f > %.1f, anchors=%d)",
+                  chi2, this->g2o_chi2_threshold_, num_anchors);
+    }
+  }
+  else
+  {
+    // g2o disabled: consecutive acceptance
+    bayes_consec++;
+    accepted = (bayes_consec >= required_consecutive);
+
+    RCLCPP_INFO(this->get_logger(),
+                "[bayes] consecutive=%d/%d", bayes_consec, required_consecutive);
+  }
+
   if (accepted)
   {
     bayes_consec = 0;
-
-    // After relocalization, reset posterior so Bayesian filter starts fresh
-    // from the corrected position (old posteriors are for the wrong location)
     if (is_reloc)
       bayes_snap.clear();
   }
@@ -1573,6 +1671,244 @@ void dlio::OdomNode::continuousLocalize()
                 is_reloc ? "RELOCALIZATION" : "map->odom",
                 correction_dist, correction_angle, fitness, confidence, P_loop);
   }
+}
+
+bool dlio::OdomNode::verifyLoopWithG2O(
+    int loop_kf_idx,
+    const Eigen::Matrix4f &T_map_body_gicp,
+    const Eigen::Matrix4f &T_odom_body,
+    const Eigen::Matrix4f &T_map_odom_current,
+    const std::vector<dlio::sc::ScanContextEntry> &sc_snap,
+    double &out_chi2, int &out_num_anchors)
+{
+  // ── Build g2o pose graph ──────────────────────────────────────────────
+  //
+  // Key idea: vertices use CURRENT T_map_odom (before correction).
+  // The loop edge proposes a DIFFERENT position for current pose (from GICP).
+  // If the GICP correction is wrong, the loop edge contradicts the anchored
+  // trajectory → high chi2. If correct, consistent → low chi2.
+  //
+  // Vertices (in map frame via CURRENT T_map_odom):
+  //   - Recent session keyframes
+  //   - Current pose (at current estimated position, NOT GICP result)
+  //   - Prior map anchor keyframes (fixed, known map positions)
+  //
+  // Edges:
+  //   - Odometry: consecutive session kfs (tight, from odom)
+  //   - Anchors:  session kfs ↔ nearby SC database kfs (moderate, fixed)
+  //   - Loop:     SC kf → current pose (measurement from GICP — the tension source)
+
+  g2o::SparseOptimizer optimizer;
+  optimizer.setVerbose(false);
+
+  auto linear_solver = std::make_unique<
+      g2o::LinearSolverEigen<g2o::BlockSolver_6_3::PoseMatrixType>>();
+  auto block_solver = std::make_unique<g2o::BlockSolver_6_3>(std::move(linear_solver));
+  auto solver = new g2o::OptimizationAlgorithmLevenberg(std::move(block_solver));
+  optimizer.setAlgorithm(solver);
+
+  // ── Snapshot session keyframes (odom frame) ──
+  struct KfSnap
+  {
+    Eigen::Vector3f p;
+    Eigen::Quaternionf q;
+  };
+  std::vector<KfSnap> session_kf;
+  {
+    std::lock_guard<std::mutex> lock(this->keyframes_mutex);
+    int n = static_cast<int>(this->keyframes.size());
+    int start = std::max(0, n - 50);
+    for (int i = start; i < n; i++)
+      session_kf.push_back({this->keyframes[i].first.first,
+                            this->keyframes[i].first.second});
+  }
+
+  int num_sk = static_cast<int>(session_kf.size());
+  if (num_sk < 3)
+  {
+    out_chi2 = 0.0;
+    out_num_anchors = 0;
+    return true; // too few keyframes, pass through
+  }
+
+  // ── Project session keyframes to map frame using CURRENT T_map_odom ──
+  Eigen::Matrix4d T_mo = T_map_odom_current.cast<double>();
+  std::vector<Eigen::Isometry3d> sk_map(num_sk);
+  for (int i = 0; i < num_sk; i++)
+  {
+    Eigen::Isometry3d T_ob = Eigen::Isometry3d::Identity();
+    T_ob.translation() = session_kf[i].p.cast<double>();
+    T_ob.linear() = session_kf[i].q.cast<double>().toRotationMatrix();
+    Eigen::Isometry3d T_mb;
+    T_mb.matrix() = T_mo * T_ob.matrix();
+    sk_map[i] = T_mb;
+  }
+
+  // Current pose in map frame using CURRENT T_map_odom (estimated, not GICP)
+  Eigen::Isometry3d current_est;
+  {
+    Eigen::Isometry3d T_ob = Eigen::Isometry3d::Identity();
+    T_ob.matrix() = T_odom_body.cast<double>();
+    current_est.matrix() = T_mo * T_ob.matrix();
+  }
+
+  // GICP result in map frame (what the loop edge proposes)
+  Eigen::Isometry3d current_gicp;
+  current_gicp.matrix() = T_map_body_gicp.cast<double>();
+
+  // ── Add session keyframe vertices ──
+  for (int i = 0; i < num_sk; i++)
+  {
+    auto *v = new g2o::VertexSE3();
+    v->setId(i);
+    v->setEstimate(sk_map[i]);
+    if (i == 0)
+      v->setFixed(true);
+    optimizer.addVertex(v);
+  }
+
+  // Current pose vertex — initialized at CURRENT estimated position
+  {
+    auto *v = new g2o::VertexSE3();
+    v->setId(num_sk);
+    v->setEstimate(current_est);
+    optimizer.addVertex(v);
+  }
+
+  // ── Odometry edges ──
+  // Relative transforms from odom (independent of T_map_odom)
+  Eigen::Matrix<double, 6, 6> odom_info =
+      Eigen::Matrix<double, 6, 6>::Identity() * 100.0;
+
+  for (int i = 1; i < num_sk; i++)
+  {
+    // Odom-frame relative (T_map_odom cancels out)
+    Eigen::Isometry3d T_ob_prev = Eigen::Isometry3d::Identity();
+    T_ob_prev.translation() = session_kf[i - 1].p.cast<double>();
+    T_ob_prev.linear() = session_kf[i - 1].q.cast<double>().toRotationMatrix();
+    Eigen::Isometry3d T_ob_cur = Eigen::Isometry3d::Identity();
+    T_ob_cur.translation() = session_kf[i].p.cast<double>();
+    T_ob_cur.linear() = session_kf[i].q.cast<double>().toRotationMatrix();
+
+    Eigen::Isometry3d rel = T_ob_prev.inverse() * T_ob_cur;
+    auto *e = new g2o::EdgeSE3();
+    e->setMeasurement(rel);
+    e->setInformation(odom_info);
+    e->vertices()[0] = optimizer.vertex(i - 1);
+    e->vertices()[1] = optimizer.vertex(i);
+    optimizer.addEdge(e);
+  }
+
+  // Last session kf → current pose (odom-frame relative)
+  {
+    Eigen::Isometry3d T_ob_last = Eigen::Isometry3d::Identity();
+    T_ob_last.translation() = session_kf.back().p.cast<double>();
+    T_ob_last.linear() = session_kf.back().q.cast<double>().toRotationMatrix();
+    Eigen::Isometry3d T_ob_current = Eigen::Isometry3d::Identity();
+    T_ob_current.matrix() = T_odom_body.cast<double>();
+
+    Eigen::Isometry3d rel = T_ob_last.inverse() * T_ob_current;
+    auto *e = new g2o::EdgeSE3();
+    e->setMeasurement(rel);
+    e->setInformation(odom_info);
+    e->vertices()[0] = optimizer.vertex(num_sk - 1);
+    e->vertices()[1] = optimizer.vertex(num_sk);
+    optimizer.addEdge(e);
+  }
+
+  // ── Prior map anchor edges ──
+  // Ground the trajectory to known map positions.
+  // Measurements computed from CURRENT projection (before correction).
+  int next_id = num_sk + 1;
+  int num_anchors = 0;
+  int N_sc = static_cast<int>(sc_snap.size());
+
+  Eigen::Matrix<double, 6, 6> anchor_info = Eigen::Matrix<double, 6, 6>::Identity();
+  anchor_info.block<3, 3>(0, 0) *= 5.0;  // rotation: loose
+  anchor_info.block<3, 3>(3, 3) *= 50.0; // translation: moderate
+
+  for (int i = 0; i < num_sk; i += 3)
+  {
+    Eigen::Vector3d sk_pos = sk_map[i].translation();
+
+    double best_dist = 1e9;
+    int best_sc = -1;
+    for (int j = 0; j < N_sc; j++)
+    {
+      double d = (sc_snap[j].position.cast<double>() - sk_pos).norm();
+      if (d < best_dist)
+      {
+        best_dist = d;
+        best_sc = j;
+      }
+    }
+
+    if (best_sc >= 0 && best_dist < 10.0)
+    {
+      auto *v = new g2o::VertexSE3();
+      v->setId(next_id);
+      Eigen::Isometry3d sc_pose = Eigen::Isometry3d::Identity();
+      sc_pose.translation() = sc_snap[best_sc].position.cast<double>();
+      v->setEstimate(sc_pose);
+      v->setFixed(true);
+      optimizer.addVertex(v);
+
+      // Measurement: expected relative transform (from current projection)
+      Eigen::Isometry3d rel = sc_pose.inverse() * sk_map[i];
+      auto *e = new g2o::EdgeSE3();
+      e->setMeasurement(rel);
+      e->setInformation(anchor_info);
+      e->vertices()[0] = optimizer.vertex(next_id);
+      e->vertices()[1] = optimizer.vertex(i);
+      optimizer.addEdge(e);
+
+      next_id++;
+      num_anchors++;
+    }
+  }
+
+  // ── Loop closure edge ──
+  // This is the ONLY edge that uses the GICP result.
+  // It says: "current pose should be at T_map_body_gicp relative to SC kf"
+  // If GICP matched at wrong place, this fights the odom chain + anchors → high chi2.
+  Eigen::Isometry3d sc_kf_pose = Eigen::Isometry3d::Identity();
+  sc_kf_pose.translation() = sc_snap[loop_kf_idx].position.cast<double>();
+
+  auto *v_loop = new g2o::VertexSE3();
+  v_loop->setId(next_id);
+  v_loop->setEstimate(sc_kf_pose);
+  v_loop->setFixed(true);
+  optimizer.addVertex(v_loop);
+
+  // Loop measurement: from SC kf to GICP result (proposed position)
+  Eigen::Isometry3d loop_meas = sc_kf_pose.inverse() * current_gicp;
+
+  Eigen::Matrix<double, 6, 6> loop_info = Eigen::Matrix<double, 6, 6>::Identity();
+  loop_info.block<3, 3>(0, 0) *= 10.0;  // rotation
+  loop_info.block<3, 3>(3, 3) *= 100.0; // translation
+
+  auto *loop_edge = new g2o::EdgeSE3();
+  loop_edge->setMeasurement(loop_meas);
+  loop_edge->setInformation(loop_info);
+  loop_edge->vertices()[0] = optimizer.vertex(next_id);
+  loop_edge->vertices()[1] = optimizer.vertex(num_sk);
+  optimizer.addEdge(loop_edge);
+
+  // ── Optimize ──
+  optimizer.initializeOptimization();
+  optimizer.optimize(this->g2o_iterations_);
+
+  // ── Check chi2 ──
+  out_chi2 = loop_edge->chi2();
+
+  RCLCPP_INFO(this->get_logger(),
+              "[bayes] g2o: loop_chi2=%.4f anchors=%d vertices=%d edges=%d",
+              out_chi2, num_anchors,
+              static_cast<int>(optimizer.vertices().size()),
+              static_cast<int>(optimizer.edges().size()));
+
+  out_num_anchors = num_anchors;
+  return out_chi2 < this->g2o_chi2_threshold_;
 }
 
 void dlio::OdomNode::publishOccupancyGrid()
