@@ -2,6 +2,7 @@
 #include "dlio/utils.h"
 #include "dlio/kfdb_io.h"
 
+#include <algorithm>
 #include <filesystem>
 #include <numeric>
 #include <unistd.h>
@@ -82,8 +83,11 @@ void dlio::OdomNode::publishToROS(pcl::PointCloud<PointType>::ConstPtr published
   p.pose.orientation.y = this->lidarPose.q.y();
   p.pose.orientation.z = this->lidarPose.q.z();
 
-  this->path_ros.poses.push_back(p);
-  this->path_pub->publish(this->path_ros);
+  {
+    std::lock_guard<std::mutex> lock(this->publish_mtx_);
+    this->path_ros.poses.push_back(p);
+    this->path_pub->publish(this->path_ros);
+  }
 
   // transform: odom to baselink
   geometry_msgs::msg::TransformStamped transformStamped;
@@ -202,12 +206,15 @@ void dlio::OdomNode::publishKeyframe(std::pair<std::pair<Eigen::Vector3f, Eigen:
   p.orientation.x = kf.first.second.x();
   p.orientation.y = kf.first.second.y();
   p.orientation.z = kf.first.second.z();
-  this->kf_pose_ros.poses.push_back(p);
+  {
+    std::lock_guard<std::mutex> lock(this->kf_publish_mtx_);
+    this->kf_pose_ros.poses.push_back(p);
 
-  // Publish
-  this->kf_pose_ros.header.stamp = timestamp;
-  this->kf_pose_ros.header.frame_id = this->odom_frame;
-  this->kf_pose_pub->publish(this->kf_pose_ros);
+    // Publish
+    this->kf_pose_ros.header.stamp = timestamp;
+    this->kf_pose_ros.header.frame_id = this->odom_frame;
+    this->kf_pose_pub->publish(this->kf_pose_ros);
+  }
 
   // publish keyframe scan for map (use unique_ptr for IPC zero-copy)
   if (!this->vf_use_ || (kf.second->points.size() == kf.second->width * kf.second->height))
@@ -330,11 +337,14 @@ void dlio::OdomNode::reloadPriorMapForRelocalization()
   if (this->prior_map_cloud_ && this->prior_map_cloud_->size() > 0)
   {
     // Resources still available, just reload SC database if needed
-    if (this->sc_database_.empty())
     {
-      if (!this->loadKeyframeDatabase())
+      std::lock_guard<std::mutex> lock(this->continuous_localize_mtx_);
+      if (this->sc_database_.empty())
       {
-        this->buildScanContextDatabase();
+        if (!this->loadKeyframeDatabase())
+        {
+          this->buildScanContextDatabase();
+        }
       }
     }
     return;
@@ -363,11 +373,14 @@ void dlio::OdomNode::reloadPriorMapForRelocalization()
   RCLCPP_INFO(this->get_logger(), "[Relocalize] Prior map reloaded: %zu pts, KdTree built",
               this->prior_map_cloud_->size());
 
-  // Load SC database
-  this->sc_database_.clear();
-  if (!this->loadKeyframeDatabase())
+  // Load SC database (lock to prevent race with continuousLocalize iterating sc_database_)
   {
-    this->buildScanContextDatabase();
+    std::lock_guard<std::mutex> lock(this->continuous_localize_mtx_);
+    this->sc_database_.clear();
+    if (!this->loadKeyframeDatabase())
+    {
+      this->buildScanContextDatabase();
+    }
   }
   RCLCPP_INFO(this->get_logger(), "[Relocalize] SC database: %zu entries", this->sc_database_.size());
 }
@@ -483,11 +496,9 @@ void dlio::OdomNode::srvSetPose(
   {
     std::lock_guard<std::mutex> lock(this->continuous_localize_mtx_);
     this->T_map_odom_ = T_map_odom_new;
+    this->bayes_posterior_.clear();
+    this->bayes_consecutive_accepts_ = 0;
   }
-
-  // Clear Bayesian state (fresh start from new map correction)
-  this->bayes_posterior_.clear();
-  this->bayes_consecutive_accepts_ = 0;
 
   // Mark as relocalized if not already
   this->prior_map_pose_set_ = true;
@@ -562,15 +573,19 @@ bool dlio::OdomNode::callSavePCD()
   // Use async callback to avoid deadlock (service-within-service in same executor)
   auto logger = this->get_logger();
   this->save_pcd_client_->async_send_request(request,
-    [logger](rclcpp::Client<direct_lidar_inertial_odometry::srv::SavePCD>::SharedFuture future) {
-      auto result = future.get();
-      if (result->success) {
-        RCLCPP_INFO(logger, "[SavePCD] Map saved successfully");
-      } else {
-        RCLCPP_WARN(logger, "[SavePCD] Map save failed");
-      }
-    });
-  return true;  // request sent, will complete asynchronously
+                                             [logger](rclcpp::Client<direct_lidar_inertial_odometry::srv::SavePCD>::SharedFuture future)
+                                             {
+                                               auto result = future.get();
+                                               if (result->success)
+                                               {
+                                                 RCLCPP_INFO(logger, "[SavePCD] Map saved successfully");
+                                               }
+                                               else
+                                               {
+                                                 RCLCPP_WARN(logger, "[SavePCD] Map save failed");
+                                               }
+                                             });
+  return true; // request sent, will complete asynchronously
 }
 
 bool dlio::OdomNode::callSaveCorrectedPCD()
@@ -593,15 +608,19 @@ bool dlio::OdomNode::callSaveCorrectedPCD()
   // Use async callback to avoid deadlock (service-within-service in same executor)
   auto logger = this->get_logger();
   this->save_corrected_pcd_client_->async_send_request(request,
-    [logger](rclcpp::Client<direct_lidar_inertial_odometry::srv::SavePCD>::SharedFuture future) {
-      auto result = future.get();
-      if (result->success) {
-        RCLCPP_INFO(logger, "[SavePCD] Corrected map saved successfully");
-      } else {
-        RCLCPP_WARN(logger, "[SavePCD] Corrected map save failed");
-      }
-    });
-  return true;  // request sent, will complete asynchronously
+                                                       [logger](rclcpp::Client<direct_lidar_inertial_odometry::srv::SavePCD>::SharedFuture future)
+                                                       {
+                                                         auto result = future.get();
+                                                         if (result->success)
+                                                         {
+                                                           RCLCPP_INFO(logger, "[SavePCD] Corrected map saved successfully");
+                                                         }
+                                                         else
+                                                         {
+                                                           RCLCPP_WARN(logger, "[SavePCD] Corrected map save failed");
+                                                         }
+                                                       });
+  return true; // request sent, will complete asynchronously
 }
 
 void dlio::OdomNode::clearAllMapData()
@@ -623,8 +642,11 @@ void dlio::OdomNode::clearAllMapData()
   this->keyframe_convex.clear();
   this->keyframe_concave.clear();
 
-  // Clear SC/relocalization data
-  this->sc_database_.clear();
+  // Clear SC/relocalization data (lock to prevent race with continuousLocalize)
+  {
+    std::lock_guard<std::mutex> cl_lock(this->continuous_localize_mtx_);
+    this->sc_database_.clear();
+  }
   {
     std::lock_guard<std::mutex> kfdb_lock(this->kfdb_mutex_);
     this->kfdb_entries_.clear();
@@ -666,9 +688,11 @@ void dlio::OdomNode::clearAllMapData()
   {
     size_t dot = pcd_path.rfind('.');
     std::string corrected_pcd = (dot != std::string::npos && pcd_path.substr(dot) == ".pcd")
-        ? pcd_path.substr(0, dot) + "_corrected.pcd" : pcd_path + "_corrected.pcd";
+                                    ? pcd_path.substr(0, dot) + "_corrected.pcd"
+                                    : pcd_path + "_corrected.pcd";
     std::string corrected_kfdb = (dot != std::string::npos && pcd_path.substr(dot) == ".pcd")
-        ? pcd_path.substr(0, dot) + "_corrected.kfdb" : pcd_path + "_corrected.kfdb";
+                                     ? pcd_path.substr(0, dot) + "_corrected.kfdb"
+                                     : pcd_path + "_corrected.kfdb";
     if (std::filesystem::exists(corrected_pcd))
     {
       std::filesystem::remove(corrected_pcd);
@@ -732,9 +756,9 @@ void dlio::OdomNode::srvNewMapWZero(
   {
     std::lock_guard<std::mutex> lock(this->continuous_localize_mtx_);
     this->T_map_odom_ = Eigen::Matrix4f::Identity();
+    this->bayes_posterior_.clear();
+    this->bayes_consecutive_accepts_ = 0;
   }
-  this->bayes_posterior_.clear();
-  this->bayes_consecutive_accepts_ = 0;
 
   // Update atexit handler
   if (!this->map_path_.empty())
@@ -952,19 +976,37 @@ void dlio::OdomNode::continuousLocalize()
                          this->dlio_initialized.load(), this->relocalized_);
     return;
   }
-  if (!this->prior_map_cloud_ || !this->prior_map_kdtree_)
+
+  // Brief lock: copy shared state, then release for heavy computation
+  std::vector<dlio::sc::ScanContextEntry> sc_snap;
+  std::vector<float> bayes_snap;
+  Eigen::Matrix4f T_map_odom_snap;
+  pcl::PointCloud<PointType>::ConstPtr prior_cloud_snap;
+  std::shared_ptr<nanoflann::KdTreeFLANN<PointType>> prior_kdtree_snap;
+  int bayes_consec;
   {
-    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-                         "[bayes] skip: prior_map=%d, kdtree=%d",
-                         this->prior_map_cloud_ ? 1 : 0, this->prior_map_kdtree_ ? 1 : 0);
-    return;
+    std::lock_guard<std::mutex> cl_lock(this->continuous_localize_mtx_);
+    if (!this->prior_map_cloud_ || !this->prior_map_kdtree_)
+    {
+      RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                           "[bayes] skip: prior_map=%d, kdtree=%d",
+                           this->prior_map_cloud_ ? 1 : 0, this->prior_map_kdtree_ ? 1 : 0);
+      return;
+    }
+    if (this->sc_database_.empty())
+    {
+      RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                           "[bayes] skip: sc_database empty");
+      return;
+    }
+    sc_snap = this->sc_database_;
+    bayes_snap = this->bayes_posterior_;
+    T_map_odom_snap = this->T_map_odom_;
+    prior_cloud_snap = this->prior_map_cloud_;
+    prior_kdtree_snap = this->prior_map_kdtree_;
+    bayes_consec = this->bayes_consecutive_accepts_;
   }
-  if (this->sc_database_.empty())
-  {
-    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-                         "[bayes] skip: sc_database empty");
-    return;
-  }
+  // --- All computation below uses local copies, no lock held ---
 
   // 1. Get latest scan (body frame) + T_odom_body
   pcl::PointCloud<PointType>::ConstPtr scan_body;
@@ -993,16 +1035,16 @@ void dlio::OdomNode::continuousLocalize()
     return;
   }
 
-  const int N = static_cast<int>(this->sc_database_.size());
+  const int N = static_cast<int>(sc_snap.size());
 
   // Initialize Bayesian posterior if needed (lazy init / size change)
-  if (static_cast<int>(this->bayes_posterior_.size()) != N + 1)
+  if (static_cast<int>(bayes_snap.size()) != N + 1)
   {
-    this->bayes_posterior_.resize(N + 1);
-    this->bayes_posterior_[0] = 1.0f; // virtual place = certain "new place"
+    bayes_snap.resize(N + 1);
+    bayes_snap[0] = 1.0f; // virtual place = certain "new place"
     for (int i = 1; i <= N; i++)
-      this->bayes_posterior_[i] = 0.0f;
-    this->bayes_consecutive_accepts_ = 0;
+      bayes_snap[i] = 0.0f;
+    bayes_consec = 0;
     RCLCPP_INFO(this->get_logger(), "[bayes] initialized posterior: N=%d keyframes", N);
   }
 
@@ -1015,14 +1057,31 @@ void dlio::OdomNode::continuousLocalize()
   auto sc_desc = dlio::sc::computeScanContext(sc_scan, this->sc_max_range_);
 
   // Raw likelihoods: invert SC distance (lower distance = better match = higher likelihood)
+  // Two filters applied:
+  //   1. SC distance threshold: reject candidates with dist > threshold (too dissimilar)
+  //   2. Top-K: only keep the K best matches, zero out the rest
   std::vector<float> raw_likelihood(N);
+  std::vector<float> sc_distances(N);
   float best_raw = 0.0f;
   int best_raw_idx = 0;
   float worst_raw = 1.0f;
+  int n_dist_rejected = 0;
   for (int i = 0; i < N; i++)
   {
-    auto [dist, shift] = dlio::sc::computeScanContextDistance(sc_desc, this->sc_database_[i].descriptor);
-    raw_likelihood[i] = 1.0f / (1.0f + dist);
+    auto [dist, shift] = dlio::sc::computeScanContextDistance(sc_desc, sc_snap[i].descriptor);
+    sc_distances[i] = dist;
+
+    // Filter 1: SC distance threshold — reject if too dissimilar
+    if (this->bayes_sc_dist_threshold_ > 0.0f && dist > this->bayes_sc_dist_threshold_)
+    {
+      raw_likelihood[i] = 0.0f;
+      n_dist_rejected++;
+    }
+    else
+    {
+      raw_likelihood[i] = 1.0f / (1.0f + dist);
+    }
+
     if (raw_likelihood[i] > best_raw)
     {
       best_raw = raw_likelihood[i];
@@ -1030,6 +1089,40 @@ void dlio::OdomNode::continuousLocalize()
     }
     if (raw_likelihood[i] < worst_raw)
       worst_raw = raw_likelihood[i];
+  }
+
+  // Filter 2: Top-K — only keep K smallest SC distances, zero out the rest
+  if (this->bayes_sc_top_k_ > 0 && this->bayes_sc_top_k_ < N)
+  {
+    // Collect indices of non-zero candidates, sorted by SC distance (ascending)
+    std::vector<int> candidates;
+    candidates.reserve(N);
+    for (int i = 0; i < N; i++)
+    {
+      if (raw_likelihood[i] > 0.0f)
+        candidates.push_back(i);
+    }
+
+    if (static_cast<int>(candidates.size()) > this->bayes_sc_top_k_)
+    {
+      // Partial sort: move K smallest distances to front
+      std::nth_element(candidates.begin(),
+                       candidates.begin() + this->bayes_sc_top_k_,
+                       candidates.end(),
+                       [&](int a, int b)
+                       { return sc_distances[a] < sc_distances[b]; });
+
+      // Build set of kept indices
+      std::vector<bool> keep(N, false);
+      for (int k = 0; k < this->bayes_sc_top_k_; k++)
+        keep[candidates[k]] = true;
+
+      for (int i = 0; i < N; i++)
+      {
+        if (!keep[i])
+          raw_likelihood[i] = 0.0f;
+      }
+    }
   }
 
   // ── 3. Angeli normalization (adapted for Scan Context) ───────────────
@@ -1053,8 +1146,9 @@ void dlio::OdomNode::continuousLocalize()
   float angeli_mean = 0.0f, angeli_stddev = 0.0f;
   int num_promoted = 0;
 
-  if (nonzero_vals.size() >= 2)
+  if (nonzero_vals.size() >= 3)
   {
+    // Enough candidates for statistical normalization (Angeli)
     float sum_vals = 0.0f;
     for (float v : nonzero_vals)
       sum_vals += v;
@@ -1080,6 +1174,22 @@ void dlio::OdomNode::continuousLocalize()
       }
     }
   }
+  else if (!nonzero_vals.empty())
+  {
+    // Too few candidates for Angeli — use raw likelihood directly as boost.
+    // Candidates already passed distance+topK filters, so they're good matches.
+    // Scale: raw_likelihood is in [0,1], boost the survivors relative to VP (1.0).
+    for (int i = 0; i < N; i++)
+    {
+      if (raw_likelihood[i] > 0.0f)
+      {
+        // Boost = raw * N so that a few strong candidates dominate over VP
+        adjusted[i + 1] = raw_likelihood[i] * static_cast<float>(N);
+        num_promoted++;
+      }
+      // else stays 1.0 (neutral)
+    }
+  }
   // VP adjusted stays 1.0 (neutral) — SC is dense, not sparse like visual features
   adjusted[0] = 1.0f;
 
@@ -1093,10 +1203,10 @@ void dlio::OdomNode::continuousLocalize()
   std::vector<float> prior(N + 1);
   float self_loop = this->bayes_virtual_place_prior_; // reuse as self-loop probability
 
-  float prev_vp = this->bayes_posterior_[0];
+  float prev_vp = bayes_snap[0];
   float sum_real_posterior = 0.0f;
   for (int i = 1; i <= N; i++)
-    sum_real_posterior += this->bayes_posterior_[i];
+    sum_real_posterior += bayes_snap[i];
 
   // VP prediction: stays VP + keyframes escaping to VP
   prior[0] = self_loop * prev_vp + (1.0f - self_loop) * sum_real_posterior;
@@ -1104,50 +1214,67 @@ void dlio::OdomNode::continuousLocalize()
   // Keyframe prediction: stays same + VP leaking to keyframes
   float vp_to_kf = (1.0f - self_loop) * prev_vp / static_cast<float>(N);
   for (int i = 1; i <= N; i++)
-    prior[i] = self_loop * this->bayes_posterior_[i] + vp_to_kf;
+    prior[i] = self_loop * bayes_snap[i] + vp_to_kf;
 
   // Update step: posterior = likelihood × prior, then normalize
   float sum_posterior = 0.0f;
   for (int i = 0; i <= N; i++)
   {
-    this->bayes_posterior_[i] = adjusted[i] * prior[i];
-    sum_posterior += this->bayes_posterior_[i];
+    bayes_snap[i] = adjusted[i] * prior[i];
+    sum_posterior += bayes_snap[i];
   }
   if (sum_posterior > 0.0f)
   {
     for (int i = 0; i <= N; i++)
-      this->bayes_posterior_[i] /= sum_posterior;
+      bayes_snap[i] /= sum_posterior;
   }
 
   // ── 5. Hypothesis check ────────────────────────────────────────────────
 
-  float P_loop = 1.0f - this->bayes_posterior_[0];
+  float P_loop = 1.0f - bayes_snap[0];
 
-  // Find best keyframe (highest posterior among real places) — always compute for logging
-  int best_kf_idx = 0;
-  float best_kf_posterior = 0.0f;
+  // Find top keyframes by posterior (for multi-candidate GICP in Stage 2)
+  struct BayesCandidate
+  {
+    int kf_idx;
+    float posterior;
+  };
+  std::vector<BayesCandidate> top_candidates;
+  top_candidates.reserve(N);
   for (int i = 1; i <= N; i++)
   {
-    if (this->bayes_posterior_[i] > best_kf_posterior)
-    {
-      best_kf_posterior = this->bayes_posterior_[i];
-      best_kf_idx = i - 1; // sc_database_ index
-    }
+    if (bayes_snap[i] > 0.0f)
+      top_candidates.push_back({i - 1, bayes_snap[i]});
   }
+  std::sort(top_candidates.begin(), top_candidates.end(),
+            [](const BayesCandidate &a, const BayesCandidate &b)
+            { return a.posterior > b.posterior; });
+
+  int best_kf_idx = top_candidates.empty() ? 0 : top_candidates[0].kf_idx;
+  float best_kf_posterior = top_candidates.empty() ? 0.0f : top_candidates[0].posterior;
 
   RCLCPP_INFO(this->get_logger(),
-              "[bayes] SC: best=%.4f(kf%d) worst=%.4f | Angeli: mean=%.4f std=%.4f promoted=%d/%d | "
+              "[bayes] SC: best=%.4f(kf%d,d=%.3f) worst=%.4f dist_rej=%d topK=%d | "
+              "Angeli: mean=%.4f std=%.4f promoted=%d/%d | "
               "P_vp=%.4f P_loop=%.4f best_kf=%d(P=%.4f) prior_vp=%.4f thr=%.2f consec=%d/%d",
-              best_raw, best_raw_idx, worst_raw,
+              best_raw, best_raw_idx, sc_distances[best_raw_idx], worst_raw,
+              n_dist_rejected, this->bayes_sc_top_k_,
               angeli_mean, angeli_stddev, num_promoted, N,
-              this->bayes_posterior_[0], P_loop, best_kf_idx, best_kf_posterior,
+              bayes_snap[0], P_loop, best_kf_idx, best_kf_posterior,
               prior[0], this->bayes_loop_threshold_,
-              this->bayes_consecutive_accepts_, this->bayes_min_consecutive_);
+              bayes_consec, this->bayes_min_consecutive_);
 
   if (P_loop <= this->bayes_loop_threshold_)
   {
     // Virtual place wins — no correction, reset consecutive
-    this->bayes_consecutive_accepts_ = 0;
+    bayes_consec = 0;
+
+    // Write back Bayesian state
+    {
+      std::lock_guard<std::mutex> wb(this->continuous_localize_mtx_);
+      this->bayes_posterior_ = bayes_snap;
+      this->bayes_consecutive_accepts_ = bayes_consec;
+    }
 
     // Publish low confidence: P_loop scaled down (not in a recognized place)
     this->last_confidence_ = P_loop * 0.5f;
@@ -1170,17 +1297,16 @@ void dlio::OdomNode::continuousLocalize()
   //   position. This handles random initialization / large position error.
   //   Relocalization requires more consecutive accepts (3 vs 2).
 
-  Eigen::Matrix4f T_map_odom_cur;
-  {
-    std::lock_guard<std::mutex> lock(this->continuous_localize_mtx_);
-    T_map_odom_cur = this->T_map_odom_;
-  }
+  Eigen::Matrix4f T_map_odom_cur = T_map_odom_snap;
+  Eigen::Matrix4f T_body_lidar = this->extrinsics.baselink2lidar_T; // lidar→body
 
   Eigen::Matrix4f T_map_body_est = T_map_odom_cur * T_odom_body;
+  Eigen::Matrix4f T_map_lidar_est = T_map_body_est * T_body_lidar; // lidar→body→odom→map
   Eigen::Vector3f est_pos = T_map_body_est.block<3, 1>(0, 3);
 
-  // Keyframe position for Stage 2 fallback
-  Eigen::Vector3f kf_pos = this->sc_database_[best_kf_idx].position;
+  // Number of keyframe candidates to try in Stage 2 (relocalization)
+  int max_reloc_candidates = std::min(static_cast<int>(top_candidates.size()),
+                                      std::max(this->bayes_sc_top_k_, 3));
 
   // GICP at a given search center + initial guess. Returns success, result transform, fitness.
   auto tryGICP = [&](const Eigen::Vector3f &center, const Eigen::Matrix4f &init_guess,
@@ -1193,15 +1319,20 @@ void dlio::OdomNode::continuousLocalize()
 
     std::vector<int> nn_indices;
     std::vector<float> nn_dists;
-    this->prior_map_kdtree_->radiusSearch(search_pt, 50.f * 50.f, nn_indices, nn_dists);
+    prior_kdtree_snap->radiusSearch(search_pt, 50.f * 50.f, nn_indices, nn_dists);
 
     if (nn_indices.size() < 200)
+    {
+      RCLCPP_WARN(this->get_logger(),
+                  "[bayes] tryGICP FAIL: too few neighbors=%zu (need 200) at [%.1f,%.1f,%.1f], prior_map=%zu pts",
+                  nn_indices.size(), center[0], center[1], center[2], prior_cloud_snap->size());
       return false;
+    }
 
     pcl::PointCloud<PointType>::Ptr local_map = std::make_shared<pcl::PointCloud<PointType>>();
     local_map->points.resize(nn_indices.size());
     for (size_t i = 0; i < nn_indices.size(); i++)
-      local_map->points[i] = this->prior_map_cloud_->points[nn_indices[i]];
+      local_map->points[i] = prior_cloud_snap->points[nn_indices[i]];
     local_map->width = local_map->points.size();
     local_map->height = 1;
     local_map->is_dense = true;
@@ -1216,7 +1347,8 @@ void dlio::OdomNode::continuousLocalize()
     pcl::PointCloud<PointType>::Ptr aligned = std::make_shared<pcl::PointCloud<PointType>>();
     bool converged = false;
 
-    if (this->use_gicp_) {
+    if (this->use_gicp_)
+    {
       nano_gicp::NanoGICP<PointType, PointType> gicp;
       gicp.setCorrespondenceRandomness(this->gicp_k_correspondences_);
       gicp.setMaxCorrespondenceDistance(this->gicp_max_corr_dist_);
@@ -1233,7 +1365,9 @@ void dlio::OdomNode::continuousLocalize()
       converged = gicp.hasConverged();
       result_fitness = gicp.getFitnessScore(1.0);
       result_T = gicp.getFinalTransformation();
-    } else {
+    }
+    else
+    {
       pclomp::NormalDistributionsTransform<PointType, PointType> ndt_local;
       ndt_local.setResolution(this->ndt_resolution_);
       ndt_local.setNumThreads(this->ndt_num_threads_);
@@ -1251,21 +1385,33 @@ void dlio::OdomNode::continuousLocalize()
     }
 
     if (!converged)
+    {
+      RCLCPP_WARN(this->get_logger(),
+                  "[bayes] tryGICP FAIL: not converged at [%.1f,%.1f,%.1f], scan=%zu pts, local_map=%zu pts",
+                  center[0], center[1], center[2], scan_body->size(), local_map->size());
       return false;
+    }
 
     if (result_fitness > this->continuous_localize_fitness_thresh_)
+    {
+      RCLCPP_WARN(this->get_logger(),
+                  "[bayes] tryGICP FAIL: fitness=%.4f > thresh=%.4f at [%.1f,%.1f,%.1f], scan=%zu, local_map=%zu",
+                  result_fitness, this->continuous_localize_fitness_thresh_,
+                  center[0], center[1], center[2], scan_body->size(), local_map->size());
       return false;
+    }
 
     return true;
   };
 
   bool gicp_ok = false;
   bool is_reloc = false;
-  Eigen::Matrix4f T_map_body_gicp;
+  Eigen::Matrix4f T_map_lidar_gicp;
   float fitness = 0.0f;
 
   // ── Stage 1: GICP at estimated position (drift correction) ──
-  gicp_ok = tryGICP(est_pos, T_map_body_est, T_map_body_gicp, fitness);
+  // scan_body is in lidar frame → init_guess must be T_map←lidar
+  gicp_ok = tryGICP(est_pos, T_map_lidar_est, T_map_lidar_gicp, fitness);
 
   if (gicp_ok)
   {
@@ -1273,46 +1419,63 @@ void dlio::OdomNode::continuousLocalize()
                 fitness, est_pos[0], est_pos[1], est_pos[2]);
   }
 
-  // ── Stage 2: GICP at keyframe position (relocalization fallback) ──
+  // ── Stage 2: GICP at top keyframe candidates (relocalization fallback) ──
+  //   Try multiple candidates by posterior rank until one converges.
   //   Only active when enable_global_correction is true.
   if (!gicp_ok && this->enable_global_correction_.load())
   {
-    float est_kf_dist = (est_pos - kf_pos).norm();
-    if (est_kf_dist > 1.0f)
+    for (int ci = 0; ci < max_reloc_candidates && !gicp_ok; ci++)
     {
-      // Init guess: odom rotation (trust IMU) + keyframe position
-      Eigen::Matrix4f kf_init = Eigen::Matrix4f::Identity();
-      kf_init.block<3, 3>(0, 0) = T_odom_body.block<3, 3>(0, 0);
-      kf_init.block<3, 1>(0, 3) = kf_pos;
+      int kf_idx = top_candidates[ci].kf_idx;
+      Eigen::Vector3f kf_pos = sc_snap[kf_idx].position;
+      float est_kf_dist = (est_pos - kf_pos).norm();
 
-      gicp_ok = tryGICP(kf_pos, kf_init, T_map_body_gicp, fitness);
+      if (est_kf_dist <= 1.0f)
+        continue; // too close to estimated pos, Stage 1 already tried this area
+
+      // Init guess: body rotation (trust IMU) + keyframe position, then apply lidar extrinsic
+      Eigen::Matrix4f kf_init = Eigen::Matrix4f::Identity();
+      kf_init.block<3, 3>(0, 0) = T_map_body_est.block<3, 3>(0, 0);
+      kf_init.block<3, 1>(0, 3) = kf_pos;
+      kf_init = kf_init * T_body_lidar; // body→lidar extrinsic for lidar-frame scan
+
+      gicp_ok = tryGICP(kf_pos, kf_init, T_map_lidar_gicp, fitness);
 
       if (gicp_ok)
       {
         is_reloc = true;
+        best_kf_idx = kf_idx; // update to the candidate that actually worked
         RCLCPP_INFO(this->get_logger(),
-                    "[bayes] Stage2 RELOC GICP OK: fitness=%.4f at kf%d=[%.1f,%.1f,%.1f] (est was [%.1f,%.1f,%.1f], dist=%.1fm)",
-                    fitness, best_kf_idx, kf_pos[0], kf_pos[1], kf_pos[2],
+                    "[bayes] Stage2 RELOC GICP OK: fitness=%.4f at candidate #%d kf%d=[%.1f,%.1f,%.1f] "
+                    "(est was [%.1f,%.1f,%.1f], dist=%.1fm)",
+                    fitness, ci, kf_idx, kf_pos[0], kf_pos[1], kf_pos[2],
                     est_pos[0], est_pos[1], est_pos[2], est_kf_dist);
       }
       else
       {
         RCLCPP_INFO(this->get_logger(),
-                    "[bayes] GICP failed at both est=[%.1f,%.1f,%.1f] and kf%d=[%.1f,%.1f,%.1f]",
-                    est_pos[0], est_pos[1], est_pos[2], best_kf_idx, kf_pos[0], kf_pos[1], kf_pos[2]);
+                    "[bayes] Stage2 candidate #%d kf%d GICP failed at [%.1f,%.1f,%.1f]",
+                    ci, kf_idx, kf_pos[0], kf_pos[1], kf_pos[2]);
       }
     }
-    else
+
+    if (!gicp_ok)
     {
       RCLCPP_INFO(this->get_logger(),
-                  "[bayes] GICP failed at est=[%.1f,%.1f,%.1f] (kf%d nearby, no fallback)",
-                  est_pos[0], est_pos[1], est_pos[2], best_kf_idx);
+                  "[bayes] GICP failed at est and all %d reloc candidates", max_reloc_candidates);
     }
   }
 
   if (!gicp_ok)
   {
-    this->bayes_consecutive_accepts_ = 0;
+    bayes_consec = 0;
+
+    // Write back Bayesian state
+    {
+      std::lock_guard<std::mutex> wb(this->continuous_localize_mtx_);
+      this->bayes_posterior_ = bayes_snap;
+      this->bayes_consecutive_accepts_ = bayes_consec;
+    }
 
     // Publish low confidence: P_loop is high but GICP can't match
     this->last_confidence_ = P_loop * 0.3f;
@@ -1326,6 +1489,8 @@ void dlio::OdomNode::continuousLocalize()
   }
 
   // ── Compute correction ──────────────────────────────────────────────
+  // GICP result is T_map←lidar, recover T_map←body by removing lidar extrinsic
+  Eigen::Matrix4f T_map_body_gicp = T_map_lidar_gicp * T_body_lidar.inverse();
   Eigen::Matrix4f T_map_odom_new = T_map_body_gicp * T_odom_body.inverse();
   Eigen::Matrix4f delta = T_map_odom_new * T_map_odom_cur.inverse();
   float correction_dist = delta.block<3, 1>(0, 3).norm();
@@ -1355,7 +1520,15 @@ void dlio::OdomNode::continuousLocalize()
       (correction_dist > this->continuous_localize_max_correction_ ||
        correction_angle > this->continuous_localize_max_correction_ * 5.0f))
   {
-    this->bayes_consecutive_accepts_ = 0;
+    bayes_consec = 0;
+
+    // Write back Bayesian state
+    {
+      std::lock_guard<std::mutex> wb(this->continuous_localize_mtx_);
+      this->bayes_posterior_ = bayes_snap;
+      this->bayes_consecutive_accepts_ = bayes_consec;
+    }
+
     RCLCPP_WARN(this->get_logger(),
                 "[bayes] correction too large (dist=%.3fm, angle=%.1f deg), confidence=%.2f, rejected",
                 correction_dist, correction_angle, confidence);
@@ -1363,31 +1536,38 @@ void dlio::OdomNode::continuousLocalize()
   }
 
   // GICP passed — increment consecutive counter
-  this->bayes_consecutive_accepts_++;
+  bayes_consec++;
 
   RCLCPP_INFO(this->get_logger(),
               "[bayes] GICP PASS%s: kf=%d fitness=%.4f conf=%.2f dist=%.3fm angle=%.1fdeg | consecutive=%d/%d",
               is_reloc ? " (RELOC)" : "", best_kf_idx, fitness, confidence,
               correction_dist, correction_angle,
-              this->bayes_consecutive_accepts_, required_consecutive);
+              bayes_consec, required_consecutive);
 
   // ── Delayed acceptance: apply only after N consecutive confirms ────────
 
-  if (this->bayes_consecutive_accepts_ >= required_consecutive)
+  bool accepted = (bayes_consec >= required_consecutive);
+  if (accepted)
   {
-    // Direct TF update (no smoothing — RTAB-Map style)
-    {
-      std::lock_guard<std::mutex> lock(this->continuous_localize_mtx_);
-      this->T_map_odom_ = T_map_odom_new;
-    }
-
-    this->bayes_consecutive_accepts_ = 0;
+    bayes_consec = 0;
 
     // After relocalization, reset posterior so Bayesian filter starts fresh
     // from the corrected position (old posteriors are for the wrong location)
     if (is_reloc)
-      this->bayes_posterior_.clear();
+      bayes_snap.clear();
+  }
 
+  // Write back all Bayesian state + correction under brief lock
+  {
+    std::lock_guard<std::mutex> wb(this->continuous_localize_mtx_);
+    this->bayes_posterior_ = bayes_snap;
+    this->bayes_consecutive_accepts_ = bayes_consec;
+    if (accepted)
+      this->T_map_odom_ = T_map_odom_new;
+  }
+
+  if (accepted)
+  {
     RCLCPP_INFO(this->get_logger(),
                 "[bayes] >>> ACCEPTED %s correction (dist=%.3fm, angle=%.1f deg, fitness=%.4f, confidence=%.2f, P_loop=%.3f)",
                 is_reloc ? "RELOCALIZATION" : "map->odom",
@@ -1397,17 +1577,20 @@ void dlio::OdomNode::continuousLocalize()
 
 void dlio::OdomNode::publishOccupancyGrid()
 {
-  if (!this->occupancy_grid_gen_ || !this->dlio_initialized) return;
+  if (!this->occupancy_grid_gen_ || !this->dlio_initialized)
+    return;
 
   pcl::PointCloud<PointType>::ConstPtr scan;
   Eigen::Matrix4f T_current;
   double scan_time;
   {
     std::lock_guard<std::mutex> lock(this->latest_scan_mtx_);
-    if (!this->latest_scan_ || this->latest_scan_->empty()) return;
+    if (!this->latest_scan_ || this->latest_scan_->empty())
+      return;
     scan_time = this->latest_scan_time_;
     // Skip if we already processed this scan
-    if (scan_time <= this->og_last_scan_time_) return;
+    if (scan_time <= this->og_last_scan_time_)
+      return;
     scan = this->latest_scan_;
     T_current = this->latest_scan_T_;
   }
@@ -1428,7 +1611,7 @@ void dlio::OdomNode::publishOccupancyGrid()
 
   // Extract robot yaw and pitch from map-frame transform
   Eigen::Matrix3f R_map = T_lidar_map.block<3, 3>(0, 0);
-  float robot_yaw   = std::atan2(R_map(1, 0), R_map(0, 0));
+  float robot_yaw = std::atan2(R_map(1, 0), R_map(0, 0));
   float robot_pitch = std::asin(-R_map(2, 0));
 
   this->occupancy_grid_gen_->update(scan_world, sensor_origin, scan_time,
@@ -1437,15 +1620,18 @@ void dlio::OdomNode::publishOccupancyGrid()
 
   // Debug: count non-unknown cells
   int free_cells = 0, occ_cells = 0;
-  for (auto v : og_msg.data) {
-    if (v >= 0 && v < 50) free_cells++;
-    else if (v >= 50) occ_cells++;
+  for (auto v : og_msg.data)
+  {
+    if (v >= 0 && v < 50)
+      free_cells++;
+    else if (v >= 50)
+      occ_cells++;
   }
   RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-      "[ogm] pts=%zu origin=(%.1f,%.1f) sensor=(%.1f,%.1f,%.1f) free=%d occ=%d frame=%s",
-      scan_world->size(), og_msg.info.origin.position.x, og_msg.info.origin.position.y,
-      sensor_origin.x(), sensor_origin.y(), sensor_origin.z(),
-      free_cells, occ_cells, og_msg.header.frame_id.c_str());
+                       "[ogm] pts=%zu origin=(%.1f,%.1f) sensor=(%.1f,%.1f,%.1f) free=%d occ=%d frame=%s",
+                       scan_world->size(), og_msg.info.origin.position.x, og_msg.info.origin.position.y,
+                       sensor_origin.x(), sensor_origin.y(), sensor_origin.z(),
+                       free_cells, occ_cells, og_msg.header.frame_id.c_str());
 
   this->occupancy_grid_pub_->publish(std::move(og_msg));
 }

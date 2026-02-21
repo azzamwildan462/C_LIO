@@ -130,21 +130,21 @@ def generate_launch_description():
                 extra_arguments=[{'use_intra_process_comms': True}],
             ),
             # DLIO Graph SLAM Component
-            ComposableNode(
-                package='direct_lidar_inertial_odometry',
-                plugin='dlio::GraphSlamNode',
-                name='dlio_graph_slam',
-                parameters=[dlio_yaml_path, dlio_params_yaml_path, graph_slam_yaml_path, map_params],
-                remappings=[
-                    ('keyframe_stamped', 'dlio/odom_node/keyframe_stamped'),
-                    ('corrected_path', 'dlio/graph_slam/corrected_path'),
-                    ('corrected_map', 'dlio/graph_slam/corrected_map'),
-                    ('corrected_kf_poses', 'dlio/graph_slam/corrected_kf_poses'),
-                    ('loop_closures', 'dlio/graph_slam/loop_closures'),
-                    ('save_corrected_pcd', 'dlio/graph_slam/save_corrected_pcd'),
-                ],
-                extra_arguments=[{'use_intra_process_comms': True}],
-            ),
+            # ComposableNode(
+            #     package='direct_lidar_inertial_odometry',
+            #     plugin='dlio::GraphSlamNode',
+            #     name='dlio_graph_slam',
+            #     parameters=[dlio_yaml_path, dlio_params_yaml_path, graph_slam_yaml_path, map_params],
+            #     remappings=[
+            #         ('keyframe_stamped', 'dlio/odom_node/keyframe_stamped'),
+            #         ('corrected_path', 'dlio/graph_slam/corrected_path'),
+            #         ('corrected_map', 'dlio/graph_slam/corrected_map'),
+            #         ('corrected_kf_poses', 'dlio/graph_slam/corrected_kf_poses'),
+            #         ('loop_closures', 'dlio/graph_slam/loop_closures'),
+            #         ('save_corrected_pcd', 'dlio/graph_slam/save_corrected_pcd'),
+            #     ],
+            #     extra_arguments=[{'use_intra_process_comms': True}],
+            # ),
         ],
         output='screen',
     )

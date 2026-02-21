@@ -19,10 +19,12 @@
 #include <filesystem>
 
 // Global pointer for signal handler
-static dlio::MapNode* g_map_node = nullptr;
+static dlio::MapNode *g_map_node = nullptr;
 
-static void shutdownSave(int sig) {
-  if (g_map_node) {
+static void shutdownSave(int sig)
+{
+  if (g_map_node)
+  {
     g_map_node->saveOnShutdown();
     g_map_node = nullptr;
   }
@@ -31,8 +33,9 @@ static void shutdownSave(int sig) {
   raise(sig);
 }
 
-dlio::MapNode::MapNode(const rclcpp::NodeOptions& options)
-: Node("dlio_map_node", options) {
+dlio::MapNode::MapNode(const rclcpp::NodeOptions &options)
+    : Node("dlio_map_node", options)
+{
 
   this->getParams();
 
@@ -40,40 +43,47 @@ dlio::MapNode::MapNode(const rclcpp::NodeOptions& options)
   auto keyframe_sub_opt = rclcpp::SubscriptionOptions();
   keyframe_sub_opt.callback_group = this->keyframe_cb_group;
   this->keyframe_sub = this->create_subscription<sensor_msgs::msg::PointCloud2>("keyframes", 10,
-      std::bind(&dlio::MapNode::callbackKeyframe, this, std::placeholders::_1), keyframe_sub_opt);
+                                                                                std::bind(&dlio::MapNode::callbackKeyframe, this, std::placeholders::_1), keyframe_sub_opt);
 
   this->map_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>("map", 100);
 
   this->save_pcd_cb_group = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
   this->save_pcd_srv = this->create_service<direct_lidar_inertial_odometry::srv::SavePCD>("save_pcd",
-      std::bind(&dlio::MapNode::savePCD, this, std::placeholders::_1, std::placeholders::_2), rmw_qos_profile_services_default, this->save_pcd_cb_group);
+                                                                                          std::bind(&dlio::MapNode::savePCD, this, std::placeholders::_1, std::placeholders::_2), rmw_qos_profile_services_default, this->save_pcd_cb_group);
 
   this->dlio_map = std::make_shared<pcl::PointCloud<PointType>>();
 
   pcl::console::setVerbosityLevel(pcl::console::L_ERROR);
 
   // Ensure parent directory exists for map save
-  if (!this->map_path_.empty()) {
+  if (!this->map_path_.empty())
+  {
     std::filesystem::path filepath(this->map_path_);
-    if (filepath.has_parent_path()) {
+    if (filepath.has_parent_path())
+    {
       std::filesystem::create_directories(filepath.parent_path());
     }
   }
 
   // Load prior map if file exists
-  if (!this->map_path_.empty()) {
+  if (!this->map_path_.empty())
+  {
     std::ifstream f(this->map_path_);
-    if (f.good()) {
+    if (f.good())
+    {
       f.close();
       this->loadPriorMap();
-    } else {
+    }
+    else
+    {
       RCLCPP_INFO(this->get_logger(), "[map] No existing map at '%s', starting fresh",
                   this->map_path_.c_str());
     }
   }
 
   // Auto-save timer (mapping mode only)
-  if (this->map_mode_ == "mapping" && !this->map_path_.empty() && this->auto_save_interval_ > 0.) {
+  if (this->map_mode_ == "mapping" && !this->map_path_.empty() && this->auto_save_interval_ > 0.)
+  {
     this->auto_save_timer = this->create_wall_timer(
         std::chrono::duration<double>(this->auto_save_interval_),
         std::bind(&dlio::MapNode::autoSave, this));
@@ -83,7 +93,8 @@ dlio::MapNode::MapNode(const rclcpp::NodeOptions& options)
   }
 
   // Register signal handler for save-on-shutdown (mapping mode)
-  if (this->map_mode_ == "mapping" && !this->map_path_.empty()) {
+  if (this->map_mode_ == "mapping" && !this->map_path_.empty())
+  {
     g_map_node = this;
     signal(SIGINT, shutdownSave);
     signal(SIGTERM, shutdownSave);
@@ -91,15 +102,16 @@ dlio::MapNode::MapNode(const rclcpp::NodeOptions& options)
 
   RCLCPP_INFO(this->get_logger(), "[map] Initialized (mode=%s, leaf_size=%.2f, map=%zu pts, publish_interval=%.1fs)",
               this->map_mode_.c_str(), this->leaf_size_, this->dlio_map->points.size(), this->publish_interval_);
-
 }
 
-dlio::MapNode::~MapNode() {
+dlio::MapNode::~MapNode()
+{
   // Fallback: save on destructor if signal handler didn't fire
   this->saveOnShutdown();
 }
 
-void dlio::MapNode::getParams() {
+void dlio::MapNode::getParams()
+{
 
   this->declare_parameter<std::string>("odom/odom_frame", "odom");
   this->declare_parameter<std::string>("frames/map", "map");
@@ -151,7 +163,8 @@ void dlio::MapNode::loadPriorMap()
   }
 
   pcl::PointCloud<PointType>::Ptr prior_cloud = std::make_shared<pcl::PointCloud<PointType>>();
-  if (pcl::io::loadPCDFile(load_path, *prior_cloud) == -1) {
+  if (pcl::io::loadPCDFile(load_path, *prior_cloud) == -1)
+  {
     RCLCPP_ERROR(this->get_logger(), "[map] Failed to load prior map: %s", load_path.c_str());
     return;
   }
@@ -180,9 +193,14 @@ void dlio::MapNode::loadPriorMap()
 
 void dlio::MapNode::autoSave()
 {
-  if (!this->dlio_map || this->dlio_map->points.empty()) return;
+  if (!this->dlio_map || this->dlio_map->points.empty())
+    return;
 
-  pcl::PointCloud<PointType>::Ptr m = std::make_shared<pcl::PointCloud<PointType>>(*this->dlio_map);
+  pcl::PointCloud<PointType>::Ptr m;
+  {
+    std::lock_guard<std::mutex> lock(this->map_mtx_);
+    m = std::make_shared<pcl::PointCloud<PointType>>(*this->dlio_map);
+  }
 
   // Voxel filter before save
   pcl::VoxelGrid<PointType> vg;
@@ -191,26 +209,38 @@ void dlio::MapNode::autoSave()
   vg.filter(*m);
 
   int ret = pcl::io::savePCDFileBinary(this->map_path_, *m);
-  if (ret == 0) {
+  if (ret == 0)
+  {
     RCLCPP_INFO(this->get_logger(), "[map] Saved: %zu pts to %s",
                 m->points.size(), this->map_path_.c_str());
-  } else {
+  }
+  else
+  {
     RCLCPP_ERROR(this->get_logger(), "[map] Save failed: %s", this->map_path_.c_str());
   }
 }
 
 void dlio::MapNode::saveOnShutdown()
 {
-  if (this->map_mode_ != "mapping" || this->map_path_.empty()) return;
-  if (!this->dlio_map || this->dlio_map->points.empty()) return;
+  if (this->map_mode_ != "mapping" || this->map_path_.empty())
+    return;
+  if (this->shutdown_saved_.exchange(true))
+    return; // already saved
+  if (!this->dlio_map || this->dlio_map->points.empty())
+    return;
 
   // Ensure parent directory exists
   std::filesystem::path filepath(this->map_path_);
-  if (filepath.has_parent_path()) {
+  if (filepath.has_parent_path())
+  {
     std::filesystem::create_directories(filepath.parent_path());
   }
 
-  pcl::PointCloud<PointType>::Ptr m = std::make_shared<pcl::PointCloud<PointType>>(*this->dlio_map);
+  pcl::PointCloud<PointType>::Ptr m;
+  {
+    std::lock_guard<std::mutex> lock(this->map_mtx_);
+    m = std::make_shared<pcl::PointCloud<PointType>>(*this->dlio_map);
+  }
 
   pcl::VoxelGrid<PointType> vg;
   vg.setLeafSize(this->map_voxel_size_, this->map_voxel_size_, this->map_voxel_size_);
@@ -218,17 +248,28 @@ void dlio::MapNode::saveOnShutdown()
   vg.filter(*m);
 
   int ret = pcl::io::savePCDFileBinary(this->map_path_, *m);
-  if (ret == 0) {
+  if (ret == 0)
+  {
     std::cout << "[map] Shutdown save: " << m->points.size() << " pts to " << this->map_path_ << std::endl;
-  } else {
+  }
+  else
+  {
     std::cerr << "[map] Shutdown save FAILED: " << this->map_path_ << std::endl;
   }
 }
 
-void dlio::MapNode::start() {
+void dlio::MapNode::start()
+{
 }
 
-void dlio::MapNode::callbackKeyframe(const sensor_msgs::msg::PointCloud2::ConstSharedPtr& keyframe) {
+void dlio::MapNode::callbackKeyframe(const sensor_msgs::msg::PointCloud2::ConstSharedPtr &keyframe)
+{
+
+  // In localization mode, prior map is already loaded in map frame.
+  // New keyframes are in odom frame — mixing them causes offset/ghosting.
+  // Only accumulate in mapping mode.
+  if (this->map_mode_ == "localization")
+    return;
 
   // convert scan to pcl format
   pcl::PointCloud<PointType>::Ptr keyframe_pcl = std::make_shared<pcl::PointCloud<PointType>>();
@@ -239,23 +280,39 @@ void dlio::MapNode::callbackKeyframe(const sensor_msgs::msg::PointCloud2::ConstS
   this->voxelgrid.setInputCloud(keyframe_pcl);
   this->voxelgrid.filter(*keyframe_pcl);
 
-  // save filtered keyframe to map for rviz
-  *this->dlio_map += *keyframe_pcl;
+  // save filtered keyframe to map for rviz (lock to prevent race with autoSave/savePCD)
+  {
+    std::lock_guard<std::mutex> lock(this->map_mtx_);
+    *this->dlio_map += *keyframe_pcl;
+  }
 
   // Throttled publish of full map
   int throttle_ms = static_cast<int>(this->publish_interval_ * 1000.0);
   RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), throttle_ms,
-    "[map] Received keyframe: %zu pts, total map: %zu pts",
-    keyframe_pcl->points.size(), this->dlio_map->points.size());
+                       "[map] Received keyframe: %zu pts, total map: %zu pts",
+                       keyframe_pcl->points.size(), this->dlio_map->points.size());
 
   // Publish full map (throttled)
   static rclcpp::Time last_pub_time(0, 0, RCL_ROS_TIME);
   rclcpp::Time now = this->now();
-  if ((now - last_pub_time).seconds() >= this->publish_interval_) {
-    if (this->dlio_map->points.size() == this->dlio_map->width * this->dlio_map->height) {
-      std::string pub_frame = (this->map_mode_ == "localization") ? this->map_frame_ : this->odom_frame;
+  if ((now - last_pub_time).seconds() >= this->publish_interval_)
+  {
+    // Brief lock: copy map snapshot
+    pcl::PointCloud<PointType>::Ptr map_snap;
+    std::string pub_frame;
+    {
+      std::lock_guard<std::mutex> lock(this->map_mtx_);
+      if (this->dlio_map->points.size() == this->dlio_map->width * this->dlio_map->height)
+      {
+        map_snap = std::make_shared<pcl::PointCloud<PointType>>(*this->dlio_map);
+        pub_frame = this->odom_frame;
+      }
+    }
+    // Serialize + publish outside lock
+    if (map_snap)
+    {
       sensor_msgs::msg::PointCloud2 map_ros;
-      pcl::toROSMsg(*this->dlio_map, map_ros);
+      pcl::toROSMsg(*map_snap, map_ros);
       map_ros.header.stamp = now;
       map_ros.header.frame_id = pub_frame;
       this->map_pub->publish(map_ros);
@@ -265,11 +322,17 @@ void dlio::MapNode::callbackKeyframe(const sensor_msgs::msg::PointCloud2::ConstS
 }
 
 void dlio::MapNode::savePCD(std::shared_ptr<direct_lidar_inertial_odometry::srv::SavePCD::Request> req,
-                            std::shared_ptr<direct_lidar_inertial_odometry::srv::SavePCD::Response> res) {
+                            std::shared_ptr<direct_lidar_inertial_odometry::srv::SavePCD::Response> res)
+{
 
-  pcl::PointCloud<PointType>::Ptr m = std::make_shared<pcl::PointCloud<PointType>>(*this->dlio_map);
+  pcl::PointCloud<PointType>::Ptr m;
+  {
+    std::lock_guard<std::mutex> lock(this->map_mtx_);
+    m = std::make_shared<pcl::PointCloud<PointType>>(*this->dlio_map);
+  }
 
-  if (!m || m->points.empty()) {
+  if (!m || m->points.empty())
+  {
     std::cout << "[map] SavePCD: map is empty, nothing to save" << std::endl;
     res->success = false;
     return;
@@ -281,11 +344,13 @@ void dlio::MapNode::savePCD(std::shared_ptr<direct_lidar_inertial_odometry::srv:
   // Derive filename from map_path_ stem (e.g. "test_gs.pcd" -> "test_gs.pcd")
   std::filesystem::path map_fp(this->map_path_);
   std::string filename = map_fp.filename().string();
-  if (filename.empty()) filename = "dlio_map.pcd";
+  if (filename.empty())
+    filename = "dlio_map.pcd";
   std::string save_file = p + "/" + filename;
 
   std::cout << std::setprecision(2) << "Saving map to " << save_file
-    << " with leaf size " << to_string_with_precision(leaf_size, 2) << "... "; std::cout.flush();
+            << " with leaf size " << to_string_with_precision(leaf_size, 2) << "... ";
+  std::cout.flush();
 
   // voxelize map
   pcl::VoxelGrid<PointType> vg;
@@ -297,9 +362,12 @@ void dlio::MapNode::savePCD(std::shared_ptr<direct_lidar_inertial_odometry::srv:
   int ret = pcl::io::savePCDFileBinary(save_file, *m);
   res->success = ret == 0;
 
-  if (res->success) {
+  if (res->success)
+  {
     std::cout << "done" << std::endl;
-  } else {
+  }
+  else
+  {
     std::cout << "failed" << std::endl;
   }
 }

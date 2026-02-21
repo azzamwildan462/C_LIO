@@ -14,7 +14,7 @@
   ros__parameters:
     use_sim_time: true
 
-    debug/odom: false
+    debug/odom: true
     debug/graph_slam: false
     debug/print_odom: false # Activate this to print odometry like default DLIO
 
@@ -40,9 +40,9 @@
     map/initial_pose/z: 0.0
     map/initial_pose/yaw: 0.0
     map/relocalize: true
-    map/relocalize/sc_max_range: 40.0
+    map/relocalize/sc_max_range: 100.0
     map/relocalize/sc_num_candidates: 50
-    map/relocalize/sc_distance_threshold: 0.6
+    map/relocalize/sc_distance_threshold: 2.0
     map/relocalize/sc_max_attempts: 10
 
     map/continuous_localize: true
@@ -51,8 +51,10 @@
     map/continuous_localize/virtual_place_prior: 0.7
     map/continuous_localize/loop_threshold: 0.5
     map/continuous_localize/min_consecutive: 2
-    map/continuous_localize/max_correction: 2.0
+    map/continuous_localize/max_correction: 2000.0
     map/continuous_localize/enable_global_correction: true
+    map/continuous_localize/sc_distance_threshold: 0.1
+    map/continuous_localize/sc_top_k: 10
 
     odom/gravity: 9.80665
     odom/computeTimeOffset: true
@@ -81,7 +83,7 @@
 
     odom/gicp/minNumPoints: 64
     odom/gicp/kCorrespondences: 16
-    odom/gicp/maxCorrespondenceDistance: 0.5
+    odom/gicp/maxCorrespondenceDistance: 1.5
     odom/gicp/maxIterations: 32
     odom/gicp/transformationEpsilon: 0.01
     odom/gicp/rotationEpsilon: 0.01
@@ -100,7 +102,7 @@
     occupancy_grid/enabled: false
     occupancy_grid/grid_size_x: 100.0
     occupancy_grid/grid_size_y: 100.0
-    occupancy_grid/resolution: 0.2
+    occupancy_grid/resolution: 0.4
     occupancy_grid/ground_threshold: -0.3
     occupancy_grid/obstacle_min_height: 0.1
     occupancy_grid/obstacle_max_height: 3.0
@@ -114,6 +116,6 @@
     occupancy_grid/height_offset: 0.0 # offset from lidar height (+ = higher, - = lower)
     occupancy_grid/adaptive_ground: true # slope-based ground segmentation (for uneven terrain)
     occupancy_grid/ground_slope_threshold: 30.0 # degrees — max slope to still consider ground
-    occupancy_grid/scan_angle_target: -180.0 # degrees, 0 = robot forward
-    occupancy_grid/scan_angle_tolerance: 80.0 # degrees, 180 = full 360° (no filter)
-    occupancy_grid/update_rate: 1.0
+    occupancy_grid/scan_angle_target: 0.0 # degrees, 0 = robot forward
+    occupancy_grid/scan_angle_tolerance: 180.0 # degrees, 180 = full 360° (no filter)
+    occupancy_grid/update_rate: 2.0

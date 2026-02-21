@@ -23,21 +23,23 @@
 #include <pcl/io/pcd_io.h>
 #include <pcl_conversions/pcl_conversions.h>
 
-class dlio::MapNode: public rclcpp::Node {
+#include <mutex>
+#include <atomic>
+
+class dlio::MapNode : public rclcpp::Node
+{
 
 public:
-
-  explicit MapNode(const rclcpp::NodeOptions& options = rclcpp::NodeOptions());
+  explicit MapNode(const rclcpp::NodeOptions &options = rclcpp::NodeOptions());
   ~MapNode();
 
   void start();
   void saveOnShutdown();
 
 private:
-
   void getParams();
 
-  void callbackKeyframe(const sensor_msgs::msg::PointCloud2::ConstSharedPtr& keyframe);
+  void callbackKeyframe(const sensor_msgs::msg::PointCloud2::ConstSharedPtr &keyframe);
 
   void savePCD(std::shared_ptr<direct_lidar_inertial_odometry::srv::SavePCD::Request> req,
                std::shared_ptr<direct_lidar_inertial_odometry::srv::SavePCD::Response> res);
@@ -53,6 +55,8 @@ private:
   rclcpp::TimerBase::SharedPtr auto_save_timer;
 
   pcl::PointCloud<PointType>::Ptr dlio_map;
+  std::mutex map_mtx_;                      // protects dlio_map from concurrent access
+  std::atomic<bool> shutdown_saved_{false}; // prevent double saveOnShutdown
   pcl::VoxelGrid<PointType> voxelgrid;
 
   std::string odom_frame;
@@ -65,5 +69,4 @@ private:
   double publish_interval_;
 
   double leaf_size_;
-
 };

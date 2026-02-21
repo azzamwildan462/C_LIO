@@ -16,8 +16,9 @@
 
 #include <filesystem>
 
-dlio::GraphSlamNode::GraphSlamNode(const rclcpp::NodeOptions& options)
-: Node("dlio_graph_slam_node", options) {
+dlio::GraphSlamNode::GraphSlamNode(const rclcpp::NodeOptions &options)
+    : Node("dlio_graph_slam_node", options)
+{
 
   this->getParams();
 
@@ -26,9 +27,9 @@ dlio::GraphSlamNode::GraphSlamNode(const rclcpp::NodeOptions& options)
   auto keyframe_sub_opt = rclcpp::SubscriptionOptions();
   keyframe_sub_opt.callback_group = this->keyframe_cb_group;
   this->keyframe_sub = this->create_subscription<direct_lidar_inertial_odometry::msg::KeyframeStamped>(
-    "keyframe_stamped", 100,
-    std::bind(&dlio::GraphSlamNode::callbackKeyframe, this, std::placeholders::_1),
-    keyframe_sub_opt);
+      "keyframe_stamped", 100,
+      std::bind(&dlio::GraphSlamNode::callbackKeyframe, this, std::placeholders::_1),
+      keyframe_sub_opt);
 
   // Publishers
   this->corrected_path_pub = this->create_publisher<nav_msgs::msg::Path>("corrected_path", 1);
@@ -39,22 +40,23 @@ dlio::GraphSlamNode::GraphSlamNode(const rclcpp::NodeOptions& options)
   // Service
   this->save_pcd_cb_group = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
   this->save_pcd_srv = this->create_service<direct_lidar_inertial_odometry::srv::SavePCD>(
-    "save_corrected_pcd",
-    std::bind(&dlio::GraphSlamNode::savePCD, this, std::placeholders::_1, std::placeholders::_2),
-    rmw_qos_profile_services_default,
-    this->save_pcd_cb_group);
+      "save_corrected_pcd",
+      std::bind(&dlio::GraphSlamNode::savePCD, this, std::placeholders::_1, std::placeholders::_2),
+      rmw_qos_profile_services_default,
+      this->save_pcd_cb_group);
 
   // Timer for loop closure detection
   this->loop_timer = this->create_wall_timer(
-    std::chrono::milliseconds(this->loop_detection_period_ms_),
-    std::bind(&dlio::GraphSlamNode::searchLoopClosure, this));
+      std::chrono::milliseconds(this->loop_detection_period_ms_),
+      std::bind(&dlio::GraphSlamNode::searchLoopClosure, this));
 
   this->optimization_done = false;
   this->last_loop_checked_idx = 0;
   this->shutdown_saved_ = false;
 
   // Auto-save timer — only in mapping mode
-  if (this->map_mode_ == "mapping" && !this->map_path_.empty() && this->auto_save_interval_ > 0.) {
+  if (this->map_mode_ == "mapping" && !this->map_path_.empty() && this->auto_save_interval_ > 0.)
+  {
     this->auto_save_timer_ = this->create_wall_timer(
         std::chrono::duration<double>(this->auto_save_interval_),
         std::bind(&dlio::GraphSlamNode::autoSave, this));
@@ -65,11 +67,13 @@ dlio::GraphSlamNode::GraphSlamNode(const rclcpp::NodeOptions& options)
               this->debug_ ? "true" : "false");
 }
 
-dlio::GraphSlamNode::~GraphSlamNode() {
+dlio::GraphSlamNode::~GraphSlamNode()
+{
   this->saveOnShutdown();
 }
 
-void dlio::GraphSlamNode::getParams() {
+void dlio::GraphSlamNode::getParams()
+{
 
   dlio::declare_param(this, "debug/graph_slam", this->debug_, false);
   dlio::declare_param(this, "frames/odom", this->odom_frame, std::string("odom"));
@@ -103,8 +107,9 @@ void dlio::GraphSlamNode::getParams() {
   // Map save params (shared with map node)
   dlio::declare_param(this, "map/mode", this->map_mode_, std::string("localization"));
   dlio::declare_param(this, "map/path", this->map_path_, std::string(""));
-  if (this->map_path_.empty()) {
-    const char* home = std::getenv("HOME");
+  if (this->map_path_.empty())
+  {
+    const char *home = std::getenv("HOME");
     if (home)
       this->map_path_ = std::string(home) + "/.ros/dlio_map.pcd";
   }
@@ -114,7 +119,8 @@ void dlio::GraphSlamNode::getParams() {
 }
 
 void dlio::GraphSlamNode::callbackKeyframe(
-    const direct_lidar_inertial_odometry::msg::KeyframeStamped::SharedPtr msg) {
+    const direct_lidar_inertial_odometry::msg::KeyframeStamped::SharedPtr msg)
+{
 
   Keyframe kf;
   kf.id = msg->id;
@@ -122,7 +128,7 @@ void dlio::GraphSlamNode::callbackKeyframe(
 
   // Extract pose as Eigen::Isometry3d
   Eigen::Quaterniond q(msg->pose.orientation.w, msg->pose.orientation.x,
-                        msg->pose.orientation.y, msg->pose.orientation.z);
+                       msg->pose.orientation.y, msg->pose.orientation.z);
   Eigen::Vector3d t(msg->pose.position.x, msg->pose.position.y, msg->pose.position.z);
   kf.pose = Eigen::Isometry3d::Identity();
   kf.pose.linear() = q.toRotationMatrix();
@@ -138,20 +144,26 @@ void dlio::GraphSlamNode::callbackKeyframe(
   // Needed for re-transformation after pose graph optimization.
   kf.cloud_local = std::make_shared<pcl::PointCloud<PointType>>();
   pcl::transformPointCloud(*kf.cloud_world, *kf.cloud_local,
-                            kf.pose.inverse().matrix().cast<float>());
+                           kf.pose.inverse().matrix().cast<float>());
 
   {
     std::lock_guard<std::mutex> lock(this->keyframes_mutex);
     this->keyframes.push_back(kf);
   }
 
-  if (this->debug_) {
+  if (this->debug_)
+  {
     RCLCPP_INFO(this->get_logger(), "[graph] Keyframe %u: pos=[%.2f, %.2f, %.2f], %zu pts",
                 kf.id, t.x(), t.y(), t.z(), kf.cloud_world->points.size());
   }
 }
 
-void dlio::GraphSlamNode::searchLoopClosure() {
+void dlio::GraphSlamNode::searchLoopClosure()
+{
+
+  // Skip in localization mode — prior map is already optimized
+  if (this->map_mode_ != "mapping")
+    return;
 
   // Copy keyframes snapshot to avoid holding mutex during GICP
   std::vector<Keyframe> kf_snapshot;
@@ -159,30 +171,35 @@ void dlio::GraphSlamNode::searchLoopClosure() {
   {
     std::lock_guard<std::mutex> lock(this->keyframes_mutex);
     num_keyframes = static_cast<int>(this->keyframes.size());
-    if (num_keyframes < this->min_keyframe_gap_ + 1) return;
+    if (num_keyframes < this->min_keyframe_gap_ + 1)
+      return;
     kf_snapshot = this->keyframes;
   }
 
   bool loop_found = false;
 
   for (int current_idx = std::max(this->last_loop_checked_idx, this->min_keyframe_gap_);
-       current_idx < num_keyframes; ++current_idx) {
+       current_idx < num_keyframes; ++current_idx)
+  {
 
     int candidate_idx = -1;
     double candidate_dist = 0.0;
-    if (this->detectLoopCandidate(kf_snapshot, current_idx, candidate_idx, candidate_dist)) {
-      if (this->debug_) {
+    if (this->detectLoopCandidate(kf_snapshot, current_idx, candidate_idx, candidate_dist))
+    {
+      if (this->debug_)
+      {
         RCLCPP_INFO(this->get_logger(),
-          "[graph] Loop candidate: kf %d <-> kf %d (dist=%.2fm)", current_idx, candidate_idx, candidate_dist);
+                    "[graph] Loop candidate: kf %d <-> kf %d (dist=%.2fm)", current_idx, candidate_idx, candidate_dist);
       }
 
       Eigen::Isometry3d relative_pose;
       double fitness_score;
       if (this->performLoopRegistration(kf_snapshot, current_idx, candidate_idx,
-                                         relative_pose, fitness_score)) {
+                                        relative_pose, fitness_score))
+      {
         RCLCPP_INFO(this->get_logger(),
-          "[graph] Loop closure CONFIRMED: %d <-> %d, fitness=%.4f",
-          candidate_idx, current_idx, fitness_score);
+                    "[graph] Loop closure CONFIRMED: %d <-> %d, fitness=%.4f",
+                    candidate_idx, current_idx, fitness_score);
 
         LoopEdge edge;
         edge.from_idx = candidate_idx;
@@ -191,12 +208,15 @@ void dlio::GraphSlamNode::searchLoopClosure() {
         edge.information = Eigen::Matrix<double, 6, 6>::Identity() * this->loop_edge_info_scale_;
         this->loop_edges.push_back(edge);
         loop_found = true;
-      } else {
-        if (this->debug_) {
+      }
+      else
+      {
+        if (this->debug_)
+        {
           RCLCPP_INFO(this->get_logger(),
-            "[graph] Loop candidate REJECTED: %d <-> %d, fitness=%.4f (thresh=%.2f)",
-            candidate_idx, current_idx, fitness_score,
-            this->threshold_loop_closure_score_);
+                      "[graph] Loop candidate REJECTED: %d <-> %d, fitness=%.4f (thresh=%.2f)",
+                      candidate_idx, current_idx, fitness_score,
+                      this->threshold_loop_closure_score_);
         }
       }
     }
@@ -204,26 +224,34 @@ void dlio::GraphSlamNode::searchLoopClosure() {
 
   this->last_loop_checked_idx = num_keyframes;
 
-  if (loop_found) {
-    // Re-lock to read latest keyframes for optimization
-    std::lock_guard<std::mutex> lock(this->keyframes_mutex);
-    this->optimizePoseGraph();
-    this->publishCorrectedData();
-    this->publishLoopClosureMarkers();
+  if (loop_found)
+  {
+    // Brief lock: snapshot keyframes, then run heavy work outside
+    std::vector<Keyframe> kf_opt;
+    {
+      std::lock_guard<std::mutex> lock(this->keyframes_mutex);
+      kf_opt = this->keyframes;
+    }
+    this->optimizePoseGraph(kf_opt);
+    this->publishCorrectedData(kf_opt);
+    this->publishLoopClosureMarkers(kf_opt);
   }
 }
 
 bool dlio::GraphSlamNode::detectLoopCandidate(
-    const std::vector<Keyframe>& kfs, int current_idx, int& candidate_idx, double& candidate_dist) {
+    const std::vector<Keyframe> &kfs, int current_idx, int &candidate_idx, double &candidate_dist)
+{
 
-  const Eigen::Vector3d& current_pos = kfs[current_idx].pose.translation();
+  const Eigen::Vector3d &current_pos = kfs[current_idx].pose.translation();
   double min_dist = std::numeric_limits<double>::max();
   candidate_idx = -1;
 
-  for (int i = 0; i < current_idx - this->min_keyframe_gap_; ++i) {
+  for (int i = 0; i < current_idx - this->min_keyframe_gap_; ++i)
+  {
     double dist = (current_pos - kfs[i].pose.translation()).norm();
 
-    if (dist < this->range_of_searching_loop_ && dist < min_dist) {
+    if (dist < this->range_of_searching_loop_ && dist < min_dist)
+    {
       min_dist = dist;
       candidate_idx = i;
     }
@@ -234,16 +262,19 @@ bool dlio::GraphSlamNode::detectLoopCandidate(
 }
 
 bool dlio::GraphSlamNode::performLoopRegistration(
-    const std::vector<Keyframe>& kfs,
+    const std::vector<Keyframe> &kfs,
     int current_idx, int candidate_idx,
-    Eigen::Isometry3d& relative_pose, double& fitness_score) {
+    Eigen::Isometry3d &relative_pose, double &fitness_score)
+{
 
   // Build target submap from candidate and neighbors (world frame)
   pcl::PointCloud<PointType>::Ptr target_cloud = std::make_shared<pcl::PointCloud<PointType>>();
 
-  for (int j = -this->search_submap_num_; j <= this->search_submap_num_; ++j) {
+  for (int j = -this->search_submap_num_; j <= this->search_submap_num_; ++j)
+  {
     int idx = candidate_idx + j;
-    if (idx < 0 || idx >= static_cast<int>(kfs.size())) continue;
+    if (idx < 0 || idx >= static_cast<int>(kfs.size()))
+      continue;
     *target_cloud += *(kfs[idx].cloud_world);
   }
 
@@ -258,12 +289,14 @@ bool dlio::GraphSlamNode::performLoopRegistration(
   // DLIO scans are already in world frame, so both source and target are world-frame.
   pcl::PointCloud<PointType>::Ptr source_cloud = kfs[current_idx].cloud_world;
 
-  if (filtered_target->empty() || source_cloud->empty()) {
+  if (filtered_target->empty() || source_cloud->empty())
+  {
     fitness_score = std::numeric_limits<double>::max();
     return false;
   }
 
-  if (this->debug_) {
+  if (this->debug_)
+  {
     RCLCPP_INFO(this->get_logger(), "[graph] GICP: source=%zu pts, target=%zu pts (both world frame)",
                 source_cloud->points.size(), filtered_target->points.size());
   }
@@ -273,7 +306,8 @@ bool dlio::GraphSlamNode::performLoopRegistration(
   bool converged = false;
   Eigen::Matrix4f final_T;
 
-  if (this->use_gicp_) {
+  if (this->use_gicp_)
+  {
     nano_gicp::NanoGICP<PointType, PointType> gicp;
     gicp.setCorrespondenceRandomness(this->lc_gicp_k_correspondences_);
     gicp.setMaxCorrespondenceDistance(this->lc_gicp_max_corr_dist_);
@@ -288,7 +322,9 @@ bool dlio::GraphSlamNode::performLoopRegistration(
     converged = gicp.hasConverged();
     fitness_score = gicp.getFitnessScore();
     final_T = gicp.getFinalTransformation();
-  } else {
+  }
+  else
+  {
     pclomp::NormalDistributionsTransform<PointType, PointType> ndt_lc;
     ndt_lc.setResolution(this->ndt_resolution_);
     ndt_lc.setNumThreads(this->ndt_num_threads_);
@@ -305,7 +341,8 @@ bool dlio::GraphSlamNode::performLoopRegistration(
     final_T = ndt_lc.getFinalTransformation();
   }
 
-  if (!converged || fitness_score > this->threshold_loop_closure_score_) {
+  if (!converged || fitness_score > this->threshold_loop_closure_score_)
+  {
     return false;
   }
 
@@ -320,7 +357,8 @@ bool dlio::GraphSlamNode::performLoopRegistration(
   return true;
 }
 
-void dlio::GraphSlamNode::optimizePoseGraph() {
+void dlio::GraphSlamNode::optimizePoseGraph(const std::vector<Keyframe> &kf_snap)
+{
 
   g2o::SparseOptimizer optimizer;
   optimizer.setVerbose(false);
@@ -331,26 +369,30 @@ void dlio::GraphSlamNode::optimizePoseGraph() {
   auto solver = new g2o::OptimizationAlgorithmLevenberg(std::move(block_solver));
   optimizer.setAlgorithm(solver);
 
-  int num_kf = static_cast<int>(this->keyframes.size());
+  int num_kf = static_cast<int>(kf_snap.size());
   Eigen::Matrix<double, 6, 6> odom_info =
       Eigen::Matrix<double, 6, 6>::Identity() * this->odom_edge_info_scale_;
 
   // Add vertices
-  for (int i = 0; i < num_kf; ++i) {
-    g2o::VertexSE3* vertex = new g2o::VertexSE3();
+  for (int i = 0; i < num_kf; ++i)
+  {
+    g2o::VertexSE3 *vertex = new g2o::VertexSE3();
     vertex->setId(i);
-    vertex->setEstimate(this->keyframes[i].pose);
-    if (i == 0) vertex->setFixed(true);
+    vertex->setEstimate(kf_snap[i].pose);
+    if (i == 0)
+      vertex->setFixed(true);
     optimizer.addVertex(vertex);
   }
 
   // Add sequential (odometry) edges
-  for (int i = 1; i < num_kf; ++i) {
+  for (int i = 1; i < num_kf; ++i)
+  {
     int start = std::max(0, i - this->num_adjacent_constraints_);
-    for (int j = start; j < i; ++j) {
-      Eigen::Isometry3d relative = this->keyframes[j].pose.inverse() * this->keyframes[i].pose;
+    for (int j = start; j < i; ++j)
+    {
+      Eigen::Isometry3d relative = kf_snap[j].pose.inverse() * kf_snap[i].pose;
 
-      g2o::EdgeSE3* edge = new g2o::EdgeSE3();
+      g2o::EdgeSE3 *edge = new g2o::EdgeSE3();
       edge->setMeasurement(relative);
       edge->setInformation(odom_info);
       edge->vertices()[0] = optimizer.vertex(j);
@@ -360,8 +402,9 @@ void dlio::GraphSlamNode::optimizePoseGraph() {
   }
 
   // Add loop closure edges
-  for (const auto& loop : this->loop_edges) {
-    g2o::EdgeSE3* edge = new g2o::EdgeSE3();
+  for (const auto &loop : this->loop_edges)
+  {
+    g2o::EdgeSE3 *edge = new g2o::EdgeSE3();
     edge->setMeasurement(loop.relative_pose);
     edge->setInformation(loop.information);
     edge->vertices()[0] = optimizer.vertex(loop.from_idx);
@@ -373,26 +416,36 @@ void dlio::GraphSlamNode::optimizePoseGraph() {
   optimizer.initializeOptimization();
   optimizer.optimize(this->optimization_iterations_);
 
-  // Extract corrected poses
-  std::lock_guard<std::mutex> lock(this->corrected_mutex);
-  this->corrected_poses.resize(num_kf);
-  for (int i = 0; i < num_kf; ++i) {
-    g2o::VertexSE3* v = static_cast<g2o::VertexSE3*>(optimizer.vertex(i));
-    this->corrected_poses[i] = v->estimate();
+  // Brief lock: store corrected poses
+  {
+    std::lock_guard<std::mutex> lock(this->corrected_mutex);
+    this->corrected_poses.resize(num_kf);
+    for (int i = 0; i < num_kf; ++i)
+    {
+      g2o::VertexSE3 *v = static_cast<g2o::VertexSE3 *>(optimizer.vertex(i));
+      this->corrected_poses[i] = v->estimate();
+    }
+    this->optimization_done = true;
   }
-  this->optimization_done = true;
 
   RCLCPP_INFO(this->get_logger(), "[graph] Pose graph optimized: %d vertices, %d loop edges",
               num_kf, static_cast<int>(this->loop_edges.size()));
 }
 
-void dlio::GraphSlamNode::publishCorrectedData() {
+void dlio::GraphSlamNode::publishCorrectedData(const std::vector<Keyframe> &kf_snap)
+{
 
-  std::lock_guard<std::mutex> lock(this->corrected_mutex);
-  if (!this->optimization_done) return;
+  // Brief lock: copy corrected poses
+  IsometryVec poses_snap;
+  {
+    std::lock_guard<std::mutex> lock(this->corrected_mutex);
+    if (!this->optimization_done)
+      return;
+    poses_snap = this->corrected_poses;
+  }
 
-  int num_kf = static_cast<int>(this->corrected_poses.size());
-  int num_stored = static_cast<int>(this->keyframes.size());
+  int num_kf = static_cast<int>(poses_snap.size());
+  int num_stored = static_cast<int>(kf_snap.size());
 
   // Use map frame for corrected data (graph-optimized poses are in map frame)
   std::string frame = this->map_frame_;
@@ -406,12 +459,13 @@ void dlio::GraphSlamNode::publishCorrectedData() {
   geometry_msgs::msg::PoseArray kf_poses;
   kf_poses.header = path.header;
 
-  for (int i = 0; i < num_kf && i < num_stored; ++i) {
-    const Eigen::Isometry3d& pose = this->corrected_poses[i];
+  for (int i = 0; i < num_kf && i < num_stored; ++i)
+  {
+    const Eigen::Isometry3d &pose = poses_snap[i];
 
     // Path
     geometry_msgs::msg::PoseStamped ps;
-    ps.header.stamp = this->keyframes[i].timestamp;
+    ps.header.stamp = kf_snap[i].timestamp;
     ps.header.frame_id = frame;
     Eigen::Quaterniond q(pose.rotation());
     ps.pose.position.x = pose.translation().x();
@@ -431,12 +485,14 @@ void dlio::GraphSlamNode::publishCorrectedData() {
   // Throttle corrected map publish (expensive: transforms all keyframe clouds)
   static rclcpp::Time last_map_pub_time(0, 0, RCL_ROS_TIME);
   rclcpp::Time now = this->now();
-  if ((now - last_map_pub_time).seconds() >= this->publish_interval_) {
+  if ((now - last_map_pub_time).seconds() >= this->publish_interval_)
+  {
     pcl::PointCloud<PointType>::Ptr corrected_map = std::make_shared<pcl::PointCloud<PointType>>();
-    for (int i = 0; i < num_kf && i < num_stored; ++i) {
+    for (int i = 0; i < num_kf && i < num_stored; ++i)
+    {
       pcl::PointCloud<PointType>::Ptr transformed = std::make_shared<pcl::PointCloud<PointType>>();
-      pcl::transformPointCloud(*this->keyframes[i].cloud_local,
-                                *transformed, this->corrected_poses[i].matrix().cast<float>());
+      pcl::transformPointCloud(*kf_snap[i].cloud_local,
+                               *transformed, poses_snap[i].matrix().cast<float>());
       *corrected_map += *transformed;
     }
 
@@ -455,12 +511,14 @@ void dlio::GraphSlamNode::publishCorrectedData() {
   }
 }
 
-void dlio::GraphSlamNode::publishLoopClosureMarkers() {
+void dlio::GraphSlamNode::publishLoopClosureMarkers(const std::vector<Keyframe> &kf_snap)
+{
 
   visualization_msgs::msg::MarkerArray markers;
 
-  for (size_t i = 0; i < this->loop_edges.size(); ++i) {
-    const auto& edge = this->loop_edges[i];
+  for (size_t i = 0; i < this->loop_edges.size(); ++i)
+  {
+    const auto &edge = this->loop_edges[i];
 
     visualization_msgs::msg::Marker marker;
     marker.header.frame_id = this->map_frame_;
@@ -476,8 +534,8 @@ void dlio::GraphSlamNode::publishLoopClosureMarkers() {
     marker.color.a = 1.0;
 
     geometry_msgs::msg::Point p1, p2;
-    const auto& pose_from = this->keyframes[edge.from_idx].pose;
-    const auto& pose_to = this->keyframes[edge.to_idx].pose;
+    const auto &pose_from = kf_snap[edge.from_idx].pose;
+    const auto &pose_to = kf_snap[edge.to_idx].pose;
     p1.x = pose_from.translation().x();
     p1.y = pose_from.translation().y();
     p1.z = pose_from.translation().z();
@@ -493,10 +551,14 @@ void dlio::GraphSlamNode::publishLoopClosureMarkers() {
   this->loop_closure_pub->publish(markers);
 }
 
-void dlio::GraphSlamNode::saveGraphMaps(const std::string& save_dir, float leaf_size) {
+void dlio::GraphSlamNode::saveGraphMaps(const std::string &save_dir, float leaf_size,
+                                        const std::vector<Keyframe> &kf_snap,
+                                        const IsometryVec &poses_snap, bool opt_done)
+{
 
-  int num_kf = static_cast<int>(this->keyframes.size());
-  if (num_kf == 0) return;
+  int num_kf = static_cast<int>(kf_snap.size());
+  if (num_kf == 0)
+    return;
 
   std::filesystem::create_directories(save_dir);
 
@@ -504,36 +566,35 @@ void dlio::GraphSlamNode::saveGraphMaps(const std::string& save_dir, float leaf_
   vg.setLeafSize(leaf_size, leaf_size, leaf_size);
 
   // Process in chunks to limit peak memory usage.
-  // Accumulate N keyframes, voxel filter, repeat, then merge filtered chunks.
   constexpr int CHUNK_SIZE = 50;
   pcl::PointCloud<PointType>::Ptr result = std::make_shared<pcl::PointCloud<PointType>>();
 
-  for (int start = 0; start < num_kf; start += CHUNK_SIZE) {
+  for (int start = 0; start < num_kf; start += CHUNK_SIZE)
+  {
     int end = std::min(start + CHUNK_SIZE, num_kf);
 
-    // Pre-count points in this chunk for reserve
     size_t chunk_pts = 0;
     for (int i = start; i < end; ++i)
-      chunk_pts += this->keyframes[i].cloud_local->points.size();
+      chunk_pts += kf_snap[i].cloud_local->points.size();
 
     pcl::PointCloud<PointType>::Ptr chunk = std::make_shared<pcl::PointCloud<PointType>>();
     chunk->points.reserve(chunk_pts);
 
-    for (int i = start; i < end; ++i) {
+    for (int i = start; i < end; ++i)
+    {
       Eigen::Matrix4f T;
-      if (this->optimization_done && i < static_cast<int>(this->corrected_poses.size()))
-        T = this->corrected_poses[i].matrix().cast<float>();
+      if (opt_done && i < static_cast<int>(poses_snap.size()))
+        T = poses_snap[i].matrix().cast<float>();
       else
-        T = this->keyframes[i].pose.matrix().cast<float>();
+        T = kf_snap[i].pose.matrix().cast<float>();
 
       pcl::PointCloud<PointType> tmp;
-      pcl::transformPointCloud(*this->keyframes[i].cloud_local, tmp, T);
+      pcl::transformPointCloud(*kf_snap[i].cloud_local, tmp, T);
       chunk->points.insert(chunk->points.end(), tmp.points.begin(), tmp.points.end());
     }
     chunk->width = chunk->points.size();
     chunk->height = 1;
 
-    // Voxel filter chunk before merging into result
     vg.setInputCloud(chunk);
     vg.filter(*chunk);
 
@@ -543,72 +604,129 @@ void dlio::GraphSlamNode::saveGraphMaps(const std::string& save_dir, float leaf_
   result->width = result->points.size();
   result->height = 1;
 
-  // Final voxel pass to merge overlapping chunk boundaries
   vg.setInputCloud(result);
   vg.filter(*result);
 
-  if (result->points.empty()) {
+  if (result->points.empty())
+  {
     std::cout << "[graph] saveGraphMaps: corrected cloud is empty, skipping" << std::endl;
     return;
   }
 
-  // Derive filename from map_path_ stem (e.g. "test_gs.pcd" -> "test_gs_corrected.pcd")
   std::filesystem::path map_fp(this->map_path_);
   std::string stem = map_fp.stem().string();
-  if (stem.empty()) stem = "dlio_map";
+  if (stem.empty())
+    stem = "dlio_map";
   std::string corr_file = save_dir + "/" + stem + "_corrected.pcd";
   int ret = pcl::io::savePCDFileBinary(corr_file, *result);
-  if (ret == 0) {
+  if (ret == 0)
+  {
     std::cout << "[graph] Saved corrected map: " << result->points.size() << " pts -> " << corr_file
-              << (this->optimization_done ? " (graph-optimized)" : " (no loop closures, same as raw)")
+              << (opt_done ? " (graph-optimized)" : " (no loop closures, same as raw)")
               << std::endl;
-  } else {
+  }
+  else
+  {
     std::cerr << "[graph] FAILED to save corrected map: " << corr_file << std::endl;
   }
 }
 
-void dlio::GraphSlamNode::autoSave() {
-  std::lock_guard<std::mutex> lock1(this->corrected_mutex);
-  std::lock_guard<std::mutex> lock2(this->keyframes_mutex);
-  if (this->keyframes.empty()) return;
+void dlio::GraphSlamNode::autoSave()
+{
+  // Brief lock: copy keyframes
+  std::vector<Keyframe> kf_snap;
+  {
+    std::lock_guard<std::mutex> lock(this->keyframes_mutex);
+    if (this->keyframes.empty())
+      return;
+    kf_snap = this->keyframes;
+  }
+
+  // Brief lock: copy corrected poses
+  IsometryVec poses_snap;
+  bool opt_done;
+  {
+    std::lock_guard<std::mutex> lock(this->corrected_mutex);
+    poses_snap = this->corrected_poses;
+    opt_done = this->optimization_done;
+  }
 
   std::filesystem::path map_fp(this->map_path_);
   std::string save_dir = map_fp.parent_path().string();
-  if (save_dir.empty()) save_dir = ".";
+  if (save_dir.empty())
+    save_dir = ".";
 
-  this->saveGraphMaps(save_dir, static_cast<float>(this->map_voxel_size_));
+  // Heavy save work runs on local copies — no locks held
+  this->saveGraphMaps(save_dir, static_cast<float>(this->map_voxel_size_),
+                      kf_snap, poses_snap, opt_done);
 }
 
-void dlio::GraphSlamNode::saveOnShutdown() {
-  if (this->map_mode_ != "mapping") return;
-  if (this->map_path_.empty()) return;
-  if (this->shutdown_saved_.exchange(true)) return;  // already saved
+void dlio::GraphSlamNode::saveOnShutdown()
+{
+  if (this->map_mode_ != "mapping")
+    return;
+  if (this->map_path_.empty())
+    return;
+  if (this->shutdown_saved_.exchange(true))
+    return; // already saved
 
-  std::lock_guard<std::mutex> lock1(this->corrected_mutex);
-  std::lock_guard<std::mutex> lock2(this->keyframes_mutex);
-  if (this->keyframes.empty()) return;
+  // Brief lock: copy keyframes
+  std::vector<Keyframe> kf_snap;
+  {
+    std::lock_guard<std::mutex> lock(this->keyframes_mutex);
+    if (this->keyframes.empty())
+      return;
+    kf_snap = this->keyframes;
+  }
+
+  // Brief lock: copy corrected poses
+  IsometryVec poses_snap;
+  bool opt_done;
+  {
+    std::lock_guard<std::mutex> lock(this->corrected_mutex);
+    poses_snap = this->corrected_poses;
+    opt_done = this->optimization_done;
+  }
 
   std::filesystem::path map_fp(this->map_path_);
   std::string save_dir = map_fp.parent_path().string();
-  if (save_dir.empty()) save_dir = ".";
+  if (save_dir.empty())
+    save_dir = ".";
 
-  this->saveGraphMaps(save_dir, static_cast<float>(this->map_voxel_size_));
+  this->saveGraphMaps(save_dir, static_cast<float>(this->map_voxel_size_),
+                      kf_snap, poses_snap, opt_done);
 }
 
 void dlio::GraphSlamNode::savePCD(
     std::shared_ptr<direct_lidar_inertial_odometry::srv::SavePCD::Request> req,
-    std::shared_ptr<direct_lidar_inertial_odometry::srv::SavePCD::Response> res) {
+    std::shared_ptr<direct_lidar_inertial_odometry::srv::SavePCD::Response> res)
+{
 
-  std::lock_guard<std::mutex> lock1(this->corrected_mutex);
-  std::lock_guard<std::mutex> lock2(this->keyframes_mutex);
-
-  if (this->keyframes.empty()) {
-    RCLCPP_WARN(this->get_logger(), "[graph] No keyframes to save");
-    res->success = false;
-    return;
+  // Brief lock: copy keyframes
+  std::vector<Keyframe> kf_snap;
+  {
+    std::lock_guard<std::mutex> lock(this->keyframes_mutex);
+    if (this->keyframes.empty())
+    {
+      RCLCPP_WARN(this->get_logger(), "[graph] No keyframes to save");
+      res->success = false;
+      return;
+    }
+    kf_snap = this->keyframes;
   }
 
-  this->saveGraphMaps(req->save_path, req->leaf_size);
+  // Brief lock: copy corrected poses
+  IsometryVec poses_snap;
+  bool opt_done;
+  {
+    std::lock_guard<std::mutex> lock(this->corrected_mutex);
+    poses_snap = this->corrected_poses;
+    opt_done = this->optimization_done;
+  }
+
+  // Heavy save work runs on local copies
+  this->saveGraphMaps(req->save_path, req->leaf_size,
+                      kf_snap, poses_snap, opt_done);
   res->success = true;
 }
 

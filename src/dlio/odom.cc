@@ -83,7 +83,8 @@ dlio::OdomNode::OdomNode(const rclcpp::NodeOptions &options)
                                                 std::bind(&dlio::OdomNode::publishPose, this));
 
   // Occupancy grid publisher + timer
-  if (this->occupancy_grid_enabled_) {
+  if (this->occupancy_grid_enabled_)
+  {
     this->occupancy_grid_pub_ = this->create_publisher<nav_msgs::msg::OccupancyGrid>(
         "occupancy_grid", rclcpp::QoS(5));
 
@@ -199,6 +200,18 @@ dlio::OdomNode::OdomNode(const rclcpp::NodeOptions &options)
   this->crop.setMax(Eigen::Vector4f(this->crop_size_, this->crop_size_, this->crop_size_, 1.0));
 
   this->voxel.setLeafSize(this->vf_res_, this->vf_res_, this->vf_res_);
+
+  // Reserve capacity for grow-only vectors to prevent reallocation during concurrent access
+  // (these are pushed from callbacks and read from other threads)
+  this->comp_times.reserve(100000);
+  this->lidar_rates.reserve(100000);
+  this->imu_rates.reserve(500000);
+  this->cpu_percents.reserve(100000);
+  this->metrics.spaciousness.reserve(100000);
+  this->metrics.density.reserve(100000);
+  this->trajectory.reserve(100000);
+  this->path_ros.poses.reserve(100000);
+  this->kf_pose_ros.poses.reserve(100000);
 
   this->metrics.spaciousness.push_back(0.);
   this->metrics.density.push_back(this->gicp_max_corr_dist_);
@@ -566,11 +579,16 @@ void dlio::OdomNode::getParams()
   dlio::declare_param(this, "map/continuous_localize/loop_threshold", loop_thr, 0.5);
   this->bayes_loop_threshold_ = static_cast<float>(loop_thr);
   dlio::declare_param(this, "map/continuous_localize/min_consecutive", this->bayes_min_consecutive_, 2);
+  double sc_dist_thr = 0.4;
+  dlio::declare_param(this, "map/continuous_localize/sc_distance_threshold", sc_dist_thr, 0.4);
+  this->bayes_sc_dist_threshold_ = static_cast<float>(sc_dist_thr);
+  dlio::declare_param(this, "map/continuous_localize/sc_top_k", this->bayes_sc_top_k_, 5);
   dlio::declare_param(this, "frames/map", this->map_frame_, std::string("map"));
 
   // Occupancy Grid
   dlio::declare_param(this, "occupancy_grid/enabled", this->occupancy_grid_enabled_, false);
-  if (this->occupancy_grid_enabled_) {
+  if (this->occupancy_grid_enabled_)
+  {
     dlio::OccupancyGridGenerator::Params ogp;
     dlio::declare_param(this, "occupancy_grid/grid_size_x", ogp.grid_size_x, 100.0);
     dlio::declare_param(this, "occupancy_grid/grid_size_y", ogp.grid_size_y, 100.0);

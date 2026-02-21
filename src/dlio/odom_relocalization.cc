@@ -63,7 +63,8 @@ void dlio::OdomNode::loadPriorMap()
 
   // 3. Compute covariances for all points (GICP only)
   std::shared_ptr<const nano_gicp::CovarianceList> all_covs;
-  if (this->use_gicp_) {
+  if (this->use_gicp_)
+  {
     nano_gicp::NanoGICP<PointType, PointType> tmp_gicp;
     tmp_gicp.setCorrespondenceRandomness(this->gicp_k_correspondences_);
     tmp_gicp.setInputSource(cloud);
@@ -97,7 +98,8 @@ void dlio::OdomNode::loadPriorMap()
     pcl::PointCloud<PointType>::Ptr chunk_cloud = std::make_shared<pcl::PointCloud<PointType>>();
     chunk_cloud->points.resize(indices.size());
     std::shared_ptr<nano_gicp::CovarianceList> chunk_covs;
-    if (this->use_gicp_) {
+    if (this->use_gicp_)
+    {
       chunk_covs = std::make_shared<nano_gicp::CovarianceList>(indices.size());
     }
 
@@ -105,7 +107,8 @@ void dlio::OdomNode::loadPriorMap()
     for (size_t j = 0; j < indices.size(); j++)
     {
       chunk_cloud->points[j] = cloud->points[indices[j]];
-      if (this->use_gicp_) {
+      if (this->use_gicp_)
+      {
         (*chunk_covs)[j] = (*all_covs)[indices[j]];
       }
       centroid += chunk_cloud->points[j].getVector3fMap();
@@ -361,7 +364,8 @@ bool dlio::OdomNode::runRelocalization(pcl::PointCloud<PointType>::ConstPtr scan
 
   // 3. Pre-compute source covariances on raw_scan (sensor frame) for GICP
   std::shared_ptr<const nano_gicp::CovarianceList> source_covs;
-  if (this->use_gicp_) {
+  if (this->use_gicp_)
+  {
     nano_gicp::NanoGICP<PointType, PointType> src_gicp;
     src_gicp.setCorrespondenceRandomness(this->gicp_k_correspondences_);
     src_gicp.setInputSource(raw_scan);
@@ -476,7 +480,8 @@ bool dlio::OdomNode::runRelocalization(pcl::PointCloud<PointType>::ConstPtr scan
       float fitness = std::numeric_limits<float>::max();
       Eigen::Matrix4f T_final = Eigen::Matrix4f::Identity();
 
-      if (this->use_gicp_) {
+      if (this->use_gicp_)
+      {
         nano_gicp::NanoGICP<PointType, PointType> gicp;
         gicp.setCorrespondenceRandomness(this->gicp_k_correspondences_);
         gicp.setMaxCorrespondenceDistance(5.0);
@@ -493,7 +498,9 @@ bool dlio::OdomNode::runRelocalization(pcl::PointCloud<PointType>::ConstPtr scan
         converged = gicp.hasConverged();
         fitness = gicp.getFitnessScore(1.0);
         T_final = gicp.getFinalTransformation();
-      } else {
+      }
+      else
+      {
         pclomp::NormalDistributionsTransform<PointType, PointType> ndt_local;
         ndt_local.setResolution(this->ndt_resolution_);
         ndt_local.setNumThreads(this->ndt_num_threads_);
@@ -640,18 +647,27 @@ bool dlio::OdomNode::saveKeyframeDatabase()
   if (kfdb_path.empty())
     return false;
 
-  std::lock_guard<std::mutex> lock(this->kfdb_mutex_);
-  if (this->kfdb_entries_.empty())
+  // Brief lock: copy entries
+  std::vector<dlio::sc::ScanContextEntry> entries_snap;
+  float max_range;
+  Eigen::Quaternionf gravity_q;
   {
-    RCLCPP_INFO(this->get_logger(), "KFDB: no entries to save");
-    return false;
+    std::lock_guard<std::mutex> lock(this->kfdb_mutex_);
+    if (this->kfdb_entries_.empty())
+    {
+      RCLCPP_INFO(this->get_logger(), "KFDB: no entries to save");
+      return false;
+    }
+    entries_snap = this->kfdb_entries_;
+    max_range = this->sc_max_range_;
+    gravity_q = this->kfdb_gravity_q_;
   }
 
-  bool ok = dlio::kfdb::save(kfdb_path, this->kfdb_entries_,
-                             this->sc_max_range_, this->kfdb_gravity_q_);
+  // File I/O outside lock
+  bool ok = dlio::kfdb::save(kfdb_path, entries_snap, max_range, gravity_q);
   if (ok)
     RCLCPP_INFO(this->get_logger(), "KFDB: saved %zu entries to %s",
-                this->kfdb_entries_.size(), kfdb_path.c_str());
+                entries_snap.size(), kfdb_path.c_str());
   else
     RCLCPP_ERROR(this->get_logger(), "KFDB: failed to save to %s", kfdb_path.c_str());
   return ok;
@@ -676,8 +692,8 @@ bool dlio::OdomNode::saveCorrectedKeyframeDatabase()
     return false;
 
   bool ok = dlio::kfdb::saveCorrected(this->map_path_, this->kfdb_entries_,
-                                       corrected_poses, this->sc_max_range_,
-                                       this->kfdb_gravity_q_);
+                                      corrected_poses, this->sc_max_range_,
+                                      this->kfdb_gravity_q_);
   if (ok)
     RCLCPP_INFO(this->get_logger(), "KFDB corrected: saved to %s", this->map_path_.c_str());
   else

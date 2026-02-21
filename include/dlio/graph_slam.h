@@ -51,19 +51,19 @@
 #include <mutex>
 #include <atomic>
 
-class dlio::GraphSlamNode : public rclcpp::Node {
+class dlio::GraphSlamNode : public rclcpp::Node
+{
 
 public:
-
-  explicit GraphSlamNode(const rclcpp::NodeOptions& options = rclcpp::NodeOptions());
+  explicit GraphSlamNode(const rclcpp::NodeOptions &options = rclcpp::NodeOptions());
   ~GraphSlamNode();
 
   void saveOnShutdown();
 
 private:
-
   // --- Keyframe storage ---
-  struct Keyframe {
+  struct Keyframe
+  {
     uint32_t id;
     rclcpp::Time timestamp;
     Eigen::Isometry3d pose;
@@ -73,7 +73,8 @@ private:
   };
 
   // --- Loop closure edge ---
-  struct LoopEdge {
+  struct LoopEdge
+  {
     int from_idx;
     int to_idx;
     Eigen::Isometry3d relative_pose;
@@ -89,21 +90,24 @@ private:
 
   // --- Loop closure ---
   void searchLoopClosure();
-  bool detectLoopCandidate(const std::vector<Keyframe>& kfs, int current_idx,
-                            int& candidate_idx, double& candidate_dist);
-  bool performLoopRegistration(const std::vector<Keyframe>& kfs, int current_idx,
-                                int candidate_idx, Eigen::Isometry3d& relative_pose,
-                                double& fitness_score);
+  bool detectLoopCandidate(const std::vector<Keyframe> &kfs, int current_idx,
+                           int &candidate_idx, double &candidate_dist);
+  bool performLoopRegistration(const std::vector<Keyframe> &kfs, int current_idx,
+                               int candidate_idx, Eigen::Isometry3d &relative_pose,
+                               double &fitness_score);
 
   // --- Pose graph optimization ---
-  void optimizePoseGraph();
+  void optimizePoseGraph(const std::vector<Keyframe> &kf_snap);
 
   // --- Publishing ---
-  void publishCorrectedData();
-  void publishLoopClosureMarkers();
+  void publishCorrectedData(const std::vector<Keyframe> &kf_snap);
+  void publishLoopClosureMarkers(const std::vector<Keyframe> &kf_snap);
 
   // --- Map save ---
-  void saveGraphMaps(const std::string& save_dir, float leaf_size);
+  using IsometryVec = std::vector<Eigen::Isometry3d, Eigen::aligned_allocator<Eigen::Isometry3d>>;
+  void saveGraphMaps(const std::string &save_dir, float leaf_size,
+                     const std::vector<Keyframe> &kf_snap,
+                     const IsometryVec &poses_snap, bool opt_done);
   void autoSave();
   void savePCD(std::shared_ptr<direct_lidar_inertial_odometry::srv::SavePCD::Request> req,
                std::shared_ptr<direct_lidar_inertial_odometry::srv::SavePCD::Response> res);
@@ -176,7 +180,6 @@ private:
   double map_voxel_size_;
   double auto_save_interval_;
   double publish_interval_;
-
 };
 
 #endif // DLIO_GRAPH_SLAM_H

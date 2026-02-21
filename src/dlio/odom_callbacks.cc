@@ -390,13 +390,14 @@ void dlio::OdomNode::callbackPointCloud(const sensor_msgs::msg::PointCloud2::Sha
       {
         std::lock_guard<std::mutex> lock(this->continuous_localize_mtx_);
         this->T_map_odom_ = Eigen::Matrix4f::Identity();
+        this->bayes_posterior_.clear();
+        this->bayes_consecutive_accepts_ = 0;
       }
-      this->bayes_posterior_.clear();
-      this->bayes_consecutive_accepts_ = 0;
 
       // Free relocalization resources (keep map + SC database if continuous localization is on)
       if (!this->continuous_localize_)
       {
+        std::lock_guard<std::mutex> lock(this->continuous_localize_mtx_);
         this->sc_database_.clear();
         this->prior_map_cloud_.reset();
         this->prior_map_kdtree_.reset();
@@ -447,12 +448,13 @@ void dlio::OdomNode::callbackPointCloud(const sensor_msgs::msg::PointCloud2::Sha
       {
         std::lock_guard<std::mutex> lock(this->continuous_localize_mtx_);
         this->T_map_odom_ = Eigen::Matrix4f::Identity();
+        this->bayes_posterior_.clear();
+        this->bayes_consecutive_accepts_ = 0;
       }
-      this->bayes_posterior_.clear();
-      this->bayes_consecutive_accepts_ = 0;
 
       if (!this->continuous_localize_)
       {
+        std::lock_guard<std::mutex> lock(this->continuous_localize_mtx_);
         this->sc_database_.clear();
         this->prior_map_cloud_.reset();
         this->prior_map_kdtree_.reset();
@@ -480,8 +482,9 @@ void dlio::OdomNode::callbackPointCloud(const sensor_msgs::msg::PointCloud2::Sha
     return;
   }
 
-  // Compute Metrics
-  this->metrics_thread = std::thread(&dlio::OdomNode::computeMetrics, this);
+  // Compute Metrics (detached thread — pass scan copy so original_scan can be safely overwritten)
+  pcl::PointCloud<PointType>::ConstPtr scan_for_metrics = this->original_scan;
+  this->metrics_thread = std::thread(&dlio::OdomNode::computeMetrics, this, scan_for_metrics);
   this->metrics_thread.detach();
 
   // Set Adaptive Parameters
@@ -568,6 +571,7 @@ void dlio::OdomNode::callbackPointCloud(const sensor_msgs::msg::PointCloud2::Sha
   {
     published_cloud = this->deskewed_scan;
   }
+  // Publish to ROS (detached thread, publish_mtx_ prevents concurrent push_back on path_ros.poses)
   this->publish_thread = std::thread(&dlio::OdomNode::publishToROS, this, published_cloud, this->T_corr);
   this->publish_thread.detach();
 
@@ -590,11 +594,12 @@ void dlio::OdomNode::callbackPointCloud(const sensor_msgs::msg::PointCloud2::Sha
 
   if (this->debug_)
   {
-    double fitness = this->use_gicp_ ? this->gicp.getFitnessScore() : this->ndt.getFitnessScore();
+    size_t n_kf = this->keyframes.size();
     RCLCPP_INFO(this->get_logger(),
                 "[odom] scan=%zu pts | keyframes=%zu | converged=%d | fitness=%.4f | dt=%.3fs | pos=[%.2f,%.2f,%.2f]",
-                this->current_scan->points.size(), this->keyframes.size(),
-                static_cast<int>(this->gicp_hasConverged.load()), fitness,
+                this->current_scan->points.size(), n_kf,
+                static_cast<int>(this->gicp_hasConverged.load()),
+                this->last_fitness_,
                 comp_time, this->state.p[0], this->state.p[1], this->state.p[2]);
   }
 

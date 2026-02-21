@@ -9,9 +9,12 @@ void dlio::OdomNode::initializeInputTarget()
   // keep history of keyframes
   this->keyframes.push_back(std::make_pair(std::make_pair(this->lidarPose.p, this->lidarPose.q), this->current_scan));
   this->keyframe_timestamps.push_back(this->scan_header_stamp);
-  if (this->use_gicp_) {
+  if (this->use_gicp_)
+  {
     this->keyframe_normals.push_back(this->gicp.getSourceCovariances());
-  } else {
+  }
+  else
+  {
     this->keyframe_normals.push_back(nullptr);
   }
   this->keyframe_transformations.push_back(this->T_corr);
@@ -19,10 +22,13 @@ void dlio::OdomNode::initializeInputTarget()
 
 void dlio::OdomNode::setInputSource()
 {
-  if (this->use_gicp_) {
+  if (this->use_gicp_)
+  {
     this->gicp.setInputSource(this->current_scan);
     this->gicp.calculateSourceCovariances();
-  } else {
+  }
+  else
+  {
     this->ndt.setInputSource(this->current_scan);
   }
 }
@@ -38,7 +44,8 @@ void dlio::OdomNode::getNextPose()
 
   if (this->new_submap_is_ready && this->submap_hasChanged)
   {
-    if (this->use_gicp_) {
+    if (this->use_gicp_)
+    {
       // Set the current global submap as the target cloud
       this->gicp.registerInputTarget(this->submap_cloud);
 
@@ -47,7 +54,9 @@ void dlio::OdomNode::getNextPose()
 
       // Set target cloud's normals as submap normals
       this->gicp.setTargetCovariances(this->submap_normals);
-    } else {
+    }
+    else
+    {
       this->ndt.setInputTarget(this->submap_cloud);
     }
 
@@ -56,12 +65,17 @@ void dlio::OdomNode::getNextPose()
 
   // Align with current submap with global IMU transformation as initial guess
   pcl::PointCloud<PointType>::Ptr aligned = std::make_shared<pcl::PointCloud<PointType>>();
-  if (this->use_gicp_) {
+  if (this->use_gicp_)
+  {
     this->gicp.align(*aligned);
     this->T_corr = this->gicp.getFinalTransformation();
-  } else {
+    this->last_fitness_ = this->gicp.getFitnessScore(1.0);
+  }
+  else
+  {
     this->ndt.align(*aligned);
     this->T_corr = this->ndt.getFinalTransformation();
+    this->last_fitness_ = this->ndt.getFitnessScore(1.0);
   }
   this->T = this->T_corr * this->T_prior;
 
@@ -428,8 +442,13 @@ void dlio::OdomNode::updateState()
 void dlio::OdomNode::setAdaptiveParams()
 {
 
-  // Spaciousness
-  float sp = this->metrics.spaciousness.back();
+  // Spaciousness + Density (lock to prevent race with detached computeMetrics thread)
+  float sp, den;
+  {
+    std::lock_guard<std::mutex> lock(this->metrics_mtx_);
+    sp = this->metrics.spaciousness.back();
+    den = this->metrics.density.back();
+  }
 
   if (sp < 0.5)
   {
@@ -441,9 +460,6 @@ void dlio::OdomNode::setAdaptiveParams()
   }
 
   this->keyframe_thresh_dist_ = sp;
-
-  // Density
-  float den = this->metrics.density.back();
 
   if (den < 0.5 * this->gicp_max_corr_dist_)
   {
@@ -463,7 +479,8 @@ void dlio::OdomNode::setAdaptiveParams()
     den = 2.0 * this->gicp_max_corr_dist_;
   };
 
-  if (this->use_gicp_) {
+  if (this->use_gicp_)
+  {
     this->gicp.setMaxCorrespondenceDistance(den);
   }
 

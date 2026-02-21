@@ -3,22 +3,22 @@
 
 #include <queue>
 
-void dlio::OdomNode::computeMetrics()
+void dlio::OdomNode::computeMetrics(pcl::PointCloud<PointType>::ConstPtr scan)
 {
-  this->computeSpaciousness();
+  this->computeSpaciousness(scan);
   this->computeDensity();
 }
 
-void dlio::OdomNode::computeSpaciousness()
+void dlio::OdomNode::computeSpaciousness(pcl::PointCloud<PointType>::ConstPtr scan)
 {
 
   // compute range of points
   std::vector<float> ds;
 
-  for (int i = 0; i <= this->original_scan->points.size(); i++)
+  for (int i = 0; i < scan->points.size(); i++)
   {
-    float d = std::sqrt(pow(this->original_scan->points[i].x, 2) +
-                        pow(this->original_scan->points[i].y, 2));
+    float d = std::sqrt(pow(scan->points[i].x, 2) +
+                        pow(scan->points[i].y, 2));
     ds.push_back(d);
   }
 
@@ -28,8 +28,11 @@ void dlio::OdomNode::computeSpaciousness()
   float median_lpf = 0.95 * this->spaciousness_median_prev_ + 0.05 * median_curr;
   this->spaciousness_median_prev_ = median_lpf;
 
-  // push
-  this->metrics.spaciousness.push_back(median_lpf);
+  // push (lock to prevent race with setAdaptiveParams reading .back())
+  {
+    std::lock_guard<std::mutex> lock(this->metrics_mtx_);
+    this->metrics.spaciousness.push_back(median_lpf);
+  }
 }
 
 void dlio::OdomNode::computeDensity()
@@ -53,7 +56,10 @@ void dlio::OdomNode::computeDensity()
   float density_lpf = 0.95 * this->density_prev_ + 0.05 * density;
   this->density_prev_ = density_lpf;
 
-  this->metrics.density.push_back(density_lpf);
+  {
+    std::lock_guard<std::mutex> lock(this->metrics_mtx_);
+    this->metrics.density.push_back(density_lpf);
+  }
 }
 
 void dlio::OdomNode::computeConvexHull()
@@ -224,9 +230,12 @@ void dlio::OdomNode::updateKeyframes()
     std::unique_lock<decltype(this->keyframes_mutex)> lock(this->keyframes_mutex);
     this->keyframes.push_back(std::make_pair(std::make_pair(this->lidarPose.p, this->lidarPose.q), this->current_scan));
     this->keyframe_timestamps.push_back(this->scan_header_stamp);
-    if (this->use_gicp_) {
+    if (this->use_gicp_)
+    {
       this->keyframe_normals.push_back(this->gicp.getSourceCovariances());
-    } else {
+    }
+    else
+    {
       this->keyframe_normals.push_back(nullptr);
     }
     this->keyframe_transformations.push_back(this->T_corr);
@@ -342,7 +351,8 @@ void dlio::OdomNode::buildSubmap(State vehicle_state)
     // reinitialize submap cloud and normals
     pcl::PointCloud<PointType>::Ptr submap_cloud_ = std::make_shared<pcl::PointCloud<PointType>>();
     std::shared_ptr<nano_gicp::CovarianceList> submap_normals_;
-    if (this->use_gicp_) {
+    if (this->use_gicp_)
+    {
       submap_normals_ = std::make_shared<nano_gicp::CovarianceList>();
     }
 
@@ -355,24 +365,29 @@ void dlio::OdomNode::buildSubmap(State vehicle_state)
       lock.unlock();
 
       // grab corresponding submap cloud's normals (GICP only)
-      if (this->use_gicp_) {
+      if (this->use_gicp_)
+      {
         submap_normals_->insert(std::end(*submap_normals_),
                                 std::begin(*(this->keyframe_normals[k])), std::end(*(this->keyframe_normals[k])));
       }
     }
 
     this->submap_cloud = submap_cloud_;
-    if (this->use_gicp_) {
+    if (this->use_gicp_)
+    {
       this->submap_normals = submap_normals_;
     }
 
     // Pause to prevent stealing resources from the main loop if it is running.
     this->pauseSubmapBuildIfNeeded();
 
-    if (this->use_gicp_) {
+    if (this->use_gicp_)
+    {
       this->gicp_temp.setInputTarget(this->submap_cloud);
       this->submap_kdtree = this->gicp_temp.target_kdtree_;
-    } else {
+    }
+    else
+    {
       this->ndt_temp.setInputTarget(this->submap_cloud);
     }
 
@@ -400,7 +415,8 @@ void dlio::OdomNode::buildKeyframesAndSubmap(State vehicle_state)
     lock.lock();
     this->keyframes[i].second = transformed_keyframe;
 
-    if (this->use_gicp_) {
+    if (this->use_gicp_)
+    {
       std::shared_ptr<const nano_gicp::CovarianceList> raw_covariances = this->keyframe_normals[i];
       Eigen::Matrix4d Td = T.cast<double>();
       std::shared_ptr<nano_gicp::CovarianceList> transformed_covariances(std::make_shared<nano_gicp::CovarianceList>(raw_covariances->size()));
@@ -410,10 +426,17 @@ void dlio::OdomNode::buildKeyframesAndSubmap(State vehicle_state)
       this->keyframe_normals[i] = transformed_covariances;
     }
 
-    // Send the T_corr-corrected cloud (consistent with the GICP-corrected pose)
-    // so that graph SLAM can correctly compute cloud_local via pose.inverse() * cloud_world
-    this->publish_keyframe_thread = std::thread(&dlio::OdomNode::publishKeyframe, this, this->keyframes[i], this->keyframe_timestamps[i], this->keyframes[i].second);
-    this->publish_keyframe_thread.detach();
+    // Copy data for publish, then unlock before heavy serialization
+    auto kf_data = this->keyframes[i];
+    auto kf_ts = this->keyframe_timestamps[i];
+    auto kf_cloud = this->keyframes[i].second;
+    lock.unlock();
+
+    // Publish in detached thread — don't block submap build
+    // (kf_publish_mtx_ inside publishKeyframe protects shared state)
+    std::thread(&dlio::OdomNode::publishKeyframe, this, kf_data, kf_ts, kf_cloud).detach();
+
+    lock.lock();
   }
 
   lock.unlock();

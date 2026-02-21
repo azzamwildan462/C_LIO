@@ -114,8 +114,8 @@ private:
 
   void setAdaptiveParams();
 
-  void computeMetrics();
-  void computeSpaciousness();
+  void computeMetrics(pcl::PointCloud<PointType>::ConstPtr scan);
+  void computeSpaciousness(pcl::PointCloud<PointType>::ConstPtr scan);
   void computeDensity();
 
   sensor_msgs::msg::Imu::SharedPtr transformImu(const sensor_msgs::msg::Imu::SharedPtr &imu);
@@ -207,6 +207,7 @@ private:
   std::atomic<bool> imu_calibrated;
   std::atomic<bool> submap_hasChanged;
   std::atomic<bool> gicp_hasConverged;
+  double last_fitness_ = 0.0;
   std::atomic<bool> deskew_status;
   std::atomic<int> deskew_size;
 
@@ -215,6 +216,11 @@ private:
   std::thread publish_keyframe_thread;
   std::thread metrics_thread;
   std::thread debug_thread;
+
+  // Mutex for detached publish/metrics threads to prevent concurrent push_back
+  std::mutex publish_mtx_;
+  std::mutex kf_publish_mtx_;
+  std::mutex metrics_mtx_;
 
   // Trajectory
   std::vector<std::pair<Eigen::Vector3f, Eigen::Quaternionf>> trajectory;
@@ -508,18 +514,20 @@ private:
   std::string map_frame_;
 
   // Bayesian state
-  float bayes_virtual_place_prior_;   // P(new place) prior, default 0.9
-  float bayes_loop_threshold_;        // posterior threshold to accept, default 0.5
-  int bayes_min_consecutive_;         // required consecutive accepts, default 2
-  int bayes_consecutive_accepts_;     // current consecutive count
+  float bayes_virtual_place_prior_;    // P(new place) prior, default 0.9
+  float bayes_loop_threshold_;         // posterior threshold to accept, default 0.5
+  int bayes_min_consecutive_;          // required consecutive accepts, default 2
+  float bayes_sc_dist_threshold_;      // max SC distance for candidate (0 = no filter)
+  int bayes_sc_top_k_;                 // only keep top-K SC matches (0 = no filter)
+  int bayes_consecutive_accepts_;      // current consecutive count
   std::vector<float> bayes_posterior_; // [0]=virtual place, [1..N]=keyframes
 
-  Eigen::Matrix4f T_map_odom_;     // TF: map→odom correction
+  Eigen::Matrix4f T_map_odom_; // TF: map→odom correction
   std::mutex continuous_localize_mtx_;
   rclcpp::TimerBase::SharedPtr continuous_localize_timer_;
-  pcl::PointCloud<PointType>::ConstPtr latest_scan_;  // body/sensor frame
-  Eigen::Matrix4f latest_scan_T_;                      // T at time of scan (body→odom)
-  double latest_scan_time_;                             // wall time when scan was stored
+  pcl::PointCloud<PointType>::ConstPtr latest_scan_; // body/sensor frame
+  Eigen::Matrix4f latest_scan_T_;                    // T at time of scan (body→odom)
+  double latest_scan_time_;                          // wall time when scan was stored
   std::mutex latest_scan_mtx_;
 
   // Confidence publisher + global correction control
