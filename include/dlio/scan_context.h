@@ -38,6 +38,11 @@ namespace dlio::sc
     SectorKey sector_key; // SC++ fast alignment key
     Eigen::Vector3f position;
     Eigen::Quaternionf orientation;
+    // GPS data
+    double gps_latitude = 0.0;  // WGS84 degrees
+    double gps_longitude = 0.0; // WGS84 degrees
+    double gps_altitude = 0.0;  // WGS84 ellipsoid height (meters)
+    bool gps_valid = false;     // true if GPS was available at keyframe time
   };
 
   inline ScanContextDescriptor computeScanContext(

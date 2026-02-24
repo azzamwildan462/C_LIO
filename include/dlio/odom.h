@@ -32,10 +32,14 @@
 #include <geometry_msgs/msg/pose_array.hpp>
 #include <nav_msgs/msg/path.hpp>
 #include <sensor_msgs/msg/imu.hpp>
+#include <sensor_msgs/msg/nav_sat_fix.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <std_msgs/msg/float32.hpp>
 #include <std_msgs/msg/bool.hpp>
 #include <tf2_ros/transform_broadcaster.h>
+#include <tf2_ros/static_transform_broadcaster.h>
+#include <GeographicLib/LocalCartesian.hpp>
+#include <GeographicLib/Geocentric.hpp>
 #include <direct_lidar_inertial_odometry/srv/set_mode.hpp>
 #include <direct_lidar_inertial_odometry/srv/relocalize.hpp>
 #include <direct_lidar_inertial_odometry/srv/set_pose.hpp>
@@ -43,6 +47,9 @@
 #include <direct_lidar_inertial_odometry/srv/new_map.hpp>
 #include <direct_lidar_inertial_odometry/srv/new_map_w_zero.hpp>
 #include <direct_lidar_inertial_odometry/srv/save_pcd.hpp>
+
+// STL (explicit for GPS buffer)
+#include <deque>
 
 // BOOST
 #include <boost/format.hpp>
@@ -564,4 +571,54 @@ private:
   rclcpp::TimerBase::SharedPtr occupancy_grid_timer_;
   double og_last_scan_time_ = 0.0;
   void publishOccupancyGrid();
+
+  // GPS subscriber + callback
+  rclcpp::Subscription<sensor_msgs::msg::NavSatFix>::SharedPtr gps_sub_;
+  rclcpp::CallbackGroup::SharedPtr gps_cb_group_;
+  void callbackGPS(const sensor_msgs::msg::NavSatFix::SharedPtr msg);
+
+  // GPS state
+  struct GPSMeasurement
+  {
+    double latitude, longitude, altitude;
+    double timestamp;
+    float horizontal_accuracy;
+    uint8_t status;
+  };
+  std::deque<GPSMeasurement> gps_buffer_;
+  std::mutex gps_buffer_mtx_;
+  static constexpr size_t GPS_BUFFER_MAX = 200;
+
+  // GPS coordinate converter
+  std::unique_ptr<GeographicLib::LocalCartesian> gps_converter_;
+  bool gps_origin_set_ = false;
+  double gps_origin_lat_ = 0.0;
+  double gps_origin_lon_ = 0.0;
+  double gps_origin_alt_ = 0.0;
+
+  // GPS params
+  bool gps_enabled_ = false;
+  std::string gps_topic_;
+  double gps_origin_param_lat_ = 0.0;
+  double gps_origin_param_lon_ = 0.0;
+  double gps_origin_param_alt_ = 0.0;
+  float gps_search_radius_ = 30.0f;
+  float gps_min_accuracy_ = 5.0f;
+  bool gps_publish_earth_tf_ = true;
+  bool gps_trust_all_ = false; // bypass status + accuracy filters (for sim)
+
+  // GPS correction tracking (g2o only after first successful correction)
+  bool gps_corrected_once_ = false;
+
+  // earth→map TF (static, published once when origin is set)
+  bool earth_tf_published_ = false;
+  std::shared_ptr<tf2_ros::StaticTransformBroadcaster> static_tf_broadcaster_;
+  void publishEarthToMapTF();
+
+  // Helper: get interpolated GPS at a given timestamp
+  bool getGPSAtTime(double timestamp, GPSMeasurement &out);
+
+  // Helper: convert lat/lon to local ENU
+  bool gpsToLocal(double lat, double lon, double alt,
+                  float &x, float &y, float &z);
 };

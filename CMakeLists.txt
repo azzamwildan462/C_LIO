@@ -36,6 +36,7 @@ find_package(PCL REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(Threads REQUIRED)
 find_package(ndt_omp_ros2 REQUIRED)
+find_package(GeographicLib REQUIRED)
 
 # g2o (from ros-humble-libg2o)
 set(g2o_DIR "/opt/ros/humble/lib/cmake/g2o")
@@ -65,6 +66,7 @@ include_directories(
   include
   ${PCL_INCLUDE_DIRS}
   ${EIGEN3_INCLUDE_DIR}
+  ${GeographicLib_INCLUDE_DIRS}
   /opt/ros/humble/include
 )
 link_directories(
@@ -119,6 +121,7 @@ target_compile_options(dlio_odom_component PRIVATE ${OpenMP_FLAGS})
 target_link_libraries(dlio_odom_component
   ${PCL_LIBRARIES} ${OpenMP_LIBS} Threads::Threads nano_gicp ${cpp_typesupport_target}
   g2o::core g2o::types_slam3d g2o::solver_eigen
+  ${GeographicLib_LIBRARIES}
 )
 ament_target_dependencies(dlio_odom_component
   rclcpp rclcpp_components tf2_ros pcl_ros nav_msgs pcl_conversions sensor_msgs geometry_msgs ndt_omp_ros2

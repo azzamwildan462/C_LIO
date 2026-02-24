@@ -55,9 +55,9 @@ namespace dlio::kfdb
     if (!ofs.is_open())
       return false;
 
-    // Header (v2: includes gravity quaternion)
+    // Header (v3: includes gravity quaternion + GPS per entry)
     uint32_t magic = 0x4B464442; // "KFDB"
-    uint32_t version = 2;
+    uint32_t version = 3;
     uint32_t sc_nr = dlio::sc::SC_NR;
     uint32_t sc_ns = dlio::sc::SC_NS;
     uint32_t num_entries = static_cast<uint32_t>(entries.size());
@@ -83,6 +83,13 @@ namespace dlio::kfdb
                 dlio::sc::SC_NR * dlio::sc::SC_NS * sizeof(float));
       ofs.write(reinterpret_cast<const char *>(entry.ring_key.data()),
                 dlio::sc::SC_NR * sizeof(float));
+
+      // v3: GPS fields
+      ofs.write(reinterpret_cast<const char *>(&entry.gps_latitude), sizeof(double));
+      ofs.write(reinterpret_cast<const char *>(&entry.gps_longitude), sizeof(double));
+      ofs.write(reinterpret_cast<const char *>(&entry.gps_altitude), sizeof(double));
+      uint8_t gv = entry.gps_valid ? 1 : 0;
+      ofs.write(reinterpret_cast<const char *>(&gv), sizeof(uint8_t));
     }
 
     ofs.close();
@@ -120,7 +127,7 @@ namespace dlio::kfdb
       return false;
 
     uint32_t magic = 0x4B464442;
-    uint32_t version = 2;
+    uint32_t version = 3;
     uint32_t sc_nr = dlio::sc::SC_NR;
     uint32_t sc_ns = dlio::sc::SC_NS;
 
@@ -153,6 +160,13 @@ namespace dlio::kfdb
                 dlio::sc::SC_NR * dlio::sc::SC_NS * sizeof(float));
       ofs.write(reinterpret_cast<const char *>(entry.ring_key.data()),
                 dlio::sc::SC_NR * sizeof(float));
+
+      // v3: GPS fields
+      ofs.write(reinterpret_cast<const char *>(&entry.gps_latitude), sizeof(double));
+      ofs.write(reinterpret_cast<const char *>(&entry.gps_longitude), sizeof(double));
+      ofs.write(reinterpret_cast<const char *>(&entry.gps_altitude), sizeof(double));
+      uint8_t gv = entry.gps_valid ? 1 : 0;
+      ofs.write(reinterpret_cast<const char *>(&gv), sizeof(uint8_t));
     }
 
     ofs.close();
@@ -179,7 +193,7 @@ namespace dlio::kfdb
       return false;
 
     ifs.read(reinterpret_cast<char *>(&version), sizeof(version));
-    if (version != 1 && version != 2)
+    if (version != 1 && version != 2 && version != 3)
       return false;
 
     ifs.read(reinterpret_cast<char *>(&sc_nr), sizeof(sc_nr));
@@ -222,6 +236,21 @@ namespace dlio::kfdb
 
       // SC++: derive sector key from descriptor (backward compatible, no format change)
       entry.sector_key = dlio::sc::computeSectorKey(entry.descriptor);
+
+      // v3: GPS fields
+      if (version >= 3)
+      {
+        ifs.read(reinterpret_cast<char *>(&entry.gps_latitude), sizeof(double));
+        ifs.read(reinterpret_cast<char *>(&entry.gps_longitude), sizeof(double));
+        ifs.read(reinterpret_cast<char *>(&entry.gps_altitude), sizeof(double));
+        uint8_t gv = 0;
+        ifs.read(reinterpret_cast<char *>(&gv), sizeof(uint8_t));
+        entry.gps_valid = (gv != 0);
+      }
+      else
+      {
+        entry.gps_valid = false;
+      }
 
       database.push_back(std::move(entry));
     }

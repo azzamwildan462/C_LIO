@@ -98,6 +98,38 @@ dlio::OdomNode::OdomNode(const rclcpp::NodeOptions &options)
     RCLCPP_INFO(this->get_logger(), "Occupancy grid enabled: rate=%.1fHz", og_rate);
   }
 
+  // GPS subscriber
+  if (this->gps_enabled_)
+  {
+    this->gps_cb_group_ = this->create_callback_group(
+        rclcpp::CallbackGroupType::MutuallyExclusive);
+    auto gps_sub_opt = rclcpp::SubscriptionOptions();
+    gps_sub_opt.callback_group = this->gps_cb_group_;
+    this->gps_sub_ = this->create_subscription<sensor_msgs::msg::NavSatFix>(
+        this->gps_topic_, rclcpp::SensorDataQoS(),
+        std::bind(&dlio::OdomNode::callbackGPS, this, std::placeholders::_1),
+        gps_sub_opt);
+
+    this->static_tf_broadcaster_ =
+        std::make_shared<tf2_ros::StaticTransformBroadcaster>(this);
+
+    // If origin param is set, initialize converter immediately
+    if (this->gps_origin_param_lat_ != 0.0 || this->gps_origin_param_lon_ != 0.0)
+    {
+      this->gps_origin_lat_ = this->gps_origin_param_lat_;
+      this->gps_origin_lon_ = this->gps_origin_param_lon_;
+      this->gps_origin_alt_ = this->gps_origin_param_alt_;
+      this->gps_converter_ = std::make_unique<GeographicLib::LocalCartesian>(
+          this->gps_origin_lat_, this->gps_origin_lon_, this->gps_origin_alt_);
+      this->gps_origin_set_ = true;
+    }
+
+    RCLCPP_INFO(this->get_logger(), "GPS enabled: topic='%s', origin=[%.6f,%.6f,%.1f]%s",
+                this->gps_topic_.c_str(), this->gps_origin_param_lat_,
+                this->gps_origin_param_lon_, this->gps_origin_param_alt_,
+                this->gps_origin_set_ ? " (from param)" : " (will use first fix)");
+  }
+
   this->T = Eigen::Matrix4f::Identity();
   this->T_prior = Eigen::Matrix4f::Identity();
   this->T_corr = Eigen::Matrix4f::Identity();
@@ -592,6 +624,21 @@ void dlio::OdomNode::getParams()
   dlio::declare_param(this, "map/continuous_localize/g2o_iterations", this->g2o_iterations_, 10);
   dlio::declare_param(this, "frames/map", this->map_frame_, std::string("map"));
 
+  // GPS
+  dlio::declare_param(this, "gps/enabled", this->gps_enabled_, false);
+  dlio::declare_param(this, "gps/topic", this->gps_topic_, std::string("fix"));
+  dlio::declare_param(this, "gps/origin/latitude", this->gps_origin_param_lat_, 0.0);
+  dlio::declare_param(this, "gps/origin/longitude", this->gps_origin_param_lon_, 0.0);
+  dlio::declare_param(this, "gps/origin/altitude", this->gps_origin_param_alt_, 0.0);
+  double gps_sr = 30.0;
+  dlio::declare_param(this, "gps/search_radius", gps_sr, 30.0);
+  this->gps_search_radius_ = static_cast<float>(gps_sr);
+  double gps_ma = 5.0;
+  dlio::declare_param(this, "gps/min_accuracy", gps_ma, 5.0);
+  this->gps_min_accuracy_ = static_cast<float>(gps_ma);
+  dlio::declare_param(this, "gps/publish_earth_tf", this->gps_publish_earth_tf_, true);
+  dlio::declare_param(this, "gps/trust_all", this->gps_trust_all_, false);
+
   // Occupancy Grid
   dlio::declare_param(this, "occupancy_grid/enabled", this->occupancy_grid_enabled_, false);
   if (this->occupancy_grid_enabled_)
@@ -618,6 +665,94 @@ void dlio::OdomNode::getParams()
     ogp.frame_id = this->map_frame_;
     this->occupancy_grid_gen_ = std::make_unique<dlio::OccupancyGridGenerator>(ogp);
   }
+}
+
+void dlio::OdomNode::callbackGPS(const sensor_msgs::msg::NavSatFix::SharedPtr msg)
+{
+  float h_acc = 0.0f;
+
+  if (!this->gps_trust_all_)
+  {
+    // Reject invalid fix
+    if (msg->status.status < sensor_msgs::msg::NavSatStatus::STATUS_FIX)
+      return;
+
+    // Extract horizontal accuracy from covariance (position_covariance[0] = east variance)
+    h_acc = std::sqrt(static_cast<float>(msg->position_covariance[0]));
+
+    // Reject poor accuracy
+    if (h_acc > this->gps_min_accuracy_ && msg->position_covariance_type != 0)
+      return;
+  }
+
+  // Initialize origin from first fix if not set from params
+  if (!this->gps_origin_set_)
+  {
+    this->gps_origin_lat_ = msg->latitude;
+    this->gps_origin_lon_ = msg->longitude;
+    this->gps_origin_alt_ = msg->altitude;
+    this->gps_converter_ = std::make_unique<GeographicLib::LocalCartesian>(
+        this->gps_origin_lat_, this->gps_origin_lon_, this->gps_origin_alt_);
+    this->gps_origin_set_ = true;
+    RCLCPP_INFO(this->get_logger(),
+                "[GPS] Origin set: lat=%.8f lon=%.8f alt=%.2f",
+                this->gps_origin_lat_, this->gps_origin_lon_, this->gps_origin_alt_);
+  }
+
+  // Publish earth→map static TF (once)
+  if (this->gps_publish_earth_tf_ && !this->earth_tf_published_)
+  {
+    this->publishEarthToMapTF();
+    this->earth_tf_published_ = true;
+  }
+
+  // Buffer GPS measurement — always use node clock (sim or wall) for consistency
+  // with latest_scan_time_ which also uses this->now().seconds()
+  double ts = this->now().seconds();
+
+  {
+    std::lock_guard<std::mutex> lock(this->gps_buffer_mtx_);
+    if (this->gps_buffer_.size() >= GPS_BUFFER_MAX)
+      this->gps_buffer_.pop_front();
+    this->gps_buffer_.push_back({msg->latitude, msg->longitude, msg->altitude,
+                                 ts, h_acc, static_cast<uint8_t>(msg->status.status)});
+  }
+}
+
+bool dlio::OdomNode::getGPSAtTime(double timestamp, GPSMeasurement &out)
+{
+  std::lock_guard<std::mutex> lock(this->gps_buffer_mtx_);
+  if (this->gps_buffer_.empty())
+    return false;
+
+  double best_dt = 1e9;
+  int best_idx = -1;
+  for (int i = 0; i < static_cast<int>(this->gps_buffer_.size()); i++)
+  {
+    double dt = std::abs(this->gps_buffer_[i].timestamp - timestamp);
+    if (dt < best_dt)
+    {
+      best_dt = dt;
+      best_idx = i;
+    }
+  }
+  if (best_idx < 0 || best_dt > 1.0)
+    return false; // max 1s age
+  out = this->gps_buffer_[best_idx];
+  return true;
+}
+
+bool dlio::OdomNode::gpsToLocal(double lat, double lon, double alt,
+                                float &x, float &y, float &z)
+{
+  if (!this->gps_origin_set_ || !this->gps_converter_)
+    return false;
+  double dx, dy, dz;
+  this->gps_converter_->Forward(lat, lon, alt, dx, dy, dz);
+  x = static_cast<float>(dx);
+  y = static_cast<float>(dy);
+  z = static_cast<float>(dz);
+  return true;
 }
 
 void dlio::OdomNode::start()

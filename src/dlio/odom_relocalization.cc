@@ -612,6 +612,20 @@ void dlio::OdomNode::computeAndStoreKeyframeSC()
   entry.position = this->lidarPose.p;
   entry.orientation = this->lidarPose.q;
 
+  // Attach GPS data to keyframe entry
+  GPSMeasurement gps_at_kf;
+  if (this->gps_enabled_ && this->getGPSAtTime(this->scan_header_stamp.seconds(), gps_at_kf))
+  {
+    entry.gps_latitude = gps_at_kf.latitude;
+    entry.gps_longitude = gps_at_kf.longitude;
+    entry.gps_altitude = gps_at_kf.altitude;
+    entry.gps_valid = true;
+  }
+  else
+  {
+    entry.gps_valid = false;
+  }
+
   // Debug: log first 3 entries
   {
     std::lock_guard<std::mutex> lock(this->kfdb_mutex_);

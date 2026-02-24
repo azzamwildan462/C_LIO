@@ -14,15 +14,15 @@
   ros__parameters:
     use_sim_time: true
 
-    debug/odom: false
+    debug/odom: true
     debug/graph_slam: false
-    debug/print_odom: true # Activate this to print odometry like default DLIO
+    debug/print_odom: false # Activate this to print odometry like default DLIO
 
+    frames/map: map
     frames/odom: odom
     frames/baselink: base_link
     frames/lidar: lidar
     frames/imu: imu
-    frames/map: map
 
     map/waitUntilMove: true
     map/dense/filtered: false
@@ -101,6 +101,17 @@
     odom/geo/Kgb: 1.0
     odom/geo/abias_max: 5.0
     odom/geo/gbias_max: 0.5
+
+    # GPS
+    gps/enabled: true
+    gps/topic: "/carla/ego_vehicle/gnss"
+    gps/origin/latitude: 0.0 # 0 = use first GPS fix
+    gps/origin/longitude: 0.0
+    gps/origin/altitude: 0.0
+    gps/search_radius: 69.0 # meters, KF search radius for GPS loop closure
+    gps/min_accuracy: 5.0 # meters, reject GPS with worse horizontal accuracy
+    gps/publish_earth_tf: true # publish earth→map static TF
+    gps/trust_all: true # bypass status + accuracy filters (for simulation)
 
     # Occupancy Grid
     # Not all tested yet, use with caution and report any issues!

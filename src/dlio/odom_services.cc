@@ -966,6 +966,46 @@ void dlio::OdomNode::debug()
   std::cout << "+-------------------------------------------------------------------+" << std::endl;
 }
 
+void dlio::OdomNode::publishEarthToMapTF()
+{
+  // Get ECEF coordinates of map origin
+  GeographicLib::Geocentric earth(GeographicLib::Constants::WGS84_a(),
+                                  GeographicLib::Constants::WGS84_f());
+  double X0, Y0, Z0;
+  earth.Forward(this->gps_origin_lat_, this->gps_origin_lon_,
+                this->gps_origin_alt_, X0, Y0, Z0);
+
+  // Rotation matrix: ECEF → ENU at origin
+  double lat_rad = this->gps_origin_lat_ * M_PI / 180.0;
+  double lon_rad = this->gps_origin_lon_ * M_PI / 180.0;
+  double sl = std::sin(lat_rad), cl = std::cos(lat_rad);
+  double sn = std::sin(lon_rad), cn = std::cos(lon_rad);
+
+  Eigen::Matrix3d R;
+  R << -sn, cn, 0.0,
+      -sl * cn, -sl * sn, cl,
+      cl * cn, cl * sn, sl;
+
+  Eigen::Quaterniond q(R);
+
+  geometry_msgs::msg::TransformStamped tf;
+  tf.header.stamp = this->now();
+  tf.header.frame_id = "earth";
+  tf.child_frame_id = this->map_frame_;
+  tf.transform.translation.x = X0;
+  tf.transform.translation.y = Y0;
+  tf.transform.translation.z = Z0;
+  tf.transform.rotation.x = q.x();
+  tf.transform.rotation.y = q.y();
+  tf.transform.rotation.z = q.z();
+  tf.transform.rotation.w = q.w();
+
+  this->static_tf_broadcaster_->sendTransform(tf);
+  RCLCPP_INFO(this->get_logger(),
+              "[GPS] Published earth->%s static TF (ECEF=[%.1f,%.1f,%.1f])",
+              this->map_frame_.c_str(), X0, Y0, Z0);
+}
+
 void dlio::OdomNode::continuousLocalize()
 {
   // Prerequisites
@@ -1018,6 +1058,289 @@ void dlio::OdomNode::continuousLocalize()
   }
 
   const int N = static_cast<int>(sc_snap.size());
+
+  // Precompute lidar extrinsic here for GPS path (also used later in SC++ path)
+  Eigen::Matrix4f T_body_lidar = this->extrinsics.baselink2lidar_T;
+
+  // ── GPS-based loop closure (skip SC++ if GPS available) ─────────────
+  if (this->gps_enabled_ && this->gps_origin_set_ && this->enable_global_correction_.load())
+  {
+    GPSMeasurement current_gps;
+    bool gps_time_ok = this->getGPSAtTime(scan_time, current_gps);
+    bool gps_acc_ok = gps_time_ok && (this->gps_trust_all_ ||
+                                      current_gps.horizontal_accuracy < this->gps_min_accuracy_);
+
+    if (!gps_time_ok && this->debug_)
+    {
+      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 10000,
+                           "[GPS] No GPS fix near scan time (buffer=%zu)",
+                           this->gps_buffer_.size());
+    }
+    else if (!gps_acc_ok && this->debug_)
+    {
+      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 10000,
+                           "[GPS] Accuracy rejected: h_acc=%.2f > %.2f",
+                           current_gps.horizontal_accuracy, this->gps_min_accuracy_);
+    }
+
+    if (gps_acc_ok)
+    {
+
+      float gps_x, gps_y, gps_z;
+      if (this->gpsToLocal(current_gps.latitude, current_gps.longitude,
+                           current_gps.altitude, gps_x, gps_y, gps_z))
+      {
+
+        Eigen::Vector3f gps_pos(gps_x, gps_y, gps_z);
+
+        // Find KFs within search radius using stored GPS lat/lon (same frame)
+        // NOTE: sc_snap[i].position is in map frame, gps_pos is in local ENU —
+        // these are different frames! Must use stored GPS coords for comparison.
+        std::vector<std::pair<int, float>> gps_candidates;
+        for (int i = 0; i < N; i++)
+        {
+          if (!sc_snap[i].gps_valid)
+            continue;
+
+          float kf_x, kf_y, kf_z;
+          if (!this->gpsToLocal(sc_snap[i].gps_latitude, sc_snap[i].gps_longitude,
+                                sc_snap[i].gps_altitude, kf_x, kf_y, kf_z))
+            continue;
+
+          float dist = std::sqrt((kf_x - gps_x) * (kf_x - gps_x) +
+                                 (kf_y - gps_y) * (kf_y - gps_y));
+          if (dist < this->gps_search_radius_)
+            gps_candidates.push_back({i, dist});
+        }
+
+        // Sort by distance (closest first)
+        std::sort(gps_candidates.begin(), gps_candidates.end(),
+                  [](auto &a, auto &b)
+                  { return a.second < b.second; });
+
+        if (!gps_candidates.empty())
+        {
+          Eigen::Matrix4f T_map_odom_cur = T_map_odom_snap;
+          Eigen::Matrix4f T_map_body_est = T_map_odom_cur * T_odom_body;
+          Eigen::Matrix4f T_map_lidar_est = T_map_body_est * T_body_lidar;
+
+          // GICP lambda (same as main path but defined locally for GPS scope)
+          auto tryGICP_gps = [&](const Eigen::Vector3f &center, const Eigen::Matrix4f &init_guess,
+                                 Eigen::Matrix4f &result_T, float &result_fitness) -> bool
+          {
+            PointType search_pt;
+            search_pt.x = center[0];
+            search_pt.y = center[1];
+            search_pt.z = center[2];
+
+            std::vector<int> nn_indices;
+            std::vector<float> nn_dists;
+            prior_kdtree_snap->radiusSearch(search_pt, 35.f * 35.f, nn_indices, nn_dists);
+
+            if (nn_indices.size() < 50)
+            {
+              RCLCPP_DEBUG(this->get_logger(),
+                           "[GPS] tryGICP: too few pts=%zu at [%.1f,%.1f,%.1f]",
+                           nn_indices.size(), center[0], center[1], center[2]);
+              return false;
+            }
+
+            pcl::PointCloud<PointType>::Ptr local_map = std::make_shared<pcl::PointCloud<PointType>>();
+            local_map->points.resize(nn_indices.size());
+            for (size_t i = 0; i < nn_indices.size(); i++)
+              local_map->points[i] = prior_cloud_snap->points[nn_indices[i]];
+            local_map->width = local_map->points.size();
+            local_map->height = 1;
+            local_map->is_dense = true;
+
+            pcl::VoxelGrid<PointType> vf;
+            vf.setLeafSize(0.5f, 0.5f, 0.5f);
+            vf.setInputCloud(local_map);
+            vf.filter(*local_map);
+            local_map->width = local_map->points.size();
+            local_map->height = 1;
+
+            pcl::PointCloud<PointType>::Ptr aligned = std::make_shared<pcl::PointCloud<PointType>>();
+            bool converged = false;
+
+            if (this->use_gicp_)
+            {
+              nano_gicp::NanoGICP<PointType, PointType> gicp;
+              gicp.setCorrespondenceRandomness(this->gicp_k_correspondences_);
+              gicp.setMaxCorrespondenceDistance(this->gicp_max_corr_dist_);
+              gicp.setMaximumIterations(32);
+              gicp.setTransformationEpsilon(0.01);
+              gicp.setRotationEpsilon(0.01);
+              gicp.setInputSource(scan_body);
+              gicp.calculateSourceCovariances();
+              gicp.setInputTarget(local_map);
+              gicp.calculateTargetCovariances();
+              gicp.align(*aligned, init_guess);
+              converged = gicp.hasConverged();
+              result_fitness = gicp.getFitnessScore(1.0);
+              result_T = gicp.getFinalTransformation();
+            }
+            else
+            {
+              pclomp::NormalDistributionsTransform<PointType, PointType> ndt_local;
+              ndt_local.setResolution(this->ndt_resolution_);
+              ndt_local.setNumThreads(this->ndt_num_threads_);
+              ndt_local.setNeighborhoodSearchMethod(pclomp::DIRECT7);
+              ndt_local.setMaximumIterations(32);
+              ndt_local.setTransformationEpsilon(0.01);
+              ndt_local.setInputSource(scan_body);
+              ndt_local.setInputTarget(local_map);
+              ndt_local.align(*aligned, init_guess);
+              converged = ndt_local.hasConverged();
+              result_fitness = ndt_local.getFitnessScore(1.0);
+              result_T = ndt_local.getFinalTransformation();
+            }
+
+            if (!converged)
+            {
+              RCLCPP_DEBUG(this->get_logger(), "[GPS] tryGICP: not converged");
+              return false;
+            }
+            if (result_fitness > this->continuous_localize_fitness_thresh_)
+            {
+              RCLCPP_DEBUG(this->get_logger(),
+                           "[GPS] tryGICP: fitness=%.4f > thresh=%.4f",
+                           result_fitness, this->continuous_localize_fitness_thresh_);
+              return false;
+            }
+
+            float disp = (result_T.block<3, 1>(0, 3) - init_guess.block<3, 1>(0, 3)).norm();
+            if (disp > 10.0f)
+            {
+              RCLCPP_DEBUG(this->get_logger(), "[GPS] tryGICP: disp=%.2fm > 10m", disp);
+              return false;
+            }
+
+            return true;
+          };
+
+          int n_try = std::min(5, static_cast<int>(gps_candidates.size()));
+
+          RCLCPP_DEBUG(this->get_logger(),
+                       "[GPS] %zu KFs within %.0fm of GPS [%.1f,%.1f], trying top %d",
+                       gps_candidates.size(), this->gps_search_radius_,
+                       gps_x, gps_y, n_try);
+
+          // Extract roll/pitch from IMU (reliable), try multiple yaws
+          Eigen::Matrix3f R_est = T_map_body_est.block<3, 3>(0, 0);
+          float est_yaw = std::atan2(R_est(1, 0), R_est(0, 0));
+          Eigen::Quaternionf q_est(R_est);
+          Eigen::Quaternionf q_yaw_inv(Eigen::AngleAxisf(-est_yaw, Eigen::Vector3f::UnitZ()));
+          Eigen::Quaternionf q_rp = q_yaw_inv * q_est; // roll+pitch only
+
+          const float yaw_offsets[] = {0.f, M_PI / 3.f, 2.f * M_PI / 3.f,
+                                       M_PI, -2.f * M_PI / 3.f, -M_PI / 3.f};
+
+          bool gps_gicp_ok = false;
+          Eigen::Matrix4f gps_T_map_lidar;
+          float gps_fitness = std::numeric_limits<float>::max();
+          int gps_best_kf = -1;
+
+          for (int ci = 0; ci < n_try; ci++)
+          {
+            int kf_idx = gps_candidates[ci].first;
+            Eigen::Vector3f cand_pos = sc_snap[kf_idx].position;
+
+            for (float yaw_offset : yaw_offsets)
+            {
+              float yaw = est_yaw + yaw_offset;
+              Eigen::Quaternionf q_full =
+                  Eigen::Quaternionf(Eigen::AngleAxisf(yaw, Eigen::Vector3f::UnitZ())) * q_rp;
+
+              Eigen::Matrix4f init_guess = Eigen::Matrix4f::Identity();
+              init_guess.block<3, 3>(0, 0) = q_full.toRotationMatrix();
+              init_guess.block<3, 1>(0, 3) = cand_pos;
+              init_guess = init_guess * T_body_lidar; // body→lidar
+
+              Eigen::Matrix4f result_T;
+              float result_fit;
+              bool ok = tryGICP_gps(cand_pos, init_guess, result_T, result_fit);
+
+              if (ok && result_fit < gps_fitness)
+              {
+                gps_fitness = result_fit;
+                gps_T_map_lidar = result_T;
+                gps_best_kf = kf_idx;
+                gps_gicp_ok = true;
+
+                // Early exit on excellent fitness
+                if (result_fit < 0.05f)
+                  goto gps_search_done;
+              }
+            }
+          }
+        gps_search_done:
+
+          if (gps_gicp_ok)
+          {
+            Eigen::Matrix4f T_map_body_gps = gps_T_map_lidar * T_body_lidar.inverse();
+
+            // Consistency check: matched KF's GPS should be close to current GPS
+            // (both in local ENU, same frame — safe to compare)
+            float kf_gps_x, kf_gps_y, kf_gps_z;
+            float gps_kf_dist = 0.0f;
+            if (sc_snap[gps_best_kf].gps_valid &&
+                this->gpsToLocal(sc_snap[gps_best_kf].gps_latitude,
+                                 sc_snap[gps_best_kf].gps_longitude,
+                                 sc_snap[gps_best_kf].gps_altitude,
+                                 kf_gps_x, kf_gps_y, kf_gps_z))
+            {
+              gps_kf_dist = std::sqrt((kf_gps_x - gps_x) * (kf_gps_x - gps_x) +
+                                      (kf_gps_y - gps_y) * (kf_gps_y - gps_y));
+            }
+
+            Eigen::Matrix4f T_map_odom_new = T_map_body_gps * T_odom_body.inverse();
+            Eigen::Matrix4f delta = T_map_odom_new * T_map_odom_cur.inverse();
+            float corr_dist = delta.block<3, 1>(0, 3).norm();
+
+            RCLCPP_INFO(this->get_logger(),
+                        "[GPS] OK: kf=%d fitness=%.4f corr=%.3fm gps_kf_dist=%.1fm",
+                        gps_best_kf, gps_fitness, corr_dist, gps_kf_dist);
+
+            {
+              std::lock_guard<std::mutex> wb(this->continuous_localize_mtx_);
+              this->T_map_odom_ = T_map_odom_new;
+            }
+
+            float conf = std::max(0.0f, 1.0f - gps_fitness /
+                                                   static_cast<float>(this->continuous_localize_fitness_thresh_));
+            this->last_confidence_ = conf;
+            if (this->confidence_pub_)
+            {
+              std_msgs::msg::Float32 msg;
+              msg.data = conf;
+              this->confidence_pub_->publish(msg);
+            }
+
+            return; // GPS path done, skip SC++
+          }
+
+          if (this->debug_)
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 10000,
+                                 "[GPS] GICP failed on %d candidates, falling back to SC++", n_try);
+        }
+        else if (this->debug_)
+        {
+          // Count how many KFs have GPS data at all
+          int n_gps_valid = 0;
+          for (int i = 0; i < N; i++)
+            if (sc_snap[i].gps_valid)
+              n_gps_valid++;
+          RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 10000,
+                               "[GPS] No KFs within %.0fm of GPS [%.1f,%.1f] "
+                               "(gps_valid_kfs=%d/%d), falling back to SC++",
+                               this->gps_search_radius_, gps_x, gps_y,
+                               n_gps_valid, N);
+        }
+      }
+    }
+  }
+  // ── End GPS path, continue with SC++ below ──────────────────────────
 
   // Initialize Bayesian posterior if needed (lazy init / size change)
   if (static_cast<int>(bayes_snap.size()) != N + 1)
@@ -1289,7 +1612,6 @@ void dlio::OdomNode::continuousLocalize()
   //   false positives (GICP local minima).
 
   Eigen::Matrix4f T_map_odom_cur = T_map_odom_snap;
-  Eigen::Matrix4f T_body_lidar = this->extrinsics.baselink2lidar_T; // lidar→body
 
   Eigen::Matrix4f T_map_body_est = T_map_odom_cur * T_odom_body;
   Eigen::Matrix4f T_map_lidar_est = T_map_body_est * T_body_lidar; // lidar→body→odom→map
