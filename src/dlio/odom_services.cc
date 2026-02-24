@@ -970,12 +970,7 @@ void dlio::OdomNode::continuousLocalize()
 {
   // Prerequisites
   if (!this->dlio_initialized || !this->relocalized_)
-  {
-    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-                         "[bayes] skip: initialized=%d, relocalized=%d",
-                         this->dlio_initialized.load(), this->relocalized_);
     return;
-  }
 
   // Brief lock: copy shared state, then release for heavy computation
   std::vector<dlio::sc::ScanContextEntry> sc_snap;
@@ -987,18 +982,9 @@ void dlio::OdomNode::continuousLocalize()
   {
     std::lock_guard<std::mutex> cl_lock(this->continuous_localize_mtx_);
     if (!this->prior_map_cloud_ || !this->prior_map_kdtree_)
-    {
-      RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-                           "[bayes] skip: prior_map=%d, kdtree=%d",
-                           this->prior_map_cloud_ ? 1 : 0, this->prior_map_kdtree_ ? 1 : 0);
       return;
-    }
     if (this->sc_database_.empty())
-    {
-      RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-                           "[bayes] skip: sc_database empty");
       return;
-    }
     sc_snap = this->sc_database_;
     bayes_snap = this->bayes_posterior_;
     T_map_odom_snap = this->T_map_odom_;
@@ -1020,8 +1006,6 @@ void dlio::OdomNode::continuousLocalize()
   }
   if (!scan_body || scan_body->empty())
   {
-    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-                         "[bayes] skip: no latest scan");
     return;
   }
 
@@ -1030,8 +1014,6 @@ void dlio::OdomNode::continuousLocalize()
   double scan_age = now_sec - scan_time;
   if (scan_time > 0.0 && scan_age > 3.0 * this->continuous_localize_interval_)
   {
-    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-                         "[bayes] skip: scan stale (%.1fs old)", scan_age);
     return;
   }
 
@@ -1045,16 +1027,19 @@ void dlio::OdomNode::continuousLocalize()
     for (int i = 1; i <= N; i++)
       bayes_snap[i] = 0.0f;
     bayes_consec = 0;
-    RCLCPP_INFO(this->get_logger(), "[bayes] initialized posterior: N=%d keyframes", N);
+    if (this->debug_)
+      RCLCPP_INFO(this->get_logger(), "[bayes] initialized posterior: N=%d keyframes", N);
   }
 
   // ── 2. Compute SC likelihoods ──────────────────────────────────────────
 
-  // Rotate scan to gravity-aligned frame for SC descriptor
+  // Rotate scan to gravity-aligned frame for SC descriptor (with ground removal)
   auto sc_scan = dlio::sc::prepareGravityAlignedScan(
-      scan_body, this->kfdb_gravity_q_, this->extrinsics.baselink2lidar.R);
+      scan_body, this->kfdb_gravity_q_, this->extrinsics.baselink2lidar.R,
+      this->sc_ground_height_threshold_);
 
   auto sc_desc = dlio::sc::computeScanContext(sc_scan, this->sc_max_range_);
+  auto query_sector_key = dlio::sc::computeSectorKey(sc_desc);
 
   // Raw likelihoods: invert SC distance (lower distance = better match = higher likelihood)
   // Two filters applied:
@@ -1069,7 +1054,10 @@ void dlio::OdomNode::continuousLocalize()
   int n_dist_rejected = 0;
   for (int i = 0; i < N; i++)
   {
-    auto [dist, shift] = dlio::sc::computeScanContextDistance(sc_desc, sc_snap[i].descriptor);
+    auto [dist, shift] = dlio::sc::computeScanContextDistance(
+        sc_desc, sc_snap[i].descriptor,
+        query_sector_key, sc_snap[i].sector_key,
+        this->sc_search_window_);
     sc_distances[i] = dist;
     sc_shifts[i] = shift;
 
@@ -1256,20 +1244,23 @@ void dlio::OdomNode::continuousLocalize()
   int best_kf_idx = top_candidates.empty() ? 0 : top_candidates[0].kf_idx;
   float best_kf_posterior = top_candidates.empty() ? 0.0f : top_candidates[0].posterior;
 
-  RCLCPP_INFO(this->get_logger(),
-              "[bayes] SC: best=%.4f(kf%d,d=%.3f) worst=%.4f dist_rej=%d topK=%d | "
-              "Angeli: mean=%.4f std=%.4f promoted=%d/%d | "
-              "P_vp=%.4f P_loop=%.4f best_kf=%d(P=%.4f) prior_vp=%.4f thr=%.2f consec=%d/%d",
-              best_raw, best_raw_idx, sc_distances[best_raw_idx], worst_raw,
-              n_dist_rejected, this->bayes_sc_top_k_,
-              angeli_mean, angeli_stddev, num_promoted, N,
-              bayes_snap[0], P_loop, best_kf_idx, best_kf_posterior,
-              prior[0], this->bayes_loop_threshold_,
-              bayes_consec, this->bayes_min_consecutive_);
+  if (this->debug_)
+    RCLCPP_INFO(this->get_logger(),
+                "[bayes] SC: best=%.4f(kf%d,d=%.3f) worst=%.4f dist_rej=%d topK=%d | "
+                "Angeli: mean=%.4f std=%.4f promoted=%d/%d | "
+                "P_vp=%.4f P_loop=%.4f best_kf=%d(P=%.4f) prior_vp=%.4f thr=%.2f consec=%d/%d",
+                best_raw, best_raw_idx, sc_distances[best_raw_idx], worst_raw,
+                n_dist_rejected, this->bayes_sc_top_k_,
+                angeli_mean, angeli_stddev, num_promoted, N,
+                bayes_snap[0], P_loop, best_kf_idx, best_kf_posterior,
+                prior[0], this->bayes_loop_threshold_,
+                bayes_consec, this->bayes_min_consecutive_);
 
-  if (P_loop <= this->bayes_loop_threshold_)
+  bool p_loop_pass = (P_loop > this->bayes_loop_threshold_);
+
+  if (!p_loop_pass)
   {
-    // Virtual place wins — no correction, reset consecutive
+    // Virtual place wins — no GICP needed. SC++ Stage 2 requires P_loop > threshold.
     bayes_consec = 0;
 
     // Write back Bayesian state
@@ -1279,7 +1270,6 @@ void dlio::OdomNode::continuousLocalize()
       this->bayes_consecutive_accepts_ = bayes_consec;
     }
 
-    // Publish low confidence: P_loop scaled down (not in a recognized place)
     this->last_confidence_ = P_loop * 0.5f;
     if (this->confidence_pub_)
     {
@@ -1290,15 +1280,13 @@ void dlio::OdomNode::continuousLocalize()
     return;
   }
 
-  // ── GICP verification: Two-stage approach ──────────────────────────────
+  // ── GICP verification (SC++ pipeline) ──────────────────────────────────
   //
-  // Stage 1 (drift correction): Try GICP at current estimated position.
-  //   Produces small corrections that fix accumulated odom drift.
-  //
-  // Stage 2 (relocalization): If Stage 1 fails AND estimated position is
-  //   far from the Bayesian winner keyframe, try GICP at the keyframe's
-  //   position. This handles random initialization / large position error.
-  //   Relocalization requires more consecutive accepts (3 vs 2).
+  // Stage 1 (drift correction): GICP at current estimated position.
+  // Stage 2 (SC++ relocalization): If Stage 1 fails, try top-K Bayesian
+  //   candidates × 6 yaw offsets (SC shift → base yaw).
+  // Stage 3 (consistency check): Re-run GICP from Stage 2 result to catch
+  //   false positives (GICP local minima).
 
   Eigen::Matrix4f T_map_odom_cur = T_map_odom_snap;
   Eigen::Matrix4f T_body_lidar = this->extrinsics.baselink2lidar_T; // lidar→body
@@ -1306,10 +1294,6 @@ void dlio::OdomNode::continuousLocalize()
   Eigen::Matrix4f T_map_body_est = T_map_odom_cur * T_odom_body;
   Eigen::Matrix4f T_map_lidar_est = T_map_body_est * T_body_lidar; // lidar→body→odom→map
   Eigen::Vector3f est_pos = T_map_body_est.block<3, 1>(0, 3);
-
-  // Number of keyframe candidates to try in Stage 2 (relocalization)
-  int max_reloc_candidates = std::min(static_cast<int>(top_candidates.size()),
-                                      std::max(this->bayes_sc_top_k_, 3));
 
   // GICP at a given search center + initial guess. Returns success, result transform, fitness.
   auto tryGICP = [&](const Eigen::Vector3f &center, const Eigen::Matrix4f &init_guess,
@@ -1326,14 +1310,12 @@ void dlio::OdomNode::continuousLocalize()
 
     if (nn_indices.size() < 50)
     {
-      RCLCPP_WARN(this->get_logger(),
-                  "[bayes] tryGICP FAIL: too few neighbors=%zu (need 200) at [%.1f,%.1f,%.1f], prior_map=%zu pts",
-                  nn_indices.size(), center[0], center[1], center[2], prior_cloud_snap->size());
+      if (this->debug_)
+        RCLCPP_WARN(this->get_logger(),
+                    "[bayes] tryGICP FAIL: too few neighbors=%zu at [%.1f,%.1f,%.1f], prior_map=%zu pts",
+                    nn_indices.size(), center[0], center[1], center[2], prior_cloud_snap->size());
       return false;
     }
-
-    RCLCPP_INFO(this->get_logger(), "[bayes] tryGICP: %zu neighbors in 35m radius at [%.1f,%.1f,%.1f]",
-                nn_indices.size(), center[0], center[1], center[2]);
 
     pcl::PointCloud<PointType>::Ptr local_map = std::make_shared<pcl::PointCloud<PointType>>();
     local_map->points.resize(nn_indices.size());
@@ -1392,29 +1374,31 @@ void dlio::OdomNode::continuousLocalize()
 
     if (!converged)
     {
-      RCLCPP_WARN(this->get_logger(),
-                  "[bayes] tryGICP FAIL: not converged at [%.1f,%.1f,%.1f], scan=%zu pts, local_map=%zu pts",
-                  center[0], center[1], center[2], scan_body->size(), local_map->size());
+      if (this->debug_)
+        RCLCPP_WARN(this->get_logger(),
+                    "[bayes] tryGICP FAIL: not converged at [%.1f,%.1f,%.1f], scan=%zu pts, local_map=%zu pts",
+                    center[0], center[1], center[2], scan_body->size(), local_map->size());
       return false;
     }
 
     if (result_fitness > this->continuous_localize_fitness_thresh_)
     {
-      RCLCPP_WARN(this->get_logger(),
-                  "[bayes] tryGICP FAIL: fitness=%.4f > thresh=%.4f at [%.1f,%.1f,%.1f], scan=%zu, local_map=%zu",
-                  result_fitness, this->continuous_localize_fitness_thresh_,
-                  center[0], center[1], center[2], scan_body->size(), local_map->size());
+      if (this->debug_)
+        RCLCPP_WARN(this->get_logger(),
+                    "[bayes] tryGICP FAIL: fitness=%.4f > thresh=%.4f at [%.1f,%.1f,%.1f], scan=%zu, local_map=%zu",
+                    result_fitness, this->continuous_localize_fitness_thresh_,
+                    center[0], center[1], center[2], scan_body->size(), local_map->size());
       return false;
     }
 
     // Displacement check: reject if GICP moved too far from init guess
-    // GICP should refine, not jump. Large displacement = likely wrong local minimum.
     float disp = (result_T.block<3, 1>(0, 3) - init_guess.block<3, 1>(0, 3)).norm();
     if (disp > 10.0f)
     {
-      RCLCPP_WARN(this->get_logger(),
-                  "[bayes] tryGICP FAIL: displacement=%.2fm > 10m from init guess at [%.1f,%.1f,%.1f]",
-                  disp, center[0], center[1], center[2]);
+      if (this->debug_)
+        RCLCPP_WARN(this->get_logger(),
+                    "[bayes] tryGICP FAIL: displacement=%.2fm > 10m from init guess at [%.1f,%.1f,%.1f]",
+                    disp, center[0], center[1], center[2]);
       return false;
     }
 
@@ -1428,96 +1412,135 @@ void dlio::OdomNode::continuousLocalize()
 
   // ── Stage 1: GICP at estimated position (drift correction) ──
   // scan_body is in lidar frame → init_guess must be T_map←lidar
-  gicp_ok = tryGICP(est_pos, T_map_lidar_est, T_map_lidar_gicp, fitness);
-
-  if (gicp_ok)
   {
-    RCLCPP_INFO(this->get_logger(), "[bayes] Stage1 GICP OK: fitness=%.4f at est=[%.1f,%.1f,%.1f]",
-                fitness, est_pos[0], est_pos[1], est_pos[2]);
+    gicp_ok = tryGICP(est_pos, T_map_lidar_est, T_map_lidar_gicp, fitness);
+
+    if (gicp_ok)
+    {
+      if (this->debug_)
+        RCLCPP_INFO(this->get_logger(), "[bayes] Stage1 GICP OK: fitness=%.4f at est=[%.1f,%.1f,%.1f]",
+                    fitness, est_pos[0], est_pos[1], est_pos[2]);
+    }
   }
 
-  // ── Stage 2: GICP at top keyframe candidates (relocalization fallback) ──
-  //   Try multiple candidates by posterior rank until one converges.
-  //   Uses SC column shift to derive heading (yaw), tries multiple yaw offsets.
-  //   Only active when enable_global_correction is true.
+  // ── Stage 2: SC++ top-K candidate relocalization ──────────────────────
+  //   Uses Bayesian-ranked top candidates from SC++ matching.
+  //   For each candidate: SC shift → base yaw, try 6 yaw offsets, GICP.
+  //   Requires P_loop > threshold AND enable_global_correction.
   if (!gicp_ok && this->enable_global_correction_.load())
   {
-    // Yaw offsets to try around the SC-derived heading (handles SC sector quantization error)
-    const std::array<float, 3> yaw_offsets = {0.f, M_PI / 3.f, -M_PI / 3.f}; // 0°, +60°, -60°
+    if (this->debug_)
+      RCLCPP_INFO(this->get_logger(), "[bayes] Stage1 failed → SC++ Stage2 candidate search...");
 
-    for (int ci = 0; ci < max_reloc_candidates && !gicp_ok; ci++)
+    // Extract roll/pitch from IMU (reliable), will test different yaws
+    Eigen::Matrix3f R_est = T_map_body_est.block<3, 3>(0, 0);
+    float est_yaw = std::atan2(R_est(1, 0), R_est(0, 0));
+    Eigen::Quaternionf q_est(R_est);
+    Eigen::Quaternionf q_yaw_inv(Eigen::AngleAxisf(-est_yaw, Eigen::Vector3f::UnitZ()));
+    Eigen::Quaternionf q_rp = q_yaw_inv * q_est; // roll+pitch only
+
+    const float yaw_offsets[] = {0.f, M_PI / 3.f, 2.f * M_PI / 3.f, M_PI, -2.f * M_PI / 3.f, -M_PI / 3.f};
+
+    int n_stage2_candidates = std::min(5, static_cast<int>(top_candidates.size()));
+    float best_stage2_fitness = std::numeric_limits<float>::max();
+
+    for (int ci = 0; ci < n_stage2_candidates; ci++)
     {
       int kf_idx = top_candidates[ci].kf_idx;
-      Eigen::Vector3f kf_pos = sc_snap[kf_idx].position;
-      float est_kf_dist = (est_pos - kf_pos).norm();
-
-      if (est_kf_dist <= 1.0f)
-        continue; // too close to estimated pos, Stage 1 already tried this area
-
-      // SC shift → yaw angle: the heading difference between current scan and this keyframe
+      Eigen::Vector3f cand_pos = sc_snap[kf_idx].position;
       float sc_yaw = static_cast<float>(top_candidates[ci].sc_shift) * 2.f * M_PI / static_cast<float>(dlio::sc::SC_NS);
 
-      // Keyframe orientation (yaw in map frame)
-      // If orientation is Identity (chunk-based fallback, no KFDB), kf_yaw=0
-      // and sc_yaw alone acts as absolute heading estimate.
-      Eigen::Quaternionf kf_q = sc_snap[kf_idx].orientation;
-      float kf_yaw = 0.f;
-      if (std::abs(kf_q.w() - 1.0f) > 1e-4f || kf_q.vec().norm() > 1e-4f)
+      for (float yaw_offset : yaw_offsets)
       {
-        Eigen::Matrix3f kf_rot = kf_q.toRotationMatrix();
-        kf_yaw = std::atan2(kf_rot(1, 0), kf_rot(0, 0));
-      }
+        float yaw = sc_yaw + yaw_offset;
+        Eigen::Quaternionf q_full = Eigen::Quaternionf(Eigen::AngleAxisf(yaw, Eigen::Vector3f::UnitZ())) * q_rp;
 
-      // Try multiple heading hypotheses around SC-derived yaw
-      for (const float &yaw_off : yaw_offsets)
-      {
-        if (gicp_ok)
-          break;
+        Eigen::Matrix4f init_guess = Eigen::Matrix4f::Identity();
+        init_guess.block<3, 3>(0, 0) = q_full.toRotationMatrix();
+        init_guess.block<3, 1>(0, 3) = cand_pos;
+        init_guess = init_guess * T_body_lidar; // body→lidar for lidar-frame scan
 
-        float candidate_yaw = kf_yaw + sc_yaw + yaw_off;
-        Eigen::Quaternionf yaw_q(Eigen::AngleAxisf(candidate_yaw, Eigen::Vector3f::UnitZ()));
+        Eigen::Matrix4f result_T;
+        float result_fit = 0.f;
+        bool ok = tryGICP(cand_pos, init_guess, result_T, result_fit);
 
-        // Use gravity-aligned roll/pitch from IMU, but yaw from SC
-        Eigen::Matrix3f R_est = T_map_body_est.block<3, 3>(0, 0);
-        // Extract roll/pitch from IMU estimate (gravity alignment is reliable)
-        Eigen::Vector3f euler = R_est.eulerAngles(2, 1, 0); // ZYX: yaw, pitch, roll
-        Eigen::Quaternionf rp_q = Eigen::Quaternionf(
-            Eigen::AngleAxisf(euler[1], Eigen::Vector3f::UnitY()) *
-            Eigen::AngleAxisf(euler[2], Eigen::Vector3f::UnitX()));
-        Eigen::Quaternionf init_q = yaw_q * rp_q;
-
-        Eigen::Matrix4f kf_init = Eigen::Matrix4f::Identity();
-        kf_init.block<3, 3>(0, 0) = init_q.toRotationMatrix();
-        kf_init.block<3, 1>(0, 3) = kf_pos;
-        kf_init = kf_init * T_body_lidar; // body→lidar extrinsic for lidar-frame scan
-
-        gicp_ok = tryGICP(kf_pos, kf_init, T_map_lidar_gicp, fitness);
-
-        if (gicp_ok)
+        if (ok && result_fit < best_stage2_fitness)
         {
+          best_stage2_fitness = result_fit;
+          T_map_lidar_gicp = result_T;
+          fitness = result_fit;
+          gicp_ok = true;
           is_reloc = true;
-          best_kf_idx = kf_idx;
-          RCLCPP_INFO(this->get_logger(),
-                      "[bayes] Stage2 RELOC GICP OK: fitness=%.4f at candidate #%d kf%d=[%.1f,%.1f,%.1f] "
-                      "sc_yaw=%.1fdeg yaw_off=%.1fdeg (est was [%.1f,%.1f,%.1f], dist=%.1fm)",
-                      fitness, ci, kf_idx, kf_pos[0], kf_pos[1], kf_pos[2],
-                      sc_yaw * 180.f / M_PI, yaw_off * 180.f / M_PI,
-                      est_pos[0], est_pos[1], est_pos[2], est_kf_dist);
-        }
-      }
 
-      if (!gicp_ok)
-      {
-        RCLCPP_INFO(this->get_logger(),
-                    "[bayes] Stage2 candidate #%d kf%d GICP failed at [%.1f,%.1f,%.1f] (3 yaw attempts)",
-                    ci, kf_idx, kf_pos[0], kf_pos[1], kf_pos[2]);
+          if (this->debug_)
+            RCLCPP_INFO(this->get_logger(),
+                        "[bayes] Stage2 HIT: kf=%d fitness=%.4f sc_yaw=%.0fdeg at [%.1f,%.1f,%.1f]",
+                        kf_idx, result_fit, yaw * 180.f / M_PI,
+                        cand_pos[0], cand_pos[1], cand_pos[2]);
+
+          // Early exit on excellent fitness
+          if (result_fit < 0.05f)
+            goto stage2_done;
+        }
       }
     }
 
-    if (!gicp_ok)
+  stage2_done:
+    if (gicp_ok)
     {
-      RCLCPP_INFO(this->get_logger(),
-                  "[bayes] GICP failed at est and all %d reloc candidates (×3 yaw each)", max_reloc_candidates);
+      if (this->debug_)
+        RCLCPP_INFO(this->get_logger(), "[bayes] Stage2 SC++ RELOC OK: fitness=%.4f", fitness);
+    }
+    else
+    {
+      if (this->debug_)
+        RCLCPP_INFO(this->get_logger(), "[bayes] Stage2 SC++ failed — no match (%d candidates × 6 yaw)",
+                    n_stage2_candidates);
+    }
+  }
+
+  // ── Stage 3: Consistency verification (re-run GICP from Stage 2 result) ──
+  //   Catches GICP false positives (local minima that pass fitness but are wrong).
+  //   Re-runs GICP using the Stage 2 result as init guess → result should be
+  //   consistent (within 2m and fitness ≤ 1.5× original).
+  if (gicp_ok && is_reloc)
+  {
+    Eigen::Vector3f stage2_pos = T_map_lidar_gicp.block<3, 1>(0, 3);
+    Eigen::Matrix4f verify_T;
+    float verify_fitness = 0.f;
+
+    bool verify_ok = tryGICP(stage2_pos, T_map_lidar_gicp, verify_T, verify_fitness);
+
+    if (verify_ok)
+    {
+      float verify_disp = (verify_T.block<3, 1>(0, 3) - T_map_lidar_gicp.block<3, 1>(0, 3)).norm();
+      bool consistent = (verify_disp < 2.0f) && (verify_fitness <= fitness * 1.5f + 0.01f);
+
+      if (consistent)
+      {
+        if (this->debug_)
+          RCLCPP_INFO(this->get_logger(),
+                      "[bayes] Stage3 verification PASS: disp=%.2fm verify_fit=%.4f orig_fit=%.4f",
+                      verify_disp, verify_fitness, fitness);
+        // Use the verification result (refined from Stage 2)
+        T_map_lidar_gicp = verify_T;
+        fitness = verify_fitness;
+      }
+      else
+      {
+        if (this->debug_)
+          RCLCPP_WARN(this->get_logger(),
+                      "[bayes] Stage3 verification INCONSISTENT: disp=%.2fm verify_fit=%.4f orig_fit=%.4f — rejecting",
+                      verify_disp, verify_fitness, fitness);
+        gicp_ok = false;
+      }
+    }
+    else
+    {
+      if (this->debug_)
+        RCLCPP_WARN(this->get_logger(),
+                    "[bayes] Stage3 verification FAIL: re-GICP failed — rejecting Stage2 result");
+      gicp_ok = false;
     }
   }
 
@@ -1584,28 +1607,38 @@ void dlio::OdomNode::continuousLocalize()
       this->bayes_consecutive_accepts_ = bayes_consec;
     }
 
-    RCLCPP_WARN(this->get_logger(),
-                "[bayes] correction too large (dist=%.3fm, angle=%.1f deg), confidence=%.2f, rejected",
-                correction_dist, correction_angle, confidence);
+    if (this->debug_)
+      RCLCPP_WARN(this->get_logger(),
+                  "[bayes] correction too large (dist=%.3fm, angle=%.1f deg), confidence=%.2f, rejected",
+                  correction_dist, correction_angle, confidence);
     return;
   }
 
-  RCLCPP_INFO(this->get_logger(),
-              "[bayes] GICP PASS%s: kf=%d fitness=%.4f conf=%.2f dist=%.3fm angle=%.1fdeg",
-              is_reloc ? " (RELOC)" : "", best_kf_idx, fitness, confidence,
-              correction_dist, correction_angle);
+  if (this->debug_)
+    RCLCPP_INFO(this->get_logger(),
+                "[bayes] GICP PASS%s: kf=%d fitness=%.4f conf=%.2f dist=%.3fm angle=%.1fdeg",
+                is_reloc ? " (RELOC)" : "", best_kf_idx, fitness, confidence,
+                correction_dist, correction_angle);
 
-  // ── g2o pose graph verification ─────────────────────────────────────
+  // ── Acceptance logic ────────────────────────────────────────────────
   //
-  // Build pose graph with: session keyframes (odom chain) + prior map anchors
-  // + proposed loop edge. If loop chi2 is too high → GICP matched at wrong
-  // place (contradicts odometry + map structure). Reject.
+  // SC++ Stage 2 relocalization: consecutive acceptance (Stage 3 already
+  //   verified consistency, so use consecutive count for safety).
   //
-  // Fallback to consecutive acceptance when g2o is disabled or too few keyframes.
+  // Stage 1 drift correction: g2o verification (if enabled) or consecutive.
 
   bool accepted = false;
 
-  if (this->g2o_verification_enabled_)
+  if (is_reloc)
+  {
+    // SC++ Stage 2 relocalization: Stage 3 verified, use consecutive for safety
+    bayes_consec++;
+    accepted = (bayes_consec >= required_consecutive);
+    if (this->debug_)
+      RCLCPP_INFO(this->get_logger(),
+                  "[bayes] RELOC consecutive=%d/%d", bayes_consec, required_consecutive);
+  }
+  else if (this->g2o_verification_enabled_)
   {
     double chi2 = 0.0;
     int num_anchors = 0;
@@ -1615,27 +1648,27 @@ void dlio::OdomNode::continuousLocalize()
 
     if (num_anchors == 0)
     {
-      // No anchors = trajectory not yet overlapping with prior map
-      // (random init / first relocalization). g2o can't verify.
-      // Fall back to consecutive acceptance.
       bayes_consec++;
       accepted = (bayes_consec >= required_consecutive);
-      RCLCPP_INFO(this->get_logger(),
-                  "[bayes] g2o: no anchors (init?), fallback consecutive=%d/%d",
-                  bayes_consec, required_consecutive);
+      if (this->debug_)
+        RCLCPP_INFO(this->get_logger(),
+                    "[bayes] g2o: no anchors (init?), fallback consecutive=%d/%d",
+                    bayes_consec, required_consecutive);
     }
     else if (g2o_ok)
     {
       accepted = true;
-      RCLCPP_INFO(this->get_logger(),
-                  "[bayes] g2o ACCEPTED (chi2=%.4f < %.1f, anchors=%d)",
-                  chi2, this->g2o_chi2_threshold_, num_anchors);
+      if (this->debug_)
+        RCLCPP_INFO(this->get_logger(),
+                    "[bayes] g2o ACCEPTED (chi2=%.4f < %.1f, anchors=%d)",
+                    chi2, this->g2o_chi2_threshold_, num_anchors);
     }
     else
     {
-      RCLCPP_INFO(this->get_logger(),
-                  "[bayes] g2o REJECTED (chi2=%.4f > %.1f, anchors=%d)",
-                  chi2, this->g2o_chi2_threshold_, num_anchors);
+      if (this->debug_)
+        RCLCPP_INFO(this->get_logger(),
+                    "[bayes] g2o REJECTED (chi2=%.4f > %.1f, anchors=%d)",
+                    chi2, this->g2o_chi2_threshold_, num_anchors);
     }
   }
   else
@@ -1644,8 +1677,9 @@ void dlio::OdomNode::continuousLocalize()
     bayes_consec++;
     accepted = (bayes_consec >= required_consecutive);
 
-    RCLCPP_INFO(this->get_logger(),
-                "[bayes] consecutive=%d/%d", bayes_consec, required_consecutive);
+    if (this->debug_)
+      RCLCPP_INFO(this->get_logger(),
+                  "[bayes] consecutive=%d/%d", bayes_consec, required_consecutive);
   }
 
   if (accepted)
@@ -1666,10 +1700,11 @@ void dlio::OdomNode::continuousLocalize()
 
   if (accepted)
   {
-    RCLCPP_INFO(this->get_logger(),
-                "[bayes] >>> ACCEPTED %s correction (dist=%.3fm, angle=%.1f deg, fitness=%.4f, confidence=%.2f, P_loop=%.3f)",
-                is_reloc ? "RELOCALIZATION" : "map->odom",
-                correction_dist, correction_angle, fitness, confidence, P_loop);
+    if (this->debug_)
+      RCLCPP_INFO(this->get_logger(),
+                  "[bayes] >>> ACCEPTED %s correction (dist=%.3fm, angle=%.1f deg, fitness=%.4f, confidence=%.2f, P_loop=%.3f)",
+                  is_reloc ? "RELOCALIZATION" : "map->odom",
+                  correction_dist, correction_angle, fitness, confidence, P_loop);
   }
 }
 
@@ -1901,11 +1936,12 @@ bool dlio::OdomNode::verifyLoopWithG2O(
   // ── Check chi2 ──
   out_chi2 = loop_edge->chi2();
 
-  RCLCPP_INFO(this->get_logger(),
-              "[bayes] g2o: loop_chi2=%.4f anchors=%d vertices=%d edges=%d",
-              out_chi2, num_anchors,
-              static_cast<int>(optimizer.vertices().size()),
-              static_cast<int>(optimizer.edges().size()));
+  if (this->debug_)
+    RCLCPP_INFO(this->get_logger(),
+                "[bayes] g2o: loop_chi2=%.4f anchors=%d vertices=%d edges=%d",
+                out_chi2, num_anchors,
+                static_cast<int>(optimizer.vertices().size()),
+                static_cast<int>(optimizer.edges().size()));
 
   out_num_anchors = num_anchors;
   return out_chi2 < this->g2o_chi2_threshold_;
@@ -1963,11 +1999,12 @@ void dlio::OdomNode::publishOccupancyGrid()
     else if (v >= 50)
       occ_cells++;
   }
-  RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-                       "[ogm] pts=%zu origin=(%.1f,%.1f) sensor=(%.1f,%.1f,%.1f) free=%d occ=%d frame=%s",
-                       scan_world->size(), og_msg.info.origin.position.x, og_msg.info.origin.position.y,
-                       sensor_origin.x(), sensor_origin.y(), sensor_origin.z(),
-                       free_cells, occ_cells, og_msg.header.frame_id.c_str());
+  if (this->debug_)
+    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                         "[ogm] pts=%zu origin=(%.1f,%.1f) sensor=(%.1f,%.1f,%.1f) free=%d occ=%d frame=%s",
+                         scan_world->size(), og_msg.info.origin.position.x, og_msg.info.origin.position.y,
+                         sensor_origin.x(), sensor_origin.y(), sensor_origin.z(),
+                         free_cells, occ_cells, og_msg.header.frame_id.c_str());
 
   this->occupancy_grid_pub_->publish(std::move(og_msg));
 }

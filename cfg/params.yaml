@@ -14,9 +14,9 @@
   ros__parameters:
     use_sim_time: true
 
-    debug/odom: true
+    debug/odom: false
     debug/graph_slam: false
-    debug/print_odom: false # Activate this to print odometry like default DLIO
+    debug/print_odom: true # Activate this to print odometry like default DLIO
 
     frames/odom: odom
     frames/baselink: base_link
@@ -40,10 +40,12 @@
     map/initial_pose/z: 0.0
     map/initial_pose/yaw: 0.0
     map/relocalize: true
-    map/relocalize/sc_max_range: 40.0
+    map/relocalize/sc_max_range: 150.0
     map/relocalize/sc_num_candidates: 50
     map/relocalize/sc_distance_threshold: 2.0
     map/relocalize/sc_max_attempts: 10
+    map/relocalize/sc_ground_height_threshold: 0.3 # meters, 0 = disabled. Removes flat ground for more discriminative SC
+    map/relocalize/sc_search_window: 7 # SC++ sector key search window (±3 shifts around coarse alignment)
 
     map/continuous_localize: true
     map/continuous_localize/interval: 2.0

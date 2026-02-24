@@ -566,6 +566,10 @@ void dlio::OdomNode::getParams()
   dlio::declare_param(this, "map/relocalize/sc_num_candidates", this->sc_num_candidates_, 10);
   dlio::declare_param(this, "map/relocalize/sc_distance_threshold", this->sc_distance_threshold_, 0.3);
   dlio::declare_param(this, "map/relocalize/sc_max_attempts", this->sc_max_attempts_, 10);
+  double sc_ground_ht = 0.3;
+  dlio::declare_param(this, "map/relocalize/sc_ground_height_threshold", sc_ground_ht, 0.3);
+  this->sc_ground_height_threshold_ = static_cast<float>(sc_ground_ht);
+  dlio::declare_param(this, "map/relocalize/sc_search_window", this->sc_search_window_, 7);
 
   // Continuous localization (Bayesian)
   dlio::declare_param(this, "map/continuous_localize", this->continuous_localize_, true);

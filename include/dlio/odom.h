@@ -505,6 +505,8 @@ private:
   double sc_distance_threshold_;
   int sc_max_attempts_;
   int sc_attempt_count_;
+  float sc_ground_height_threshold_; // ground removal height for SC (0 = disabled)
+  int sc_search_window_;             // SC++ local search window (default 7)
   double last_reloc_fitness_;
   std::vector<dlio::sc::ScanContextEntry> sc_database_;
   pcl::PointCloud<PointType>::Ptr prior_map_cloud_;

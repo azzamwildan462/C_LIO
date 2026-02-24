@@ -230,6 +230,7 @@ void dlio::OdomNode::buildScanContextDatabase()
     dlio::sc::ScanContextEntry entry;
     entry.descriptor = dlio::sc::computeScanContext(local_cloud, this->sc_max_range_);
     entry.ring_key = dlio::sc::computeRingKey(entry.descriptor);
+    entry.sector_key = dlio::sc::computeSectorKey(entry.descriptor);
     entry.position = centroid;
     entry.orientation = Eigen::Quaternionf::Identity();
     this->sc_database_.push_back(std::move(entry));
@@ -280,14 +281,17 @@ bool dlio::OdomNode::runRelocalization(pcl::PointCloud<PointType>::ConstPtr scan
 
   // 1. Rotate scan to gravity-aligned frame for SC matching
   RCLCPP_INFO(this->get_logger(),
-              "SC: using kfdb_gravity_q=[%.4f,%.4f,%.4f,%.4f]",
+              "SC: using kfdb_gravity_q=[%.4f,%.4f,%.4f,%.4f] ground_thresh=%.2f",
               this->kfdb_gravity_q_.w(), this->kfdb_gravity_q_.x(),
-              this->kfdb_gravity_q_.y(), this->kfdb_gravity_q_.z());
+              this->kfdb_gravity_q_.y(), this->kfdb_gravity_q_.z(),
+              this->sc_ground_height_threshold_);
   auto sc_scan = dlio::sc::prepareGravityAlignedScan(
-      raw_scan, this->kfdb_gravity_q_, this->extrinsics.baselink2lidar.R);
+      raw_scan, this->kfdb_gravity_q_, this->extrinsics.baselink2lidar.R,
+      this->sc_ground_height_threshold_);
 
   dlio::sc::ScanContextDescriptor query_desc = dlio::sc::computeScanContext(sc_scan, this->sc_max_range_);
   dlio::sc::RingKey query_key = dlio::sc::computeRingKey(query_desc);
+  dlio::sc::SectorKey query_sector_key = dlio::sc::computeSectorKey(query_desc);
 
   // Debug: SC descriptor stats
   {
@@ -344,7 +348,10 @@ bool dlio::OdomNode::runRelocalization(pcl::PointCloud<PointType>::ConstPtr scan
 
   for (size_t i = 0; i < this->sc_database_.size(); i++)
   {
-    auto [dist, shift] = dlio::sc::computeScanContextDistance(query_desc, this->sc_database_[i].descriptor);
+    auto [dist, shift] = dlio::sc::computeScanContextDistance(
+        query_desc, this->sc_database_[i].descriptor,
+        query_sector_key, this->sc_database_[i].sector_key,
+        this->sc_search_window_);
     sc_candidates.push_back({static_cast<int>(i), dist, shift});
   }
 
@@ -592,14 +599,16 @@ void dlio::OdomNode::computeAndStoreKeyframeSC()
     vf.filter(*raw_scan);
   }
 
-  // 2. Rotate to gravity-aligned frame for SC consistency
+  // 2. Rotate to gravity-aligned frame for SC consistency (with ground removal)
   auto sc_scan = dlio::sc::prepareGravityAlignedScan(
-      raw_scan, this->kfdb_gravity_q_, this->extrinsics.baselink2lidar.R);
+      raw_scan, this->kfdb_gravity_q_, this->extrinsics.baselink2lidar.R,
+      this->sc_ground_height_threshold_);
 
-  // 3. Compute SC descriptor and ring key
+  // 3. Compute SC descriptor, ring key, and sector key (SC++)
   dlio::sc::ScanContextEntry entry;
   entry.descriptor = dlio::sc::computeScanContext(sc_scan, this->sc_max_range_);
   entry.ring_key = dlio::sc::computeRingKey(entry.descriptor);
+  entry.sector_key = dlio::sc::computeSectorKey(entry.descriptor);
   entry.position = this->lidarPose.p;
   entry.orientation = this->lidarPose.q;
 

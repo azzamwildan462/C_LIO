@@ -220,6 +220,9 @@ namespace dlio::kfdb
       ifs.read(reinterpret_cast<char *>(entry.ring_key.data()),
                dlio::sc::SC_NR * sizeof(float));
 
+      // SC++: derive sector key from descriptor (backward compatible, no format change)
+      entry.sector_key = dlio::sc::computeSectorKey(entry.descriptor);
+
       database.push_back(std::move(entry));
     }
 
