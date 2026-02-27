@@ -326,6 +326,82 @@ void dlio::OdomNode::srvSetMode(
     g_odom_node.store(nullptr);
   }
 
+  // If switching to mapping: seed kfdb_entries_ from loaded sc_database_
+  // so that saves include all prior entries + new ones
+  if (req->mode == "mapping")
+  {
+    std::lock_guard<std::mutex> lock(this->kfdb_mutex_);
+    if (this->kfdb_entries_.empty() && !this->sc_database_.empty())
+    {
+      this->kfdb_entries_ = this->sc_database_;
+      RCLCPP_INFO(this->get_logger(),
+                  "[SetMode] Seeded kfdb_entries_ with %zu entries from loaded KFDB",
+                  this->kfdb_entries_.size());
+    }
+  }
+
+  // If starting in mapping mode with existing KFDB, load and seed
+  if (req->mode == "mapping" && !this->map_path_.empty())
+  {
+    std::lock_guard<std::mutex> lock(this->kfdb_mutex_);
+    if (this->kfdb_entries_.empty())
+    {
+      std::string kfdb_path = this->getKfdbPath();
+      float file_max_range = this->sc_max_range_;
+      Eigen::Quaternionf file_gravity_q = this->kfdb_gravity_q_;
+      std::vector<dlio::sc::ScanContextEntry> loaded;
+      if (dlio::kfdb::load(kfdb_path, loaded, file_max_range, file_gravity_q))
+      {
+        this->kfdb_entries_ = std::move(loaded);
+        this->kfdb_gravity_q_ = file_gravity_q;
+        if (std::abs(file_max_range - this->sc_max_range_) > 0.1f)
+          this->sc_max_range_ = file_max_range;
+        RCLCPP_INFO(this->get_logger(),
+                    "[Mapping] Loaded %zu existing KFDB entries for incremental mapping",
+                    this->kfdb_entries_.size());
+      }
+    }
+  }
+
+  // Enable continuous localization in mapping mode (drift correction against prior map)
+  if (req->mode == "mapping" && this->continuous_localize_ &&
+      this->continuous_localize_on_mapping_ && this->use_prior_map_)
+  {
+    this->relocalized_ = true; // position known from localization phase
+
+    if (!this->continuous_localize_timer_)
+    {
+      this->continuous_localize_timer_ = this->create_wall_timer(
+          std::chrono::duration<double>(this->continuous_localize_interval_),
+          std::bind(&dlio::OdomNode::continuousLocalize, this));
+
+      if (!this->confidence_pub_)
+        this->confidence_pub_ = this->create_publisher<std_msgs::msg::Float32>("localization_confidence", 10);
+
+      if (!this->global_correction_sub_)
+      {
+        this->global_correction_sub_ = this->create_subscription<std_msgs::msg::Bool>(
+            "enable_global_correction", 10,
+            [this](const std_msgs::msg::Bool::SharedPtr msg)
+            {
+              bool prev = this->enable_global_correction_.load();
+              this->enable_global_correction_.store(msg->data);
+              if (prev != msg->data)
+              {
+                RCLCPP_INFO(this->get_logger(), "[bayes] global correction %s",
+                            msg->data ? "ENABLED" : "DISABLED (drift-only mode)");
+                if (!msg->data)
+                  this->bayes_consecutive_accepts_ = 0;
+              }
+            });
+      }
+
+      RCLCPP_INFO(this->get_logger(),
+                  "[SetMode] Continuous localization enabled for mapping mode (interval=%.1fs)",
+                  this->continuous_localize_interval_);
+    }
+  }
+
   res->success = true;
   res->message = "Mode changed from '" + old_mode + "' to '" + req->mode + "'";
   res->current_mode = this->map_mode_;

@@ -14,8 +14,8 @@
   ros__parameters:
     use_sim_time: true
 
-    debug/odom: true
-    debug/graph_slam: false
+    debug/odom: false
+    debug/graph_slam: true
     debug/print_odom: false # Activate this to print odometry like default DLIO
 
     frames/map: map
@@ -48,8 +48,9 @@
     map/relocalize/sc_search_window: 7 # SC++ sector key search window (±3 shifts around coarse alignment)
 
     map/continuous_localize: true
+    map/continuous_localize/on_mapping: false # also run during mapping mode (drift correction vs prior map)
     map/continuous_localize/interval: 2.0
-    map/continuous_localize/fitness_threshold: 0.15
+    map/continuous_localize/fitness_threshold: 0.10
     map/continuous_localize/virtual_place_prior: 0.8
     map/continuous_localize/loop_threshold: 0.5
     map/continuous_localize/min_consecutive: 2
@@ -58,7 +59,7 @@
     map/continuous_localize/sc_distance_threshold: 1.0
     map/continuous_localize/sc_top_k: 3
     map/continuous_localize/g2o_verification: true
-    map/continuous_localize/g2o_chi2_threshold: 50.0
+    map/continuous_localize/g2o_chi2_threshold: 1.0
     map/continuous_localize/g2o_iterations: 10
 
     odom/gravity: 9.80665
@@ -79,7 +80,7 @@
     odom/submap/keyframe/knn: 10
     odom/submap/keyframe/kcv: 10
     odom/submap/keyframe/kcc: 10
-    odom/registration_method: "gicp" # "gicp" or "ndt"
+    odom/registration_method: "ndt" # "gicp" or "ndt"
 
     odom/ndt/resolution: 1.0
     odom/ndt/num_threads: 4

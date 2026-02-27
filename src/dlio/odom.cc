@@ -363,8 +363,15 @@ dlio::OdomNode::OdomNode(const rclcpp::NodeOptions &options)
   this->bayes_consecutive_accepts_ = 0;
   this->bayes_posterior_.clear();
 
-  if (this->continuous_localize_ && this->use_prior_map_ && this->map_mode_ == "localization")
+  bool cl_enabled = this->continuous_localize_ && this->use_prior_map_ &&
+                    (this->map_mode_ == "localization" ||
+                     (this->map_mode_ == "mapping" && this->continuous_localize_on_mapping_));
+  if (cl_enabled)
   {
+    // In mapping mode with prior map, mark position as known so continuousLocalize() runs
+    if (this->map_mode_ == "mapping")
+      this->relocalized_ = true;
+
     this->continuous_localize_timer_ = this->create_wall_timer(
         std::chrono::duration<double>(this->continuous_localize_interval_),
         std::bind(&dlio::OdomNode::continuousLocalize, this));
@@ -396,7 +403,8 @@ dlio::OdomNode::OdomNode(const rclcpp::NodeOptions &options)
                         enable_global_default, true);
     this->enable_global_correction_.store(enable_global_default);
 
-    RCLCPP_INFO(this->get_logger(), "Continuous localization enabled: interval=%.1fs, fitness_thresh=%.2f, global_corr=%s",
+    RCLCPP_INFO(this->get_logger(), "Continuous localization enabled (%s mode): interval=%.1fs, fitness_thresh=%.2f, global_corr=%s",
+                this->map_mode_.c_str(),
                 this->continuous_localize_interval_, this->continuous_localize_fitness_thresh_,
                 enable_global_default ? "on" : "off");
   }
@@ -605,6 +613,7 @@ void dlio::OdomNode::getParams()
 
   // Continuous localization (Bayesian)
   dlio::declare_param(this, "map/continuous_localize", this->continuous_localize_, true);
+  dlio::declare_param(this, "map/continuous_localize/on_mapping", this->continuous_localize_on_mapping_, false);
   dlio::declare_param(this, "map/continuous_localize/interval", this->continuous_localize_interval_, 2.0);
   dlio::declare_param(this, "map/continuous_localize/fitness_threshold", this->continuous_localize_fitness_thresh_, 0.15);
   dlio::declare_param(this, "map/continuous_localize/max_correction", this->continuous_localize_max_correction_, 2.0);

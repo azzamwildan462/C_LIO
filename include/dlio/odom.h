@@ -531,6 +531,7 @@ private:
 
   // Continuous localization — Bayesian filter (RTAB-Map style)
   bool continuous_localize_;
+  bool continuous_localize_on_mapping_; // also run during mapping mode (drift correction vs prior map)
   double continuous_localize_interval_;
   double continuous_localize_fitness_thresh_;
   double continuous_localize_max_correction_;
