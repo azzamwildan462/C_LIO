@@ -114,6 +114,7 @@ add_library(dlio_odom_component SHARED
   src/dlio/odom_keyframes.cc
   src/dlio/odom_relocalization.cc
   src/dlio/odom_services.cc
+  src/dlio/odom_submap_localization.cc
   src/dlio/kfdb_io.cc
   src/dlio/occupancy_grid.cc
 )
@@ -148,7 +149,8 @@ add_library(dlio_graph_slam_component SHARED
 target_compile_options(dlio_graph_slam_component PRIVATE ${OpenMP_FLAGS})
 target_link_libraries(dlio_graph_slam_component
   ${PCL_LIBRARIES} ${OpenMP_LIBS} Threads::Threads nano_gicp ${cpp_typesupport_target}
-  g2o::core g2o::types_slam3d g2o::solver_eigen
+  g2o::core g2o::types_slam3d g2o::solver_eigen 
+  ${GeographicLib_LIBRARIES}
 )
 ament_target_dependencies(dlio_graph_slam_component
   rclcpp rclcpp_components pcl_ros pcl_conversions nav_msgs sensor_msgs geometry_msgs visualization_msgs ndt_omp_ros2

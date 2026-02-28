@@ -75,6 +75,7 @@ dlio::OdomNode::OdomNode(const rclcpp::NodeOptions &options)
   this->kf_pose_pub = this->create_publisher<geometry_msgs::msg::PoseArray>("kf_pose", 1);
   this->kf_cloud_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>("kf_cloud", 10);
   this->deskewed_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>("deskewed", 1);
+  this->deskewed_raw_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>("deskewed_raw", 1);
   this->kf_stamped_pub = this->create_publisher<direct_lidar_inertial_odometry::msg::KeyframeStamped>("kf_stamped", 10);
 
   this->br = std::make_shared<tf2_ros::TransformBroadcaster>(*this);
@@ -409,6 +410,20 @@ dlio::OdomNode::OdomNode(const rclcpp::NodeOptions &options)
                 enable_global_default ? "on" : "off");
   }
 
+  // Submap-based relocalization (GPS-denied alternative)
+  this->submap_loc_state_ = SubmapLocState::IDLE;
+  if (this->submap_loc_enabled_ && this->use_prior_map_ && this->map_mode_ == "localization")
+  {
+    this->initSubmapLocalization();
+    this->submap_loc_timer_ = this->create_wall_timer(
+        std::chrono::duration<double>(this->submap_loc_interval_),
+        std::bind(&dlio::OdomNode::submapLocalizeTick, this));
+    if (!this->confidence_pub_)
+      this->confidence_pub_ = this->create_publisher<std_msgs::msg::Float32>("localization_confidence", 10);
+    RCLCPP_INFO(this->get_logger(), "Submap relocalization enabled: interval=%.1fs, group_size=%d, search_radius=%.1fm",
+                this->submap_loc_interval_, this->submap_loc_group_size_, this->submap_loc_search_radius_);
+  }
+
   // Register atexit handler for KFDB saving (mapping mode)
   if (this->map_mode_ == "mapping" && !this->map_path_.empty())
   {
@@ -632,6 +647,25 @@ void dlio::OdomNode::getParams()
   dlio::declare_param(this, "map/continuous_localize/g2o_chi2_threshold", this->g2o_chi2_threshold_, 50.0);
   dlio::declare_param(this, "map/continuous_localize/g2o_iterations", this->g2o_iterations_, 10);
   dlio::declare_param(this, "frames/map", this->map_frame_, std::string("map"));
+
+  // Submap-based relocalization (GPS-denied)
+  dlio::declare_param(this, "map/submap_localize", this->submap_loc_enabled_, false);
+  dlio::declare_param(this, "map/submap_localize/interval", this->submap_loc_interval_, 2.0);
+  dlio::declare_param(this, "map/submap_localize/group_size", this->submap_loc_group_size_, 10);
+  dlio::declare_param(this, "map/submap_localize/search_radius", this->submap_loc_search_radius_, 50.0);
+  dlio::declare_param(this, "map/submap_localize/fitness_threshold", this->submap_loc_fitness_thresh_, 0.15);
+  dlio::declare_param(this, "map/submap_localize/prob_threshold", this->submap_loc_prob_threshold_, 0.6);
+  dlio::declare_param(this, "map/submap_localize/motion_error_threshold", this->submap_loc_motion_error_thresh_, 1.0);
+  dlio::declare_param(this, "map/submap_localize/motion_rot_threshold", this->submap_loc_motion_rot_thresh_, 5.0);
+  dlio::declare_param(this, "map/submap_localize/min_motion_validations", this->submap_loc_min_motion_valid_, 3);
+  dlio::declare_param(this, "map/submap_localize/prob_drop_threshold", this->submap_loc_prob_drop_thresh_, 0.3);
+  dlio::declare_param(this, "map/submap_localize/max_correction", this->submap_loc_max_correction_, 5.0);
+  {
+    double sc_thresh = 0.5;
+    dlio::declare_param(this, "map/submap_localize/sc_distance_threshold", sc_thresh, 0.5);
+    this->submap_loc_sc_dist_thresh_ = static_cast<float>(sc_thresh);
+  }
+  dlio::declare_param(this, "map/submap_localize/sc_accum_scans", this->submap_loc_sc_accum_scans_, 5);
 
   // GPS
   dlio::declare_param(this, "gps/enabled", this->gps_enabled_, false);

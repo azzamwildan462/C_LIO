@@ -394,8 +394,8 @@ void dlio::OdomNode::callbackPointCloud(const sensor_msgs::msg::PointCloud2::Sha
         this->bayes_consecutive_accepts_ = 0;
       }
 
-      // Free relocalization resources (keep map + SC database if continuous localization is on)
-      if (!this->continuous_localize_)
+      // Free relocalization resources (keep if continuous localization or submap localization needs them)
+      if (!this->continuous_localize_ && !this->submap_loc_enabled_)
       {
         std::lock_guard<std::mutex> lock(this->continuous_localize_mtx_);
         this->sc_database_.clear();
@@ -452,7 +452,7 @@ void dlio::OdomNode::callbackPointCloud(const sensor_msgs::msg::PointCloud2::Sha
         this->bayes_consecutive_accepts_ = 0;
       }
 
-      if (!this->continuous_localize_)
+      if (!this->continuous_localize_ && !this->submap_loc_enabled_)
       {
         std::lock_guard<std::mutex> lock(this->continuous_localize_mtx_);
         this->sc_database_.clear();
@@ -571,15 +571,17 @@ void dlio::OdomNode::callbackPointCloud(const sensor_msgs::msg::PointCloud2::Sha
   {
     published_cloud = this->deskewed_scan;
   }
+  // Capture raw (unfiltered) deskewed scan for graph SLAM SC computation
+  pcl::PointCloud<PointType>::ConstPtr raw_deskewed = this->deskewed_scan;
   // Publish to ROS (detached thread, publish_mtx_ prevents concurrent push_back on path_ros.poses)
-  this->publish_thread = std::thread(&dlio::OdomNode::publishToROS, this, published_cloud, this->T_corr);
+  this->publish_thread = std::thread(&dlio::OdomNode::publishToROS, this, published_cloud, raw_deskewed, this->T_corr);
   this->publish_thread.detach();
 
   // Store latest scan (sensor/body frame) + its T for continuous localization
   // IMPORTANT: use original_scan (sensor frame), NOT current_scan (odom/world frame).
   // The SC computation in continuousLocalize() assumes body-frame input and applies
   // its own gravity rotation. Using odom-frame scans causes double-rotation → SC fails.
-  if (this->continuous_localize_ || this->occupancy_grid_enabled_)
+  if (this->continuous_localize_ || this->occupancy_grid_enabled_ || this->submap_loc_enabled_)
   {
     std::lock_guard<std::mutex> lock(this->latest_scan_mtx_);
     this->latest_scan_ = this->original_scan;

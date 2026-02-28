@@ -64,9 +64,11 @@ void dlio::OdomNode::publishPose()
   }
 }
 
-void dlio::OdomNode::publishToROS(pcl::PointCloud<PointType>::ConstPtr published_cloud, Eigen::Matrix4f T_cloud)
+void dlio::OdomNode::publishToROS(pcl::PointCloud<PointType>::ConstPtr published_cloud,
+                                  pcl::PointCloud<PointType>::ConstPtr raw_deskewed_cloud,
+                                  Eigen::Matrix4f T_cloud)
 {
-  this->publishCloud(published_cloud, T_cloud);
+  this->publishCloud(published_cloud, raw_deskewed_cloud, T_cloud);
 
   // nav_msgs::msg::Path — use lidarPose directly (no smoothing)
   this->path_ros.header.stamp = this->imu_stamp;
@@ -142,7 +144,7 @@ void dlio::OdomNode::publishToROS(pcl::PointCloud<PointType>::ConstPtr published
   br->sendTransform(transformStamped);
 
   // transform: map to odom (continuous localization correction)
-  if (this->continuous_localize_)
+  if (this->continuous_localize_ || this->submap_loc_enabled_)
   {
     Eigen::Matrix4f T_m2o;
     {
@@ -170,7 +172,9 @@ void dlio::OdomNode::publishToROS(pcl::PointCloud<PointType>::ConstPtr published
   }
 }
 
-void dlio::OdomNode::publishCloud(pcl::PointCloud<PointType>::ConstPtr published_cloud, Eigen::Matrix4f T_cloud)
+void dlio::OdomNode::publishCloud(pcl::PointCloud<PointType>::ConstPtr published_cloud,
+                                  pcl::PointCloud<PointType>::ConstPtr raw_deskewed_cloud,
+                                  Eigen::Matrix4f T_cloud)
 {
 
   if (this->wait_until_move_)
@@ -191,6 +195,19 @@ void dlio::OdomNode::publishCloud(pcl::PointCloud<PointType>::ConstPtr published
   deskewed_ros->header.stamp = this->scan_header_stamp;
   deskewed_ros->header.frame_id = this->odom_frame;
   this->deskewed_pub->publish(std::move(deskewed_ros));
+
+  // Publish raw (unfiltered) deskewed scan for graph SLAM SC computation
+  if (raw_deskewed_cloud && !raw_deskewed_cloud->empty())
+  {
+    pcl::PointCloud<PointType>::Ptr raw_t = std::make_shared<pcl::PointCloud<PointType>>();
+    pcl::transformPointCloud(*raw_deskewed_cloud, *raw_t, T_cloud);
+
+    auto raw_ros = std::make_unique<sensor_msgs::msg::PointCloud2>();
+    pcl::toROSMsg(*raw_t, *raw_ros);
+    raw_ros->header.stamp = this->scan_header_stamp;
+    raw_ros->header.frame_id = this->odom_frame;
+    this->deskewed_raw_pub->publish(std::move(raw_ros));
+  }
 }
 
 void dlio::OdomNode::publishKeyframe(std::pair<std::pair<Eigen::Vector3f, Eigen::Quaternionf>, pcl::PointCloud<PointType>::ConstPtr> kf, rclcpp::Time timestamp,
@@ -1244,9 +1261,9 @@ void dlio::OdomNode::continuousLocalize()
               nano_gicp::NanoGICP<PointType, PointType> gicp;
               gicp.setCorrespondenceRandomness(this->gicp_k_correspondences_);
               gicp.setMaxCorrespondenceDistance(this->gicp_max_corr_dist_);
-              gicp.setMaximumIterations(32);
-              gicp.setTransformationEpsilon(0.01);
-              gicp.setRotationEpsilon(0.01);
+              gicp.setMaximumIterations(64);
+              gicp.setTransformationEpsilon(0.05);
+              gicp.setRotationEpsilon(0.05);
               gicp.setInputSource(scan_body);
               gicp.calculateSourceCovariances();
               gicp.setInputTarget(local_map);
@@ -1262,8 +1279,8 @@ void dlio::OdomNode::continuousLocalize()
               ndt_local.setResolution(this->ndt_resolution_);
               ndt_local.setNumThreads(this->ndt_num_threads_);
               ndt_local.setNeighborhoodSearchMethod(pclomp::DIRECT7);
-              ndt_local.setMaximumIterations(32);
-              ndt_local.setTransformationEpsilon(0.01);
+              ndt_local.setMaximumIterations(64);
+              ndt_local.setTransformationEpsilon(0.05);
               ndt_local.setInputSource(scan_body);
               ndt_local.setInputTarget(local_map);
               ndt_local.align(*aligned, init_guess);
@@ -1274,7 +1291,7 @@ void dlio::OdomNode::continuousLocalize()
 
             if (!converged)
             {
-              RCLCPP_DEBUG(this->get_logger(), "[GPS] tryGICP: not converged");
+              RCLCPP_DEBUG(this->get_logger(), "[GPS] tryGICP: not converged, fitness=%.4f", result_fitness);
               return false;
             }
             if (result_fitness > this->continuous_localize_fitness_thresh_)
@@ -1738,9 +1755,9 @@ void dlio::OdomNode::continuousLocalize()
       nano_gicp::NanoGICP<PointType, PointType> gicp;
       gicp.setCorrespondenceRandomness(this->gicp_k_correspondences_);
       gicp.setMaxCorrespondenceDistance(this->gicp_max_corr_dist_);
-      gicp.setMaximumIterations(32);
-      gicp.setTransformationEpsilon(0.01);
-      gicp.setRotationEpsilon(0.01);
+      gicp.setMaximumIterations(64);
+      gicp.setTransformationEpsilon(0.05);
+      gicp.setRotationEpsilon(0.05);
 
       gicp.setInputSource(scan_body);
       gicp.calculateSourceCovariances();
@@ -1758,8 +1775,8 @@ void dlio::OdomNode::continuousLocalize()
       ndt_local.setResolution(this->ndt_resolution_);
       ndt_local.setNumThreads(this->ndt_num_threads_);
       ndt_local.setNeighborhoodSearchMethod(pclomp::DIRECT7);
-      ndt_local.setMaximumIterations(32);
-      ndt_local.setTransformationEpsilon(0.01);
+      ndt_local.setMaximumIterations(64);
+      ndt_local.setTransformationEpsilon(0.05);
 
       ndt_local.setInputSource(scan_body);
       ndt_local.setInputTarget(local_map);
@@ -1774,8 +1791,8 @@ void dlio::OdomNode::continuousLocalize()
     {
       if (this->debug_)
         RCLCPP_WARN(this->get_logger(),
-                    "[bayes] tryGICP FAIL: not converged at [%.1f,%.1f,%.1f], scan=%zu pts, local_map=%zu pts",
-                    center[0], center[1], center[2], scan_body->size(), local_map->size());
+                    "[bayes] tryGICP FAIL: not converged at [%.1f,%.1f,%.1f], scan=%zu pts, local_map=%zu pts, fitness=%.4f",
+                    center[0], center[1], center[2], scan_body->size(), local_map->size(), result_fitness);
       return false;
     }
 

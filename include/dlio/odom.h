@@ -94,8 +94,12 @@ private:
 
   void publishPose();
 
-  void publishToROS(pcl::PointCloud<PointType>::ConstPtr published_cloud, Eigen::Matrix4f T_cloud);
-  void publishCloud(pcl::PointCloud<PointType>::ConstPtr published_cloud, Eigen::Matrix4f T_cloud);
+  void publishToROS(pcl::PointCloud<PointType>::ConstPtr published_cloud,
+                    pcl::PointCloud<PointType>::ConstPtr raw_deskewed_cloud,
+                    Eigen::Matrix4f T_cloud);
+  void publishCloud(pcl::PointCloud<PointType>::ConstPtr published_cloud,
+                    pcl::PointCloud<PointType>::ConstPtr raw_deskewed_cloud,
+                    Eigen::Matrix4f T_cloud);
   void publishKeyframe(std::pair<std::pair<Eigen::Vector3f, Eigen::Quaternionf>,
                                  pcl::PointCloud<PointType>::ConstPtr>
                            kf,
@@ -182,6 +186,15 @@ private:
                          const std::vector<dlio::sc::ScanContextEntry> &sc_snap,
                          double &out_chi2, int &out_num_anchors);
 
+  // Submap-based relocalization (GPS-denied)
+  void initSubmapLocalization();
+  void submapLocalizeTick();
+  void submapLocalizeStage1(pcl::PointCloud<PointType>::ConstPtr scan_body,
+                            const Eigen::Matrix4f &T_odom_body);
+  void submapLocalizeStage2(pcl::PointCloud<PointType>::ConstPtr scan_body,
+                            const Eigen::Matrix4f &T_odom_body);
+  int findClosestKF(const Eigen::Vector3f &pos) const;
+
   void debug();
 
   rclcpp::TimerBase::SharedPtr publish_timer;
@@ -210,6 +223,7 @@ private:
   rclcpp::Publisher<geometry_msgs::msg::PoseArray>::SharedPtr kf_pose_pub;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr kf_cloud_pub;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr deskewed_pub;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr deskewed_raw_pub;
   rclcpp::Publisher<direct_lidar_inertial_odometry::msg::KeyframeStamped>::SharedPtr kf_stamped_pub;
 
   // TF
@@ -410,6 +424,33 @@ private:
   };
   Pose lidarPose;
   Pose imuPose;
+
+  // Submap-based relocalization types
+  struct SubmapEntry
+  {
+    int submap_id;
+    std::vector<int> kf_indices;           // indices into sc_database_
+    Eigen::Vector3f centroid;              // centroid of member KF positions
+    pcl::PointCloud<PointType>::Ptr cloud; // pre-built submap cloud
+    float probability;                     // current probability robot is here
+  };
+
+  enum class SubmapLocState
+  {
+    IDLE,
+    STAGE1,
+    STAGE2
+  };
+
+  struct SubmapMotionTracker
+  {
+    int current_kf_idx;
+    int prev_kf_idx;
+    Eigen::Matrix4f T_odom_prev;
+    Eigen::Matrix4f T_map_body_prev;
+    int consecutive_valid;
+    int total_validated;
+  };
 
   // Metrics
   struct Metrics
@@ -622,4 +663,38 @@ private:
   // Helper: convert lat/lon to local ENU
   bool gpsToLocal(double lat, double lon, double alt,
                   float &x, float &y, float &z);
+
+  // Submap-based relocalization
+  bool submap_loc_enabled_;
+  double submap_loc_interval_;            // timer interval (s), default 2.0
+  int submap_loc_group_size_;             // KFs per submap, default 10
+  double submap_loc_search_radius_;       // radius for cloud extraction (m), default 50.0
+  double submap_loc_fitness_thresh_;      // GICP fitness threshold, default 0.15
+  double submap_loc_prob_threshold_;      // prob to enter Stage 2, default 0.6
+  double submap_loc_motion_error_thresh_; // max pos error Tlink vs pTlink (m), default 1.0
+  double submap_loc_motion_rot_thresh_;   // max rot error (deg), default 5.0
+  int submap_loc_min_motion_valid_;       // consecutive valid steps needed, default 3
+  double submap_loc_prob_drop_thresh_;    // prob to revert to Stage 1, default 0.3
+  double submap_loc_max_correction_;      // max TF correction (m), default 5.0
+  float submap_loc_sc_dist_thresh_;       // SC distance filter for Stage1 (0=disabled), default 0.5
+  int submap_loc_sc_accum_scans_;         // number of recent scans to accumulate for SC descriptor, default 5
+
+  SubmapLocState submap_loc_state_;
+  std::vector<SubmapEntry> submap_entries_;
+  SubmapMotionTracker submap_motion_;
+  rclcpp::TimerBase::SharedPtr submap_loc_timer_;
+  std::mutex submap_loc_mtx_;
+
+  // Ring buffer of recent scans for accumulated SC descriptor
+  struct ScanStamped
+  {
+    pcl::PointCloud<PointType>::Ptr cloud;
+    Eigen::Matrix4f T_odom_body;
+  };
+  std::deque<ScanStamped> submap_loc_scan_buffer_;
+
+  // Shadow T_map_odom for submap localization — does NOT touch the system
+  // T_map_odom_ until correction is validated.  Updated from Stage1 GICP
+  // result so that Stage2 init_guess is accurate.
+  Eigen::Matrix4f submap_loc_T_map_odom_shadow_;
 };
