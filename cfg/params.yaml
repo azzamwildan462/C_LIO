@@ -134,7 +134,7 @@
 
     # Occupancy Grid
     # Not all tested yet, use with caution and report any issues!
-    occupancy_grid/enabled: true
+    occupancy_grid/enabled: false
     occupancy_grid/grid_size_x: 100.0
     occupancy_grid/grid_size_y: 100.0
     occupancy_grid/resolution: 0.4

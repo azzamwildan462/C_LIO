@@ -1395,11 +1395,6 @@ void dlio::OdomNode::continuousLocalize()
                         "[GPS] OK: kf=%d fitness=%.4f corr=%.3fm gps_kf_dist=%.1fm",
                         gps_best_kf, gps_fitness, corr_dist, gps_kf_dist);
 
-            {
-              std::lock_guard<std::mutex> wb(this->continuous_localize_mtx_);
-              this->T_map_odom_ = T_map_odom_new;
-            }
-
             float conf = std::max(0.0f, 1.0f - gps_fitness /
                                                    static_cast<float>(this->continuous_localize_fitness_thresh_));
             this->last_confidence_ = conf;
@@ -1408,6 +1403,11 @@ void dlio::OdomNode::continuousLocalize()
               std_msgs::msg::Float32 msg;
               msg.data = conf;
               this->confidence_pub_->publish(msg);
+            }
+
+            {
+              std::lock_guard<std::mutex> wb(this->continuous_localize_mtx_);
+              this->T_map_odom_ = T_map_odom_new;
             }
 
             return; // GPS path done, skip SC++
@@ -2109,7 +2109,7 @@ void dlio::OdomNode::continuousLocalize()
     std::lock_guard<std::mutex> wb(this->continuous_localize_mtx_);
     this->bayes_posterior_ = bayes_snap;
     this->bayes_consecutive_accepts_ = bayes_consec;
-    if (accepted)
+    if (accepted && this->enable_global_correction_.load())
       this->T_map_odom_ = T_map_odom_new;
   }
 

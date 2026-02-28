@@ -348,10 +348,11 @@ void dlio::OdomNode::submapLocalizeStage1(
 
     this->submap_loc_state_ = SubmapLocState::STAGE2;
 
-    RCLCPP_INFO(this->get_logger(),
-                "[submap_loc] Stage1→Stage2: submap=%d kf=%d fitness=%.4f prob=%.3f pos=[%.1f,%.1f,%.1f]",
-                best_submap_idx, closest_kf, best_fitness, best_prob,
-                gicp_pos[0], gicp_pos[1], gicp_pos[2]);
+    if (this->debug_)
+      RCLCPP_INFO(this->get_logger(),
+                  "[submap_loc] Stage1→Stage2: submap=%d kf=%d fitness=%.4f prob=%.3f pos=[%.1f,%.1f,%.1f]",
+                  best_submap_idx, closest_kf, best_fitness, best_prob,
+                  gicp_pos[0], gicp_pos[1], gicp_pos[2]);
   }
 }
 
@@ -533,6 +534,12 @@ void dlio::OdomNode::submapLocalizeStage2(
     }
 
     // Apply correction to system variable (validated)
+    if (!this->enable_global_correction_.load())
+    {
+      if (this->debug_)
+        RCLCPP_INFO(this->get_logger(), "[submap_loc] global correction disabled, skipping TF update");
+      return;
+    }
     {
       std::lock_guard<std::mutex> lock(this->continuous_localize_mtx_);
       this->T_map_odom_ = T_map_odom_new;
@@ -549,10 +556,11 @@ void dlio::OdomNode::submapLocalizeStage2(
       this->confidence_pub_->publish(msg);
     }
 
-    RCLCPP_INFO(this->get_logger(),
-                "[submap_loc] TF CORRECTED: dist=%.3fm fitness=%.4f conf=%.2f pos=[%.1f,%.1f,%.1f]",
-                correction_dist, fitness, confidence,
-                gicp_pos[0], gicp_pos[1], gicp_pos[2]);
+    if (this->debug_)
+      RCLCPP_INFO(this->get_logger(),
+                  "[submap_loc] TF CORRECTED: dist=%.3fm fitness=%.4f conf=%.2f pos=[%.1f,%.1f,%.1f]",
+                  correction_dist, fitness, confidence,
+                  gicp_pos[0], gicp_pos[1], gicp_pos[2]);
 
     // Reset consecutive count after applying correction
     this->submap_motion_.consecutive_valid = 0;

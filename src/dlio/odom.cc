@@ -646,6 +646,7 @@ void dlio::OdomNode::getParams()
   dlio::declare_param(this, "map/continuous_localize/g2o_verification", this->g2o_verification_enabled_, true);
   dlio::declare_param(this, "map/continuous_localize/g2o_chi2_threshold", this->g2o_chi2_threshold_, 50.0);
   dlio::declare_param(this, "map/continuous_localize/g2o_iterations", this->g2o_iterations_, 10);
+
   dlio::declare_param(this, "frames/map", this->map_frame_, std::string("map"));
 
   // Submap-based relocalization (GPS-denied)
