@@ -8,7 +8,7 @@
     loop_closure/min_keyframe_gap: 15
     loop_closure/fitness_score_threshold: 0.3
 
-    registration_method: "gicp"  # "gicp" or "ndt"
+    registration_method: "gicp" # "gicp" or "ndt"
     ndt/resolution: 1.0
     ndt/num_threads: 4
 
@@ -17,6 +17,16 @@
     gicp/max_iterations: 64
     gicp/transformation_epsilon: 0.01
     gicp/rotation_epsilon: 0.01
+
+    sc/max_range: 20.0
+    sc/distance_threshold: 0.9
+    sc/ground_height_threshold: 0.0
+    sc/search_window: 7
+
+    gps/enabled: false
+    gps/topic: "/carla/ego_vehicle/gnss"
+    gps/search_radius: 50.0
+    gps/min_accuracy: 5.0
 
     pose_graph/num_adjacent_constraints: 5
     pose_graph/optimization_iterations: 20

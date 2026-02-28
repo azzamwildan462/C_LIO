@@ -15,6 +15,7 @@
 #define DLIO_GRAPH_SLAM_H
 
 #include "dlio/dlio.h"
+#include "dlio/scan_context.h"
 
 // ROS
 #include "rclcpp/rclcpp.hpp"
@@ -22,6 +23,7 @@
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/pose_array.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
+#include <sensor_msgs/msg/nav_sat_fix.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
 #include <direct_lidar_inertial_odometry/msg/keyframe_stamped.hpp>
 #include <direct_lidar_inertial_odometry/srv/save_pcd.hpp>
@@ -48,8 +50,11 @@
 #include "g2o/types/slam3d/vertex_se3.h"
 #include "g2o/types/slam3d/edge_se3.h"
 
+#include <GeographicLib/LocalCartesian.hpp>
+
 #include <mutex>
 #include <atomic>
+#include <deque>
 
 class dlio::GraphSlamNode : public rclcpp::Node
 {
@@ -69,6 +74,11 @@ private:
     Eigen::Isometry3d pose;
     pcl::PointCloud<PointType>::Ptr cloud_local;
     pcl::PointCloud<PointType>::Ptr cloud_world;
+    dlio::sc::ScanContextDescriptor sc_descriptor;
+    dlio::sc::SectorKey sector_key;
+    // GPS
+    float gps_x = 0.f, gps_y = 0.f, gps_z = 0.f;
+    bool gps_valid = false;
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
   };
 
@@ -87,14 +97,25 @@ private:
 
   // --- Callbacks ---
   void callbackKeyframe(const direct_lidar_inertial_odometry::msg::KeyframeStamped::SharedPtr msg);
+  void callbackDeskewed(const sensor_msgs::msg::PointCloud2::SharedPtr msg);
+  void callbackGPS(const sensor_msgs::msg::NavSatFix::SharedPtr msg);
+
+  // --- GPS helpers ---
+  struct GPSMeasurement
+  {
+    double latitude, longitude, altitude, timestamp;
+    float horizontal_accuracy;
+  };
+  bool getGPSAtTime(double timestamp, GPSMeasurement &out);
+  bool gpsToLocal(double lat, double lon, double alt, float &x, float &y, float &z);
 
   // --- Loop closure ---
   void searchLoopClosure();
   bool detectLoopCandidate(const std::vector<Keyframe> &kfs, int current_idx,
-                           int &candidate_idx, double &candidate_dist);
+                           int &candidate_idx, double &candidate_dist, int &sc_shift);
   bool performLoopRegistration(const std::vector<Keyframe> &kfs, int current_idx,
-                               int candidate_idx, Eigen::Isometry3d &relative_pose,
-                               double &fitness_score);
+                               int candidate_idx, int sc_shift,
+                               Eigen::Isometry3d &relative_pose, double &fitness_score);
 
   // --- Pose graph optimization ---
   void optimizePoseGraph(const std::vector<Keyframe> &kf_snap);
@@ -126,6 +147,27 @@ private:
 
   rclcpp::TimerBase::SharedPtr loop_timer;
   rclcpp::TimerBase::SharedPtr auto_save_timer_;
+
+  // Deskewed scan buffer (dense scans for SC computation)
+  struct DeskewedScan
+  {
+    rclcpp::Time timestamp;
+    pcl::PointCloud<PointType>::Ptr cloud; // in odom (world) frame
+  };
+  rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr deskewed_sub_;
+  rclcpp::CallbackGroup::SharedPtr deskewed_cb_group_;
+  std::deque<DeskewedScan> deskewed_buffer_;
+  std::mutex deskewed_buffer_mtx_;
+  static constexpr size_t DESKEWED_BUFFER_MAX = 30;
+
+  // GPS
+  rclcpp::Subscription<sensor_msgs::msg::NavSatFix>::SharedPtr gps_sub_;
+  rclcpp::CallbackGroup::SharedPtr gps_cb_group_;
+  std::deque<GPSMeasurement> gps_buffer_;
+  std::mutex gps_buffer_mtx_;
+  static constexpr size_t GPS_BUFFER_MAX = 200;
+  std::unique_ptr<GeographicLib::LocalCartesian> gps_converter_;
+  bool gps_origin_set_ = false;
 
   // --- Data ---
   std::vector<Keyframe> keyframes;
@@ -171,6 +213,18 @@ private:
   int optimization_iterations_;
   double odom_edge_info_scale_;
   double loop_edge_info_scale_;
+
+  // SC++ loop closure detection
+  float sc_max_range_;
+  float sc_distance_threshold_;
+  float sc_ground_height_threshold_;
+  int sc_search_window_;
+
+  // GPS-assisted loop closure
+  bool gps_enabled_;
+  std::string gps_topic_;
+  float gps_search_radius_;
+  float gps_min_accuracy_;
 
   bool debug_;
 

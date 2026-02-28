@@ -23,6 +23,7 @@ def generate_launch_description():
     rviz = LaunchConfiguration('rviz', default='false')
     pointcloud_topic = LaunchConfiguration('pointcloud_topic', default='points_raw')
     imu_topic = LaunchConfiguration('imu_topic', default='imu_raw')
+    gps_topic = LaunchConfiguration('gps_topic', default='gps_raw')
     map_mode = LaunchConfiguration('map_mode', default='localization')
     map_path = LaunchConfiguration('map_path', default='')
     relocalize = LaunchConfiguration('relocalize', default='true')
@@ -44,6 +45,11 @@ def generate_launch_description():
         'imu_topic',
         default_value=imu_topic,
         description='IMU topic name'
+    )
+    declare_gps_topic_arg = DeclareLaunchArgument(
+        'gps_topic',
+        default_value=gps_topic,
+        description='gps topic name'
     )
     declare_map_mode_arg = DeclareLaunchArgument(
         'map_mode',
@@ -92,7 +98,7 @@ def generate_launch_description():
                 package='direct_lidar_inertial_odometry',
                 plugin='dlio::OdomNode',
                 name='dlio_odom',
-                parameters=[dlio_yaml_path, dlio_params_yaml_path, map_params, odom_extra_params],
+                parameters=[dlio_yaml_path, dlio_params_yaml_path, map_params, odom_extra_params, {'gps/topic': gps_topic}],
                 remappings=[
                     ('pointcloud', pointcloud_topic),
                     ('imu', imu_topic),
@@ -103,6 +109,7 @@ def generate_launch_description():
                     ('kf_cloud', 'dlio/odom_node/pointcloud/keyframe'),
                     ('kf_stamped', 'dlio/odom_node/keyframe_stamped'),
                     ('deskewed', 'dlio/odom_node/pointcloud/deskewed'),
+                    ('deskewed_raw', 'dlio/odom_node/pointcloud/deskewed_raw'),
                     ('dlio_odom/set_mode', 'dlio/odom_node/set_mode'),
                     ('dlio_odom/relocalize', 'dlio/odom_node/relocalize'),
                     ('dlio_odom/set_pose', 'dlio/odom_node/set_pose'),
@@ -130,13 +137,15 @@ def generate_launch_description():
                 extra_arguments=[{'use_intra_process_comms': True}],
             ),
             # DLIO Graph SLAM Component
+            # Currently this feature is experimental and not ready production use
             # ComposableNode(
             #     package='direct_lidar_inertial_odometry',
             #     plugin='dlio::GraphSlamNode',
             #     name='dlio_graph_slam',
-            #     parameters=[dlio_yaml_path, dlio_params_yaml_path, graph_slam_yaml_path, map_params],
+            #     parameters=[dlio_yaml_path, dlio_params_yaml_path, graph_slam_yaml_path, map_params, {'gps/topic': gps_topic}],
             #     remappings=[
             #         ('keyframe_stamped', 'dlio/odom_node/keyframe_stamped'),
+            #         ('deskewed', 'dlio/odom_node/pointcloud/deskewed_raw'),
             #         ('corrected_path', 'dlio/graph_slam/corrected_path'),
             #         ('corrected_map', 'dlio/graph_slam/corrected_map'),
             #         ('corrected_kf_poses', 'dlio/graph_slam/corrected_kf_poses'),
@@ -164,6 +173,7 @@ def generate_launch_description():
         declare_rviz_arg,
         declare_pointcloud_topic_arg,
         declare_imu_topic_arg,
+        declare_gps_topic_arg,
         declare_map_mode_arg,
         declare_map_path_arg,
         declare_relocalize_arg,
