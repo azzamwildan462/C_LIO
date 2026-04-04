@@ -43,6 +43,9 @@ set(g2o_DIR "/opt/ros/humble/lib/cmake/g2o")
 find_package(g2o REQUIRED COMPONENTS g2o::core g2o::types_slam3d g2o::solver_eigen)
 add_compile_definitions(G2O_USE_VENDORED_CERES)
 
+# GTSAM (for LIO-SAM-style map optimization)
+find_package(GTSAM REQUIRED QUIET)
+
 include(FindOpenMP)
 if(OPENMP_FOUND)
   set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${OpenMP_C_FLAGS}")
@@ -67,7 +70,11 @@ include_directories(
   ${PCL_INCLUDE_DIRS}
   ${EIGEN3_INCLUDE_DIR}
   ${GeographicLib_INCLUDE_DIRS}
+  ${GTSAM_INCLUDE_DIR}
   /opt/ros/humble/include
+)
+link_directories(
+  ${GTSAM_LIBRARY_DIRS}
 )
 link_directories(
   ${PCL_LIBRARY_DIRS}
@@ -157,6 +164,21 @@ ament_target_dependencies(dlio_graph_slam_component
 )
 rclcpp_components_register_nodes(dlio_graph_slam_component "dlio::GraphSlamNode")
 
+# LIO-SAM Map Optimization Component (GTSAM iSAM2)
+add_library(dlio_lio_sam_map_opt_component SHARED
+  src/dlio/lio_sam_map_optimization.cc
+)
+target_compile_options(dlio_lio_sam_map_opt_component PRIVATE ${OpenMP_FLAGS})
+target_link_libraries(dlio_lio_sam_map_opt_component
+  ${PCL_LIBRARIES} ${OpenMP_LIBS} Threads::Threads nano_gicp ${cpp_typesupport_target}
+  gtsam
+  ${GeographicLib_LIBRARIES}
+)
+ament_target_dependencies(dlio_lio_sam_map_opt_component
+  rclcpp rclcpp_components pcl_ros pcl_conversions nav_msgs sensor_msgs geometry_msgs visualization_msgs ndt_omp_ros2 tf2_ros
+)
+rclcpp_components_register_nodes(dlio_lio_sam_map_opt_component "dlio::LioSamMapOptimizationNode")
+
 # ---- Standalone Executables (backward compatibility) ----
 
 # Odometry Node
@@ -174,10 +196,15 @@ add_executable(dlio_graph_slam_node src/dlio/graph_slam_node.cc)
 target_link_libraries(dlio_graph_slam_node dlio_graph_slam_component)
 ament_target_dependencies(dlio_graph_slam_node rclcpp)
 
+# LIO-SAM Map Optimization Node
+add_executable(dlio_lio_sam_map_opt_node src/dlio/lio_sam_map_optimization_node.cc)
+target_link_libraries(dlio_lio_sam_map_opt_node dlio_lio_sam_map_opt_component)
+ament_target_dependencies(dlio_lio_sam_map_opt_node rclcpp)
+
 # ---- Export & Install ----
 
 ament_export_include_directories(include)
-ament_export_libraries(dlio_odom_component dlio_map_component dlio_graph_slam_component nano_gicp nanoflann)
+ament_export_libraries(dlio_odom_component dlio_map_component dlio_graph_slam_component dlio_lio_sam_map_opt_component nano_gicp nanoflann)
 ament_export_dependencies(rclcpp rclcpp_components std_msgs sensor_msgs geometry_msgs pcl_ros)
 ament_package()
 
@@ -185,13 +212,14 @@ install(TARGETS
   dlio_odom_component
   dlio_map_component
   dlio_graph_slam_component
+  dlio_lio_sam_map_opt_component
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib
   RUNTIME DESTINATION bin
 )
 
 install(TARGETS
-  dlio_odom_node dlio_map_node dlio_graph_slam_node
+  dlio_odom_node dlio_map_node dlio_graph_slam_node dlio_lio_sam_map_opt_node
   DESTINATION lib/${PROJECT_NAME}
 )
 

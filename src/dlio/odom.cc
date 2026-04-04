@@ -29,6 +29,7 @@ static void odomAtexitSave()
   if (node)
   {
     node->saveKeyframeDatabase();
+    node->saveCorrectedKeyframeDatabase();
   }
 }
 
@@ -364,6 +365,9 @@ dlio::OdomNode::OdomNode(const rclcpp::NodeOptions &options)
   this->bayes_consecutive_accepts_ = 0;
   this->bayes_posterior_.clear();
 
+  RCLCPP_INFO(this->get_logger(), "[dlio_odom] map/tf_source='%s', map_mode='%s'",
+              this->tf_map_odom_source_.c_str(), this->map_mode_.c_str());
+
   bool cl_enabled = this->continuous_localize_ && this->use_prior_map_ &&
                     (this->map_mode_ == "localization" ||
                      (this->map_mode_ == "mapping" && this->continuous_localize_on_mapping_));
@@ -437,6 +441,7 @@ dlio::OdomNode::~OdomNode()
   if (this->map_mode_ == "mapping" && !this->map_path_.empty())
   {
     this->saveKeyframeDatabase();
+    this->saveCorrectedKeyframeDatabase();
   }
 }
 
@@ -591,6 +596,7 @@ void dlio::OdomNode::getParams()
 
   // Map load/save
   dlio::declare_param(this, "map/mode", this->map_mode_, std::string("localization"));
+  dlio::declare_param(this, "map/tf_source", this->tf_map_odom_source_, std::string("odom"));
   dlio::declare_param(this, "map/path", this->map_path_, std::string(""));
   if (this->map_path_.empty())
   {

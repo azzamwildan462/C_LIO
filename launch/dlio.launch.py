@@ -81,6 +81,7 @@ def generate_launch_description():
     dlio_yaml_path = PathJoinSubstitution([current_pkg, 'cfg', 'dlio.yaml'])
     dlio_params_yaml_path = PathJoinSubstitution([current_pkg, 'cfg', 'params.yaml'])
     graph_slam_yaml_path = PathJoinSubstitution([current_pkg, 'cfg', 'graph_slam.yaml'])
+    lio_sam_opt_yaml_path = PathJoinSubstitution([current_pkg, 'cfg', 'lio_sam_map_optimization.yaml'])
 
     # Map params override (passed to both OdomNode and MapNode)
     map_params = {'map/mode': map_mode, 'map/path': map_path, 'map/use_corrected': use_corrected}
@@ -136,8 +137,7 @@ def generate_launch_description():
                 ],
                 extra_arguments=[{'use_intra_process_comms': True}],
             ),
-            # DLIO Graph SLAM Component
-            # Currently this feature is experimental and not ready production use
+            # DLIO Graph SLAM Component (g2o-based, experimental)
             # ComposableNode(
             #     package='direct_lidar_inertial_odometry',
             #     plugin='dlio::GraphSlamNode',
@@ -154,6 +154,34 @@ def generate_launch_description():
             #     ],
             #     extra_arguments=[{'use_intra_process_comms': True}],
             # ),
+            # LIO-SAM Map Optimization moved to separate process (see lio_sam_opt_node below)
+            # to prevent heavy ICP/GTSAM work from starving OdomNode threads.
+        ],
+        output='screen',
+    )
+
+    # LIO-SAM Map Optimization — separate process with lower priority to avoid starving OdomNode
+    lio_sam_opt_container = ComposableNodeContainer(
+        name='lio_sam_opt_container',
+        namespace='',
+        package='rclcpp_components',
+        executable='component_container_mt',
+        prefix='nice -n 10',
+        composable_node_descriptions=[
+            ComposableNode(
+                package='direct_lidar_inertial_odometry',
+                plugin='dlio::LioSamMapOptimizationNode',
+                name='dlio_lio_sam_map_opt',
+                parameters=[dlio_yaml_path, dlio_params_yaml_path, lio_sam_opt_yaml_path, map_params, {'gps/topic': gps_topic}],
+                remappings=[
+                    ('keyframe_stamped', 'dlio/odom_node/keyframe_stamped'),
+                    ('corrected_path', 'dlio/lio_sam_opt/corrected_path'),
+                    ('corrected_map', 'dlio/lio_sam_opt/corrected_map'),
+                    ('corrected_kf_poses', 'dlio/graph_slam/corrected_kf_poses'),
+                    ('loop_closures', 'dlio/lio_sam_opt/loop_closures'),
+                    ('save_corrected_pcd', 'dlio/lio_sam_opt/save_corrected_pcd'),
+                ],
+            ),
         ],
         output='screen',
     )
@@ -180,5 +208,6 @@ def generate_launch_description():
         declare_use_corrected_arg,
         declare_registration_method_arg,
         dlio_container,
+        lio_sam_opt_container,
         rviz_node
     ])

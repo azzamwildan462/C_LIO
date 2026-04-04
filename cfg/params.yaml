@@ -16,7 +16,11 @@
 
     debug/odom: false
     debug/graph_slam: false
-    debug/print_odom: true # Activate this to print odometry like default DLIO
+    debug/print_odom: false # Activate this to print odometry like default DLIO
+
+    # TF source for map→odom: "odom" (OdomNode) or "lio_sam_opt"
+    # In localization mode, OdomNode always publishes regardless.
+    map/tf_source: "lio_sam_opt"
 
     frames/map: map
     frames/odom: odom

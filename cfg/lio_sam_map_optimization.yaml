@@ -1,0 +1,56 @@
+/**:
+  ros__parameters:
+    # ---- Loop Closure Detection (LIO-SAM style: distance-based KD-tree) ----
+    loop_detection_period_ms: 3000 # Hz = 1000/period_ms (higher = less CPU)
+    loop_closure/search_radius: 15.0 # meters, spatial proximity for LC candidate
+    loop_closure/search_time_diff: 30.0 # seconds, min temporal gap to avoid recent frames
+    loop_closure/search_num: 25 # +/- keyframes to aggregate for history submap
+    loop_closure/fitness_score_threshold: 0.3
+    loop_closure/min_keyframe_gap: 30 # min index gap between LC pair
+
+    # ---- Scan Context++ (secondary / fallback loop closure) ----
+    sc/enabled: true
+    sc/max_range: 20.0
+    sc/distance_threshold: 0.5
+    sc/ground_height_threshold: 0.0
+    sc/search_window: 7
+
+    # ---- Registration for LC verification ----
+    # Options: "icp" (LIO-SAM default), "gicp", "ndt"
+    registration_method: "icp"
+    icp/max_iterations: 100
+    icp/max_correspondence_distance: 30.0 # 2x search_radius
+    icp/transformation_epsilon: 0.000001
+    gicp/k_correspondences: 20
+    gicp/rotation_epsilon: 0.01
+    ndt/resolution: 1.0
+    ndt/num_threads: 4
+
+    voxel_leaf_size: 0.8
+
+    # ---- GPS ----
+    gps/enabled: false
+    gps/topic: "/carla/ego_vehicle/gnss"
+    gps/cov_threshold: 2.0 # max GPS covariance to accept
+    gps/pose_cov_threshold: 25.0 # min pose covariance to trigger GPS factor
+    gps/use_elevation: false
+    gps/min_accuracy: 5.0 # max horizontal accuracy (meters)
+
+    # ---- iSAM2 ----
+    isam/relinearize_threshold: 0.01
+    isam/relinearize_skip: 1
+
+    # ---- TF source ----
+    # Who publishes map→odom TF: "odom" (OdomNode) or "lio_sam_opt"
+    # In localization mode, OdomNode always publishes regardless of this setting.
+    # NOTE: this must match the value in params.yaml — do NOT override here,
+    # otherwise OdomNode and LioSamMapOptimizationNode get different values
+    # and BOTH publish map→odom TF simultaneously, causing TF jumping.
+    # Set map/tf_source in params.yaml only.
+    # map/tf_source: "lio_sam_opt"
+
+    # ---- Map save ----
+    map/voxel_size: 0.25
+    map/auto_save_interval: 30.0 # seconds (0 = disabled)
+    map/publish_interval: 5.0 # seconds between corrected map publishes
+    map/global_map_vis_radius: 1000.0 # meters

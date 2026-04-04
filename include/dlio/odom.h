@@ -81,7 +81,8 @@ public:
   ~OdomNode();
 
   void start();
-  bool saveKeyframeDatabase(); // public for atexit handler
+  bool saveKeyframeDatabase();          // public for atexit handler
+  bool saveCorrectedKeyframeDatabase(); // public for atexit handler
 
 private:
   struct State;
@@ -175,8 +176,6 @@ private:
   void clearAllMapData();
   bool callSavePCD();
   bool callSaveCorrectedPCD();
-  bool saveCorrectedKeyframeDatabase();
-
   // Continuous localization (map→odom TF correction)
   void continuousLocalize();
   bool verifyLoopWithG2O(int loop_kf_idx,
@@ -535,6 +534,7 @@ private:
 
   // Map load/save
   std::string map_mode_;
+  std::string tf_map_odom_source_; // "odom" or "lio_sam_opt"
   std::string map_path_;
   bool use_corrected_;
   double map_voxel_size_;

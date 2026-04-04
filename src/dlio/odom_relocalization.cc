@@ -661,6 +661,7 @@ void dlio::OdomNode::computeAndStoreKeyframeSC()
   if (this->kfdb_entries_.size() % 20 == 0)
   {
     this->saveKeyframeDatabase();
+    this->saveCorrectedKeyframeDatabase();
   }
 }
 
@@ -718,7 +719,14 @@ bool dlio::OdomNode::saveCorrectedKeyframeDatabase()
                                       corrected_poses, this->sc_max_range_,
                                       this->kfdb_gravity_q_);
   if (ok)
-    RCLCPP_INFO(this->get_logger(), "KFDB corrected: saved to %s", this->map_path_.c_str());
+  {
+    // Actual file is <map_stem>_corrected.kfdb (derived in kfdb::saveCorrected)
+    size_t dot = this->map_path_.rfind('.');
+    std::string kfdb_path = (dot != std::string::npos && this->map_path_.substr(dot) == ".pcd")
+                                ? this->map_path_.substr(0, dot) + "_corrected.kfdb"
+                                : this->map_path_ + "_corrected.kfdb";
+    RCLCPP_INFO(this->get_logger(), "KFDB corrected: saved to %s", kfdb_path.c_str());
+  }
   else
     RCLCPP_ERROR(this->get_logger(), "KFDB corrected: save failed");
   return ok;

@@ -143,8 +143,10 @@ void dlio::OdomNode::publishToROS(pcl::PointCloud<PointType>::ConstPtr published
 
   br->sendTransform(transformStamped);
 
-  // transform: map to odom (continuous localization correction)
-  if (this->continuous_localize_ || this->submap_loc_enabled_)
+  // transform: map to odom
+  // When tf_source="lio_sam_opt", let lio_sam_opt publish this TF instead (any mode)
+  bool skip_map_odom_tf = (this->tf_map_odom_source_ == "lio_sam_opt");
+  if (!skip_map_odom_tf && (this->continuous_localize_ || this->submap_loc_enabled_))
   {
     Eigen::Matrix4f T_m2o;
     {
