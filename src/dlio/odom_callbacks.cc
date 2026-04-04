@@ -36,14 +36,21 @@ void dlio::OdomNode::getScanFromROS(const sensor_msgs::msg::PointCloud2::SharedP
       this->sensor = dlio::SensorType::VELODYNE;
       break;
     }
-    else if (field.name == "timestamp" && original_scan_->points[0].timestamp < 1e14)
+    else if (field.name == "timestamp")
     {
-      this->sensor = dlio::SensorType::HESAI;
-      break;
-    }
-    else if (field.name == "timestamp" && original_scan_->points[0].timestamp > 1e14)
-    {
-      this->sensor = dlio::SensorType::LIVOX;
+      double ts0 = original_scan_->points[0].timestamp;
+      if (ts0 > 1e14)
+      {
+        this->sensor = dlio::SensorType::LIVOX; // nanoseconds since epoch
+      }
+      else if (ts0 > 1e6)
+      {
+        this->sensor = dlio::SensorType::HESAI; // absolute seconds since epoch
+      }
+      else
+      {
+        this->sensor = dlio::SensorType::ROBOSENSE; // relative offset in seconds from scan start
+      }
       break;
     }
   }
@@ -175,6 +182,17 @@ void dlio::OdomNode::deskewPointcloud()
     extract_point_time = [&sweep_ref_time](boost::range::index_value<PointType &, long> pt)
     { return pt.value().timestamp; };
   }
+  else if (this->sensor == dlio::SensorType::ROBOSENSE)
+  {
+    // Robosense: timestamp field is relative offset in seconds from scan start
+    point_time_cmp = [](const PointType &p1, const PointType &p2)
+    { return p1.timestamp < p2.timestamp; };
+    point_time_neq = [](boost::range::index_value<PointType &, long> p1,
+                        boost::range::index_value<PointType &, long> p2)
+    { return p1.value().timestamp != p2.value().timestamp; };
+    extract_point_time = [&sweep_ref_time](boost::range::index_value<PointType &, long> pt)
+    { return sweep_ref_time + pt.value().timestamp; };
+  }
   else if (this->sensor == dlio::SensorType::LIVOX)
   {
     point_time_cmp = [](const PointType &p1, const PointType &p2)
@@ -214,6 +232,15 @@ void dlio::OdomNode::deskewPointcloud()
 
   int median_pt_index = timestamps.size() / 2;
   this->scan_stamp = timestamps[median_pt_index]; // set this->scan_stamp to the timestamp of the median point
+
+  if (this->deep_debug_ && !timestamps.empty())
+  {
+    RCLCPP_INFO(this->get_logger(),
+                "[DEEP] deskew: sensor=%d, sweep_ref=%.6f, first_pt_time=%.6f, scan_stamp=%.6f, raw_timestamp[0]=%.9f, imu_front=%.6f",
+                (int)this->sensor, sweep_ref_time, timestamps.front(), this->scan_stamp,
+                deskewed_scan_->points[0].timestamp,
+                this->imu_buffer.empty() ? 0.0 : this->imu_buffer.front().stamp);
+  }
 
   // don't process scans until IMU data is present
   if (!this->first_valid_scan)
@@ -499,13 +526,26 @@ void dlio::OdomNode::callbackPointCloud(const sensor_msgs::msg::PointCloud2::Sha
   // Set initial frame as first keyframe
   if (this->keyframes.size() == 0)
   {
+    if (this->deep_debug_)
+      RCLCPP_INFO(this->get_logger(), "[DEEP] first keyframe: initializeInputTarget start, scan pts=%zu", this->current_scan->points.size());
     this->initializeInputTarget();
+    if (this->deep_debug_)
+      RCLCPP_INFO(this->get_logger(), "[DEEP] first keyframe: initializeInputTarget done, keyframes=%zu", this->keyframes.size());
     this->main_loop_running = false;
+    if (this->deep_debug_)
+      RCLCPP_INFO(this->get_logger(), "[DEEP] first keyframe: launching buildKeyframesAndSubmap");
     this->submap_future =
         std::async(std::launch::async, &dlio::OdomNode::buildKeyframesAndSubmap, this, this->state);
     this->submap_future.wait(); // wait until completion
+    if (this->deep_debug_)
+      RCLCPP_INFO(this->get_logger(), "[DEEP] first keyframe: buildKeyframesAndSubmap done");
     return;
   }
+
+  if (this->deep_debug_)
+    RCLCPP_INFO(this->get_logger(), "[DEEP] scan #%zu: past first kf, pts=%zu, submap_cloud=%zu",
+                this->keyframes.size(), this->current_scan->points.size(),
+                this->submap_cloud ? this->submap_cloud->points.size() : 0);
 
   // First real scan with prior map — register against prior map submap,
   // add as keyframe, and set prev_scan_stamp
@@ -521,13 +561,22 @@ void dlio::OdomNode::callbackPointCloud(const sensor_msgs::msg::PointCloud2::Sha
   }
 
   // Get the next pose via IMU + S2M + GEO
+  if (this->deep_debug_)
+    RCLCPP_INFO(this->get_logger(), "[DEEP] getNextPose start");
   {
     std::lock_guard<std::mutex> state_lock(this->state_mtx_);
     this->getNextPose();
   }
+  if (this->deep_debug_)
+    RCLCPP_INFO(this->get_logger(), "[DEEP] getNextPose done, pos=[%.2f,%.2f,%.2f]",
+                this->state.p[0], this->state.p[1], this->state.p[2]);
 
   // Update current keyframe poses and map
+  if (this->deep_debug_)
+    RCLCPP_INFO(this->get_logger(), "[DEEP] updateKeyframes start");
   this->updateKeyframes();
+  if (this->deep_debug_)
+    RCLCPP_INFO(this->get_logger(), "[DEEP] updateKeyframes done");
 
   // Build keyframe normals and submap if needed (and if we're not already waiting)
   if (this->new_submap_is_ready)
@@ -757,6 +806,20 @@ void dlio::OdomNode::callbackImu(const sensor_msgs::msg::Imu::SharedPtr imu_raw)
 
     Eigen::Vector3f lin_accel_corrected = (this->imu_accel_sm_ * lin_accel) - this->state.b.accel;
     Eigen::Vector3f ang_vel_corrected = ang_vel - this->state.b.gyro;
+
+    // use_2d_imu: constrain IMU to 2D plane
+    // - Accel Z: replace with expected gravity in body frame (not zero! zero causes freefall)
+    // - Gyro: keep only yaw (Z), zero roll/pitch
+    if (this->use_2d_imu_)
+    {
+      // Replace Z accel with gravity projection in body frame so gravity cancels perfectly
+      Eigen::Vector3f gravity_body = this->state.q.conjugate()._transformVector(
+          Eigen::Vector3f(0.f, 0.f, this->gravity_));
+      lin_accel_corrected[2] = gravity_body[2];
+
+      ang_vel_corrected[0] = 0.f; // zero roll rate
+      ang_vel_corrected[1] = 0.f; // zero pitch rate
+    }
 
     this->imu_meas.lin_accel = lin_accel_corrected;
     this->imu_meas.ang_vel = ang_vel_corrected;

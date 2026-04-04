@@ -62,6 +62,7 @@ namespace dlio
     VELODYNE,
     HESAI,
     LIVOX,
+    ROBOSENSE,
     UNKNOWN
   };
 

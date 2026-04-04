@@ -26,7 +26,7 @@
     ndt/resolution: 1.0
     ndt/num_threads: 4
 
-    voxel_leaf_size: 0.8
+    voxel_leaf_size: 0.05
 
     # ---- GPS ----
     gps/enabled: false
@@ -50,7 +50,7 @@
     # map/tf_source: "lio_sam_opt"
 
     # ---- Map save ----
-    map/voxel_size: 0.25
+    map/voxel_size: 0.1
     map/auto_save_interval: 30.0 # seconds (0 = disabled)
     map/publish_interval: 5.0 # seconds between corrected map publishes
     map/global_map_vis_radius: 1000.0 # meters

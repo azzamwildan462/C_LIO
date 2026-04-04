@@ -135,7 +135,7 @@ def generate_launch_description():
                     ('map', 'dlio/map_node/map'),
                     ('save_pcd', 'dlio/map_node/save_pcd'),
                 ],
-                extra_arguments=[{'use_intra_process_comms': True}],
+                extra_arguments=[{'use_intra_process_comms': False}],
             ),
             # DLIO Graph SLAM Component (g2o-based, experimental)
             # ComposableNode(
@@ -208,6 +208,6 @@ def generate_launch_description():
         declare_use_corrected_arg,
         declare_registration_method_arg,
         dlio_container,
-        lio_sam_opt_container,
+        # lio_sam_opt_container,
         rviz_node
     ])

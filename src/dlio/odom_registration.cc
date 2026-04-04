@@ -42,10 +42,22 @@ void dlio::OdomNode::getNextPose()
     this->new_submap_is_ready = (this->submap_future.wait_for(std::chrono::seconds(0)) == std::future_status::ready);
   }
 
+  if (this->deep_debug_)
+    RCLCPP_INFO(this->get_logger(),
+                "[DEEP] getNextPose: submap_ready=%d, submap_changed=%d, use_gicp=%d",
+                (int)this->new_submap_is_ready, (int)this->submap_hasChanged.load(), (int)this->use_gicp_);
+
   if (this->new_submap_is_ready && this->submap_hasChanged)
   {
     if (this->use_gicp_)
     {
+      if (this->deep_debug_)
+        RCLCPP_INFO(this->get_logger(),
+                    "[DEEP] getNextPose: registerInputTarget, submap_cloud=%zu, submap_normals=%zu, kdtree=%p",
+                    this->submap_cloud ? this->submap_cloud->points.size() : 0,
+                    this->submap_normals ? this->submap_normals->size() : 0,
+                    (void *)this->submap_kdtree.get());
+
       // Set the current global submap as the target cloud
       this->gicp.registerInputTarget(this->submap_cloud);
 
@@ -54,6 +66,9 @@ void dlio::OdomNode::getNextPose()
 
       // Set target cloud's normals as submap normals
       this->gicp.setTargetCovariances(this->submap_normals);
+
+      if (this->deep_debug_)
+        RCLCPP_INFO(this->get_logger(), "[DEEP] getNextPose: target registered OK");
     }
     else
     {
@@ -65,26 +80,116 @@ void dlio::OdomNode::getNextPose()
 
   // Align with current submap with global IMU transformation as initial guess
   pcl::PointCloud<PointType>::Ptr aligned = std::make_shared<pcl::PointCloud<PointType>>();
+
+  if (this->deep_debug_)
+    RCLCPP_INFO(this->get_logger(),
+                "[DEEP] getNextPose: source=%zu pts, calling align...",
+                this->gicp.getInputSource() ? this->gicp.getInputSource()->points.size() : 0);
+
   if (this->use_gicp_)
   {
     this->gicp.align(*aligned);
+    if (this->deep_debug_)
+      RCLCPP_INFO(this->get_logger(), "[DEEP] getNextPose: gicp.align done");
     this->T_corr = this->gicp.getFinalTransformation();
-    this->last_fitness_ = this->gicp.getFitnessScore(1.0);
+    if (this->deep_debug_)
+    {
+      RCLCPP_INFO(this->get_logger(), "[DEEP] getNextPose: getFinalTransformation done");
+      auto src = this->gicp.getInputSource();
+      auto tgt = this->gicp.getInputTarget();
+      RCLCPP_INFO(this->get_logger(), "[DEEP] getNextPose: pre-fitness src=%zu tgt=%zu converged=%d",
+                  src ? src->points.size() : 0,
+                  tgt ? tgt->points.size() : 0,
+                  (int)this->gicp.hasConverged());
+    }
+    if (this->gicp.getInputTarget() && !this->gicp.getInputTarget()->empty())
+    {
+      // Check for NaN in aligned output (indicates corrupt input data)
+      if (this->deep_debug_)
+      {
+        int nan_src = 0, nan_tgt = 0, nan_aligned = 0;
+        auto src = this->gicp.getInputSource();
+        auto tgt = this->gicp.getInputTarget();
+        if (src)
+          for (const auto &p : src->points)
+            if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z))
+              nan_src++;
+        if (tgt)
+          for (const auto &p : tgt->points)
+            if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z))
+              nan_tgt++;
+        for (const auto &p : aligned->points)
+          if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z))
+            nan_aligned++;
+        RCLCPP_INFO(this->get_logger(), "[DEEP] getNextPose: NaN check — src=%d tgt=%d aligned=%d", nan_src, nan_tgt, nan_aligned);
+      }
+      // nano_gicp uses its own target_kdtree_, but PCL's getFitnessScore() uses
+      // the base class tree_ which is not set up → segfault. Compute manually.
+      {
+        double score = 0.0;
+        int nr = 0;
+        pcl::PointCloud<PointType> transformed;
+        pcl::transformPointCloud(*this->gicp.getInputSource(), transformed, this->T_corr);
+        std::vector<int> nn_idx(1);
+        std::vector<float> nn_dist(1);
+        for (const auto &pt : transformed.points)
+        {
+          if (!std::isfinite(pt.x))
+            continue;
+          this->gicp.target_kdtree_->nearestKSearch(pt, 1, nn_idx, nn_dist);
+          if (nn_dist[0] <= 1.0)
+          {
+            score += nn_dist[0];
+            nr++;
+          }
+        }
+        this->last_fitness_ = (nr > 0) ? (score / nr) : std::numeric_limits<double>::max();
+      }
+    }
+    else
+    {
+      this->last_fitness_ = std::numeric_limits<double>::max();
+      RCLCPP_WARN(this->get_logger(), "[DEEP] getNextPose: skipped getFitnessScore (target empty/null)");
+    }
+    if (this->deep_debug_)
+      RCLCPP_INFO(this->get_logger(), "[DEEP] getNextPose: getFitnessScore done = %.4f", this->last_fitness_);
   }
   else
   {
     this->ndt.align(*aligned);
+    if (this->deep_debug_)
+      RCLCPP_INFO(this->get_logger(), "[DEEP] getNextPose: ndt.align done");
     this->T_corr = this->ndt.getFinalTransformation();
-    this->last_fitness_ = this->ndt.getFitnessScore(1.0);
+    // NDT uses PCL's internal tree so getFitnessScore should be safe,
+    // but wrap for safety
+    try
+    {
+      this->last_fitness_ = this->ndt.getFitnessScore(1.0);
+    }
+    catch (...)
+    {
+      this->last_fitness_ = this->ndt.hasConverged() ? 0.1 : 1.0;
+      RCLCPP_WARN(this->get_logger(), "[odom] NDT getFitnessScore failed, using fallback");
+    }
   }
+
+  if (this->deep_debug_)
+    RCLCPP_INFO(this->get_logger(), "[DEEP] getNextPose: fitness=%.4f", this->last_fitness_);
+
   this->T = this->T_corr * this->T_prior;
 
   // Update next global pose
   // Both source and target clouds are in the global frame now, so tranformation is global
   this->propagateGICP();
 
+  if (this->deep_debug_)
+    RCLCPP_INFO(this->get_logger(), "[DEEP] getNextPose: propagateGICP done");
+
   // Geometric observer update
   this->updateState();
+
+  if (this->deep_debug_)
+    RCLCPP_INFO(this->get_logger(), "[DEEP] getNextPose: updateState done");
 }
 
 bool dlio::OdomNode::imuMeasFromTimeRange(double start_time, double end_time,

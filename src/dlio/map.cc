@@ -264,6 +264,7 @@ void dlio::MapNode::start()
 
 void dlio::MapNode::callbackKeyframe(const sensor_msgs::msg::PointCloud2::ConstSharedPtr &keyframe)
 {
+  RCLCPP_INFO_ONCE(this->get_logger(), "[map] callbackKeyframe called! mode=%s", this->map_mode_.c_str());
 
   // In localization mode, prior map is already loaded in map frame.
   // New keyframes are in odom frame — mixing them causes offset/ghosting.
@@ -287,22 +288,21 @@ void dlio::MapNode::callbackKeyframe(const sensor_msgs::msg::PointCloud2::ConstS
   }
 
   // Throttled publish of full map
-  int throttle_ms = static_cast<int>(this->publish_interval_ * 1000.0);
-  RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), throttle_ms,
-                       "[map] Received keyframe: %zu pts, total map: %zu pts",
-                       keyframe_pcl->points.size(), this->dlio_map->points.size());
+  // RCLCPP_INFO(this->get_logger(), "[map] Received keyframe: %zu pts, total map: %zu pts",
+  //             keyframe_pcl->points.size(), this->dlio_map->points.size());
 
-  // Publish full map (throttled)
-  static rclcpp::Time last_pub_time(0, 0, RCL_ROS_TIME);
-  rclcpp::Time now = this->now();
-  if ((now - last_pub_time).seconds() >= this->publish_interval_)
+  // Publish full map (throttled via wall clock — immune to sim time issues)
+  static auto last_pub_wall = std::chrono::steady_clock::now();
+  auto now_wall = std::chrono::steady_clock::now();
+  double elapsed_sec = std::chrono::duration<double>(now_wall - last_pub_wall).count();
+  if (elapsed_sec >= this->publish_interval_)
   {
     // Brief lock: copy map snapshot
     pcl::PointCloud<PointType>::Ptr map_snap;
     std::string pub_frame;
     {
       std::lock_guard<std::mutex> lock(this->map_mtx_);
-      if (this->dlio_map->points.size() == this->dlio_map->width * this->dlio_map->height)
+      if (!this->dlio_map->points.empty())
       {
         map_snap = std::make_shared<pcl::PointCloud<PointType>>(*this->dlio_map);
         pub_frame = this->odom_frame;
@@ -313,11 +313,11 @@ void dlio::MapNode::callbackKeyframe(const sensor_msgs::msg::PointCloud2::ConstS
     {
       sensor_msgs::msg::PointCloud2 map_ros;
       pcl::toROSMsg(*map_snap, map_ros);
-      map_ros.header.stamp = now;
+      map_ros.header.stamp = rclcpp::Time(0, 0, RCL_ROS_TIME); // use latest TF
       map_ros.header.frame_id = pub_frame;
       this->map_pub->publish(map_ros);
     }
-    last_pub_time = now;
+    last_pub_wall = now_wall;
   }
 }
 

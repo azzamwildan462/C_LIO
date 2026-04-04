@@ -61,7 +61,7 @@ dlio::OdomNode::OdomNode(const rclcpp::NodeOptions &options)
   this->lidar_cb_group = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
   auto lidar_sub_opt = rclcpp::SubscriptionOptions();
   lidar_sub_opt.callback_group = this->lidar_cb_group;
-  this->lidar_sub = this->create_subscription<sensor_msgs::msg::PointCloud2>("pointcloud", 1,
+  this->lidar_sub = this->create_subscription<sensor_msgs::msg::PointCloud2>("pointcloud", rclcpp::SensorDataQoS(),
                                                                              std::bind(&dlio::OdomNode::callbackPointCloud, this, std::placeholders::_1), lidar_sub_opt);
 
   this->imu_cb_group = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
@@ -451,6 +451,8 @@ void dlio::OdomNode::getParams()
   // Debug
   dlio::declare_param(this, "debug/odom", this->debug_, false);
   dlio::declare_param(this, "debug/print_odom", this->debug_print_, false);
+  dlio::declare_param(this, "deep_debug/odom", this->deep_debug_, false);
+  dlio::declare_param(this, "odom/use_2d_imu", this->use_2d_imu_, false);
 
   // Version
   dlio::declare_param(this, "version", this->version_, "0.0.0");
@@ -498,28 +500,64 @@ void dlio::OdomNode::getParams()
   // Extrinsics
   std::vector<double> t_default{0., 0., 0.};
   std::vector<double> R_default{1., 0., 0., 0., 1., 0., 0., 0., 1.};
+  std::vector<double> rpy_default{0., 0., 0.};
+
+  // Helper: RPY (degrees) → rotation matrix
+  auto rpyToRotation = [](double roll_deg, double pitch_deg, double yaw_deg) -> Eigen::Matrix3f
+  {
+    float r = roll_deg * M_PI / 180.0;
+    float p = pitch_deg * M_PI / 180.0;
+    float y = yaw_deg * M_PI / 180.0;
+    Eigen::Matrix3f R;
+    R = Eigen::AngleAxisf(y, Eigen::Vector3f::UnitZ()) * Eigen::AngleAxisf(p, Eigen::Vector3f::UnitY()) * Eigen::AngleAxisf(r, Eigen::Vector3f::UnitX());
+    return R;
+  };
 
   // center of gravity to imu
-  std::vector<double> baselink2imu_t, baselink2imu_R;
+  std::vector<double> baselink2imu_t, baselink2imu_R, baselink2imu_rpy;
   dlio::declare_param(this, "extrinsics/baselink2imu/t", baselink2imu_t, t_default);
+  dlio::declare_param(this, "extrinsics/baselink2imu/rpy", baselink2imu_rpy, rpy_default);
   dlio::declare_param(this, "extrinsics/baselink2imu/R", baselink2imu_R, R_default);
   this->extrinsics.baselink2imu.t =
       Eigen::Vector3f(baselink2imu_t[0], baselink2imu_t[1], baselink2imu_t[2]);
-  this->extrinsics.baselink2imu.R =
-      Eigen::Map<const Eigen::Matrix<float, -1, -1, Eigen::RowMajor>>(std::vector<float>(baselink2imu_R.begin(), baselink2imu_R.end()).data(), 3, 3);
+  if (baselink2imu_rpy != rpy_default)
+  {
+    // Use RPY (degrees) if specified
+    this->extrinsics.baselink2imu.R = rpyToRotation(baselink2imu_rpy[0], baselink2imu_rpy[1], baselink2imu_rpy[2]);
+    RCLCPP_INFO(this->get_logger(), "[odom] baselink2imu: rpy=[%.1f, %.1f, %.1f] deg",
+                baselink2imu_rpy[0], baselink2imu_rpy[1], baselink2imu_rpy[2]);
+  }
+  else
+  {
+    // Fallback to rotation matrix
+    this->extrinsics.baselink2imu.R =
+        Eigen::Map<const Eigen::Matrix<float, -1, -1, Eigen::RowMajor>>(std::vector<float>(baselink2imu_R.begin(), baselink2imu_R.end()).data(), 3, 3);
+  }
   this->extrinsics.baselink2imu_T = Eigen::Matrix4f::Identity();
   this->extrinsics.baselink2imu_T.block(0, 3, 3, 1) = this->extrinsics.baselink2imu.t;
   this->extrinsics.baselink2imu_T.block(0, 0, 3, 3) = this->extrinsics.baselink2imu.R;
 
   // center of gravity to lidar
-  std::vector<double> baselink2lidar_t, baselink2lidar_R;
+  std::vector<double> baselink2lidar_t, baselink2lidar_R, baselink2lidar_rpy;
   dlio::declare_param(this, "extrinsics/baselink2lidar/t", baselink2lidar_t, t_default);
+  dlio::declare_param(this, "extrinsics/baselink2lidar/rpy", baselink2lidar_rpy, rpy_default);
   dlio::declare_param(this, "extrinsics/baselink2lidar/R", baselink2lidar_R, R_default);
 
   this->extrinsics.baselink2lidar.t =
       Eigen::Vector3f(baselink2lidar_t[0], baselink2lidar_t[1], baselink2lidar_t[2]);
-  this->extrinsics.baselink2lidar.R =
-      Eigen::Map<const Eigen::Matrix<float, -1, -1, Eigen::RowMajor>>(std::vector<float>(baselink2lidar_R.begin(), baselink2lidar_R.end()).data(), 3, 3);
+  if (baselink2lidar_rpy != rpy_default)
+  {
+    // Use RPY (degrees) if specified
+    this->extrinsics.baselink2lidar.R = rpyToRotation(baselink2lidar_rpy[0], baselink2lidar_rpy[1], baselink2lidar_rpy[2]);
+    RCLCPP_INFO(this->get_logger(), "[odom] baselink2lidar: rpy=[%.1f, %.1f, %.1f] deg",
+                baselink2lidar_rpy[0], baselink2lidar_rpy[1], baselink2lidar_rpy[2]);
+  }
+  else
+  {
+    // Fallback to rotation matrix
+    this->extrinsics.baselink2lidar.R =
+        Eigen::Map<const Eigen::Matrix<float, -1, -1, Eigen::RowMajor>>(std::vector<float>(baselink2lidar_R.begin(), baselink2lidar_R.end()).data(), 3, 3);
+  }
 
   this->extrinsics.baselink2lidar_T = Eigen::Matrix4f::Identity();
   this->extrinsics.baselink2lidar_T.block(0, 3, 3, 1) = this->extrinsics.baselink2lidar.t;

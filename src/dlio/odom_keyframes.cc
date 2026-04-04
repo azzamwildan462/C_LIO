@@ -397,12 +397,20 @@ void dlio::OdomNode::buildSubmap(State vehicle_state)
 
 void dlio::OdomNode::buildKeyframesAndSubmap(State vehicle_state)
 {
+  if (this->deep_debug_)
+    RCLCPP_INFO(this->get_logger(), "[DEEP] buildKF&Submap: enter, num_processed=%d, keyframes=%zu",
+                this->num_processed_keyframes, this->keyframes.size());
 
   // transform the new keyframe(s) and associated covariance list(s)
   std::unique_lock<decltype(this->keyframes_mutex)> lock(this->keyframes_mutex);
 
   for (int i = this->num_processed_keyframes; i < this->keyframes.size(); i++)
   {
+    if (this->deep_debug_)
+      RCLCPP_INFO(this->get_logger(), "[DEEP] buildKF&Submap: processing kf[%d], cloud=%zu pts, normals=%zu",
+                  i, this->keyframes[i].second ? this->keyframes[i].second->points.size() : 0,
+                  (this->use_gicp_ && i < (int)this->keyframe_normals.size()) ? this->keyframe_normals[i]->size() : 0);
+
     pcl::PointCloud<PointType>::ConstPtr raw_keyframe = this->keyframes[i].second;
     Eigen::Matrix4f T = this->keyframe_transformations[i];
     lock.unlock();
@@ -417,6 +425,8 @@ void dlio::OdomNode::buildKeyframesAndSubmap(State vehicle_state)
 
     if (this->use_gicp_)
     {
+      if (this->deep_debug_)
+        RCLCPP_INFO(this->get_logger(), "[DEEP] buildKF&Submap: transforming covariances for kf[%d]", i);
       std::shared_ptr<const nano_gicp::CovarianceList> raw_covariances = this->keyframe_normals[i];
       Eigen::Matrix4d Td = T.cast<double>();
       std::shared_ptr<nano_gicp::CovarianceList> transformed_covariances(std::make_shared<nano_gicp::CovarianceList>(raw_covariances->size()));
@@ -432,6 +442,9 @@ void dlio::OdomNode::buildKeyframesAndSubmap(State vehicle_state)
     auto kf_cloud = this->keyframes[i].second;
     lock.unlock();
 
+    if (this->deep_debug_)
+      RCLCPP_INFO(this->get_logger(), "[DEEP] buildKF&Submap: publishing kf[%d]", i);
+
     // Publish in detached thread — don't block submap build
     // (kf_publish_mtx_ inside publishKeyframe protects shared state)
     std::thread(&dlio::OdomNode::publishKeyframe, this, kf_data, kf_ts, kf_cloud).detach();
@@ -441,10 +454,17 @@ void dlio::OdomNode::buildKeyframesAndSubmap(State vehicle_state)
 
   lock.unlock();
 
+  if (this->deep_debug_)
+    RCLCPP_INFO(this->get_logger(), "[DEEP] buildKF&Submap: all kf processed, calling buildSubmap");
+
   // Pause to prevent stealing resources from the main loop if it is running.
   this->pauseSubmapBuildIfNeeded();
 
+  if (this->deep_debug_)
+    RCLCPP_INFO(this->get_logger(), "[DEEP] buildKF&Submap: buildSubmap start");
   this->buildSubmap(vehicle_state);
+  if (this->deep_debug_)
+    RCLCPP_INFO(this->get_logger(), "[DEEP] buildKF&Submap: buildSubmap done");
 }
 
 void dlio::OdomNode::pauseSubmapBuildIfNeeded()

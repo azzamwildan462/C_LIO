@@ -929,7 +929,7 @@ void dlio::LioSamMapOptimizationNode::publishCorrectedData()
 
     // Corrected path + keyframe poses (lightweight)
     nav_msgs::msg::Path path;
-    path.header.stamp = this->now();
+    path.header.stamp = rclcpp::Time(0, 0, RCL_ROS_TIME);
     path.header.frame_id = this->map_frame_;
 
     geometry_msgs::msg::PoseArray kf_poses;
@@ -987,7 +987,7 @@ void dlio::LioSamMapOptimizationNode::publishGlobalMap(
 
     sensor_msgs::msg::PointCloud2 map_ros;
     pcl::toROSMsg(*global_map, map_ros);
-    map_ros.header.stamp = this->now();
+    map_ros.header.stamp = rclcpp::Time(0, 0, RCL_ROS_TIME); // use latest TF
     map_ros.header.frame_id = this->map_frame_;
     this->corrected_map_pub_->publish(map_ros);
 }
@@ -1027,7 +1027,7 @@ void dlio::LioSamMapOptimizationNode::publishLoopClosureMarkers()
     {
         visualization_msgs::msg::Marker marker;
         marker.header.frame_id = this->map_frame_;
-        marker.header.stamp = this->now();
+        marker.header.stamp = rclcpp::Time(0, 0, RCL_ROS_TIME);
         marker.ns = "loop_closures";
         marker.id = idx++;
         marker.type = visualization_msgs::msg::Marker::LINE_STRIP;

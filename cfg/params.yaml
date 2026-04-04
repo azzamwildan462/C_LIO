@@ -14,13 +14,14 @@
   ros__parameters:
     use_sim_time: true
 
+    deep_debug/odom: false
     debug/odom: false
     debug/graph_slam: false
     debug/print_odom: false # Activate this to print odometry like default DLIO
 
     # TF source for map→odom: "odom" (OdomNode) or "lio_sam_opt"
     # In localization mode, OdomNode always publishes regardless.
-    map/tf_source: "lio_sam_opt"
+    map/tf_source: "odom"
 
     frames/map: map
     frames/odom: odom
@@ -30,12 +31,12 @@
 
     map/waitUntilMove: true
     map/dense/filtered: false
-    map/sparse/leafSize: 0.25
+    map/sparse/leafSize: 0.1
 
     map/mode: "localization"
     map/path: "" # empty = defaults to $HOME/.ros/dlio_map.pcd
     map/use_corrected: true # load graph-optimized _corrected files in localization mode
-    map/voxel_size: 0.25
+    map/voxel_size: 0.1
     map/chunk_size: 20.0
     map/auto_save_interval: 30.0
     map/publish_interval: 5.0 # throttle map/corrected_map publish (seconds)
@@ -94,13 +95,14 @@
     # ====================================================================================================================================================
 
     odom/gravity: 9.80665
+    odom/use_2d_imu: false
     odom/computeTimeOffset: true
 
     odom/imu/approximateGravity: false
     odom/imu/calibration/gyro: true
     odom/imu/calibration/accel: true
     odom/imu/calibration/time: 3.0
-    odom/imu/bufferSize: 5000
+    odom/imu/bufferSize: 2000
 
     odom/preprocessing/cropBoxFilter/size: 1.0
     odom/preprocessing/voxelFilter/res: 0.25
@@ -111,7 +113,7 @@
     odom/submap/keyframe/knn: 10
     odom/submap/keyframe/kcv: 10
     odom/submap/keyframe/kcc: 10
-    odom/registration_method: "ndt" # "gicp" or "ndt"
+    odom/registration_method: "gicp" # "gicp" or "ndt"
 
     odom/ndt/resolution: 1.0
     odom/ndt/num_threads: 4
@@ -119,11 +121,11 @@
     odom/ndt/step_size: 0.3
 
     odom/gicp/minNumPoints: 64
-    odom/gicp/kCorrespondences: 16
-    odom/gicp/maxCorrespondenceDistance: 1.5
-    odom/gicp/maxIterations: 32
-    odom/gicp/transformationEpsilon: 0.01
-    odom/gicp/rotationEpsilon: 0.01
+    odom/gicp/kCorrespondences: 8
+    odom/gicp/maxCorrespondenceDistance: 0.5
+    odom/gicp/maxIterations: 64
+    odom/gicp/transformationEpsilon: 0.001
+    odom/gicp/rotationEpsilon: 0.001
     odom/gicp/initLambdaFactor: 0.000000001
 
     odom/geo/Kp: 4.5

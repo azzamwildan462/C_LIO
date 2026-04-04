@@ -531,6 +531,8 @@ private:
 
   bool debug_;
   bool debug_print_;
+  bool deep_debug_ = false;
+  bool use_2d_imu_ = false;
 
   // Map load/save
   std::string map_mode_;
