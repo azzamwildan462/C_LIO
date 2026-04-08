@@ -348,40 +348,60 @@ void dlio::OdomNode::buildSubmap(State vehicle_state)
     // Pause to prevent stealing resources from the main loop if it is running.
     this->pauseSubmapBuildIfNeeded();
 
-    // reinitialize submap cloud and normals
-    pcl::PointCloud<PointType>::Ptr submap_cloud_ = std::make_shared<pcl::PointCloud<PointType>>();
-    std::shared_ptr<nano_gicp::CovarianceList> submap_normals_;
-    if (this->use_gicp_)
+    if (this->submap_method_ == "voxel_hash_map" && this->voxel_map_)
     {
-      submap_normals_ = std::make_shared<nano_gicp::CovarianceList>();
+      // Voxel hash map: incrementally add new keyframes only
+      int num_kf = static_cast<int>(this->keyframes.size());
+      for (int k = this->voxel_map_last_kf_idx_; k < num_kf; ++k)
+      {
+        lock.lock();
+        auto kf_cloud = this->keyframes[k].second;
+        lock.unlock();
+        this->voxel_map_->update(kf_cloud, vehicle_state.p);
+      }
+      this->voxel_map_last_kf_idx_ = num_kf;
+
+      this->submap_cloud = this->voxel_map_->getCloud();
     }
-
-    for (auto k : this->submap_kf_idx_curr)
+    else
     {
-
-      // create current submap cloud
-      lock.lock();
-      *submap_cloud_ += *this->keyframes[k].second;
-      lock.unlock();
-
-      // grab corresponding submap cloud's normals (GICP only)
+      // KNN keyframe submap (default)
+      pcl::PointCloud<PointType>::Ptr submap_cloud_ = std::make_shared<pcl::PointCloud<PointType>>();
+      std::shared_ptr<nano_gicp::CovarianceList> submap_normals_;
       if (this->use_gicp_)
       {
-        submap_normals_->insert(std::end(*submap_normals_),
-                                std::begin(*(this->keyframe_normals[k])), std::end(*(this->keyframe_normals[k])));
+        submap_normals_ = std::make_shared<nano_gicp::CovarianceList>();
       }
-    }
 
-    this->submap_cloud = submap_cloud_;
-    if (this->use_gicp_)
-    {
-      this->submap_normals = submap_normals_;
+      for (auto k : this->submap_kf_idx_curr)
+      {
+        lock.lock();
+        *submap_cloud_ += *this->keyframes[k].second;
+        lock.unlock();
+
+        if (this->use_gicp_)
+        {
+          submap_normals_->insert(std::end(*submap_normals_),
+                                  std::begin(*(this->keyframe_normals[k])), std::end(*(this->keyframe_normals[k])));
+        }
+      }
+
+      this->submap_cloud = submap_cloud_;
+      if (this->use_gicp_)
+      {
+        this->submap_normals = submap_normals_;
+      }
     }
 
     // Pause to prevent stealing resources from the main loop if it is running.
     this->pauseSubmapBuildIfNeeded();
 
-    if (this->use_gicp_)
+    if (this->registration_method_ == "robust_icp")
+    {
+      this->robust_icp_temp_.setInputTarget(this->submap_cloud);
+      this->submap_kdtree = this->robust_icp_temp_.target_kdtree_;
+    }
+    else if (this->use_gicp_)
     {
       this->gicp_temp.setInputTarget(this->submap_cloud);
       this->submap_kdtree = this->gicp_temp.target_kdtree_;

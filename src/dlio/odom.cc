@@ -224,6 +224,24 @@ dlio::OdomNode::OdomNode(const rclcpp::NodeOptions &options)
     this->ndt_temp.setNeighborhoodSearchMethod(search);
   }
 
+  // Robust ICP (KISS-ICP style point-to-point with GM kernel)
+  if (this->registration_method_ == "robust_icp")
+  {
+    double kernel_scale = 0.0;
+    dlio::declare_param(this, "odom/robust_icp/kernel_scale", kernel_scale, 0.0);
+
+    this->robust_icp_.setMaxIterations(this->gicp_max_iter_);
+    this->robust_icp_.setMaxCorrespondenceDistance(this->gicp_max_corr_dist_);
+    this->robust_icp_.setConvergenceEpsilon(this->gicp_transformation_ep_);
+    this->robust_icp_.setKernelScale(kernel_scale);
+
+    this->robust_icp_temp_.setMaxIterations(this->gicp_max_iter_);
+    this->robust_icp_temp_.setMaxCorrespondenceDistance(this->gicp_max_corr_dist_);
+
+    RCLCPP_INFO(this->get_logger(), "[odom] Using Robust ICP (KISS-ICP style, GM kernel, sigma=%.2f)",
+                kernel_scale > 0 ? kernel_scale : this->gicp_max_corr_dist_);
+  }
+
   this->geo.first_opt_done = false;
   this->geo.prev_vel = Eigen::Vector3f(0., 0., 0.);
 
@@ -453,6 +471,7 @@ void dlio::OdomNode::getParams()
   dlio::declare_param(this, "debug/print_odom", this->debug_print_, false);
   dlio::declare_param(this, "deep_debug/odom", this->deep_debug_, false);
   dlio::declare_param(this, "odom/use_2d_imu", this->use_2d_imu_, false);
+  dlio::declare_param(this, "odom/use_imu", this->use_imu_, true);
 
   // Version
   dlio::declare_param(this, "version", this->version_, "0.0.0");
@@ -477,9 +496,33 @@ void dlio::OdomNode::getParams()
   dlio::declare_param(this, "odom/keyframe/threshR", this->keyframe_thresh_rot_, 1.0);
 
   // Submap
+  dlio::declare_param(this, "odom/submap/method", this->submap_method_, std::string("keyframe"));
   dlio::declare_param(this, "odom/submap/keyframe/knn", this->submap_knn_, 10);
   dlio::declare_param(this, "odom/submap/keyframe/kcv", this->submap_kcv_, 10);
   dlio::declare_param(this, "odom/submap/keyframe/kcc", this->submap_kcc_, 10);
+
+  if (this->submap_method_ == "voxel_hash_map")
+  {
+    double vm_voxel_size = 1.0, vm_max_dist = 100.0;
+    int vm_max_pts = 20;
+    dlio::declare_param(this, "odom/submap/voxel_hash_map/voxel_size", vm_voxel_size, 1.0);
+    dlio::declare_param(this, "odom/submap/voxel_hash_map/max_distance", vm_max_dist, 100.0);
+    dlio::declare_param(this, "odom/submap/voxel_hash_map/max_points_per_voxel", vm_max_pts, 20);
+
+    if (this->use_gicp_)
+    {
+      RCLCPP_WARN(this->get_logger(),
+                  "[odom] GICP incompatible with voxel_hash_map (no covariances), falling back to keyframe submap");
+      this->submap_method_ = "keyframe";
+    }
+    else
+    {
+      this->voxel_map_ = std::make_unique<dlio::VoxelHashMap>(vm_voxel_size, vm_max_dist, vm_max_pts);
+      RCLCPP_INFO(this->get_logger(),
+                  "[odom] Using voxel hash map submap (voxel=%.2fm, max_dist=%.0fm, max_pts=%d)",
+                  vm_voxel_size, vm_max_dist, vm_max_pts);
+    }
+  }
 
   // Dense map resolution
   dlio::declare_param(this, "map/dense/filtered", this->densemap_filtered_, true);
@@ -602,10 +645,21 @@ void dlio::OdomNode::getParams()
     this->imu_accel_sm_ = Eigen::Matrix3f::Identity();
   }
 
+  // Force off IMU-dependent features when use_imu=false
+  if (!this->use_imu_)
+  {
+    this->deskew_ = false;
+    this->imu_calibrate_ = false;
+    this->gravity_align_ = false;
+    this->calibrate_accel_ = false;
+    this->calibrate_gyro_ = false;
+    this->adaptive_params_ = false;
+    RCLCPP_INFO(this->get_logger(), "[odom] use_imu=false: deskew/calibration/gravity/adaptive forced off");
+  }
+
   // Registration method
-  std::string reg_method_str;
-  dlio::declare_param(this, "odom/registration_method", reg_method_str, std::string("gicp"));
-  this->use_gicp_ = (reg_method_str == "gicp");
+  dlio::declare_param(this, "odom/registration_method", this->registration_method_, std::string("gicp"));
+  this->use_gicp_ = (this->registration_method_ == "gicp");
 
   // NDT params
   dlio::declare_param(this, "odom/ndt/resolution", this->ndt_resolution_, 2.0);

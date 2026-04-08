@@ -83,33 +83,43 @@ void dlio::OdomNode::preprocessPoints()
 
     this->scan_stamp = rclcpp::Time(this->scan_header_stamp).seconds();
 
-    // don't process scans until IMU data is present
+    // don't process scans until IMU data is present (skip check in pure LiDAR mode)
     if (!this->first_valid_scan)
     {
-
-      if (this->imu_buffer.empty() || this->scan_stamp <= this->imu_buffer.back().stamp)
+      if (this->use_imu_)
       {
-        return;
+        if (this->imu_buffer.empty() || this->scan_stamp <= this->imu_buffer.back().stamp)
+        {
+          return;
+        }
       }
 
       this->first_valid_scan = true;
       this->T_prior = this->T; // assume no motion for the first scan
+      this->T_prev_ = this->T; // init for constant velocity model
     }
     else
     {
-
-      // IMU prior for second scan onwards
-      std::vector<Eigen::Matrix4f, Eigen::aligned_allocator<Eigen::Matrix4f>> frames;
-      frames = this->integrateImu(this->prev_scan_stamp, this->lidarPose.q, this->lidarPose.p,
-                                  this->geo.prev_vel.cast<float>(), {this->scan_stamp});
-
-      if (frames.size() > 0)
+      if (this->use_imu_)
       {
-        this->T_prior = frames.back();
+        // IMU prior for second scan onwards
+        std::vector<Eigen::Matrix4f, Eigen::aligned_allocator<Eigen::Matrix4f>> frames;
+        frames = this->integrateImu(this->prev_scan_stamp, this->lidarPose.q, this->lidarPose.p,
+                                    this->geo.prev_vel.cast<float>(), {this->scan_stamp});
+
+        if (frames.size() > 0)
+        {
+          this->T_prior = frames.back();
+        }
+        else
+        {
+          this->T_prior = this->T;
+        }
       }
       else
       {
-        this->T_prior = this->T;
+        // Pure LiDAR: constant velocity model (like KISS-ICP)
+        this->T_prior = this->T * this->T_prev_.inverse() * this->T;
       }
     }
 
@@ -302,8 +312,8 @@ void dlio::OdomNode::deskewPointcloud()
 void dlio::OdomNode::initializeDLIO()
 {
 
-  // Wait for IMU
-  if (!this->first_imu_received || !this->imu_calibrated)
+  // Wait for IMU (skip if pure LiDAR mode)
+  if (this->use_imu_ && (!this->first_imu_received || !this->imu_calibrated))
   {
     return;
   }
@@ -832,7 +842,7 @@ void dlio::OdomNode::callbackImu(const sensor_msgs::msg::Imu::SharedPtr imu_raw)
     // Notify the callbackPointCloud thread that IMU data exists for this time
     this->cv_imu_stamp.notify_one();
 
-    if (this->geo.first_opt_done)
+    if (this->use_imu_ && this->geo.first_opt_done)
     {
       // Geometric Observer: Propagate State
       this->propagateState();

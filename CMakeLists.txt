@@ -118,6 +118,8 @@ add_library(dlio_odom_component SHARED
   src/dlio/odom.cc
   src/dlio/odom_callbacks.cc
   src/dlio/odom_registration.cc
+  src/dlio/robust_icp.cc
+  src/dlio/voxel_hash_map.cc
   src/dlio/odom_keyframes.cc
   src/dlio/odom_relocalization.cc
   src/dlio/odom_services.cc

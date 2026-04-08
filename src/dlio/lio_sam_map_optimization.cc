@@ -179,6 +179,11 @@ void dlio::LioSamMapOptimizationNode::getParams()
     dlio::declare_param(this, "isam/relinearize_threshold", this->isam_relinearize_threshold_, 0.1);
     dlio::declare_param(this, "isam/relinearize_skip", this->isam_relinearize_skip_, 1);
 
+    // Noise model
+    dlio::declare_param(this, "odom_noise/rotation", this->odom_noise_rot_, 0.1);
+    dlio::declare_param(this, "odom_noise/translation", this->odom_noise_trans_, 0.5);
+    dlio::declare_param(this, "loop_noise/multiplier", this->loop_noise_multiplier_, 0.001);
+
     // Map save
     dlio::declare_param(this, "map/mode", this->map_mode_, std::string("mapping"));
     dlio::declare_param(this, "map/tf_source", this->tf_map_odom_source_, std::string("odom"));
@@ -215,7 +220,7 @@ void dlio::LioSamMapOptimizationNode::publishMapToOdomTF()
     q.normalize();
 
     geometry_msgs::msg::TransformStamped tf_msg;
-    tf_msg.header.stamp = this->now();
+    tf_msg.header.stamp = this->tf_stamp_cached_;
     tf_msg.header.frame_id = this->map_frame_;
     tf_msg.child_frame_id = this->odom_frame_;
 
@@ -371,7 +376,9 @@ void dlio::LioSamMapOptimizationNode::callbackKeyframe(
             gtsam::Pose3 prev_pose = this->isometryToGtsamPose(this->keyframes_.back().pose);
             gtsam::Pose3 relative = prev_pose.between(current_pose);
             auto odom_noise = gtsam::noiseModel::Diagonal::Variances(
-                (gtsam::Vector(6) << 1e-2, 1e-2, 1e-2, 1e-1, 1e-1, 1e-1).finished());
+                (gtsam::Vector(6) << this->odom_noise_rot_, this->odom_noise_rot_, this->odom_noise_rot_,
+                 this->odom_noise_trans_, this->odom_noise_trans_, this->odom_noise_trans_)
+                    .finished());
             this->gtsam_graph_.add(gtsam::BetweenFactor<gtsam::Pose3>(
                 X(idx - 1), X(idx), relative, odom_noise));
             this->initial_estimate_.insert(X(idx), current_pose);
@@ -567,17 +574,27 @@ void dlio::LioSamMapOptimizationNode::addLoopFactors()
 
 void dlio::LioSamMapOptimizationNode::updateISAM()
 {
-    this->isam_->update(this->gtsam_graph_, this->initial_estimate_);
-    this->isam_->update();
-
-    // Extra iterations for loop closure convergence (like LIO-SAM)
-    if (this->a_loop_is_closed_)
+    try
     {
+        this->isam_->update(this->gtsam_graph_, this->initial_estimate_);
         this->isam_->update();
-        this->isam_->update();
-        this->isam_->update();
-        this->isam_->update();
-        this->isam_->update();
+
+        // Extra iterations for loop closure convergence (like LIO-SAM)
+        if (this->a_loop_is_closed_)
+        {
+            this->isam_->update();
+            this->isam_->update();
+            this->isam_->update();
+            this->isam_->update();
+            this->isam_->update();
+        }
+    }
+    catch (const gtsam::IndeterminantLinearSystemException &e)
+    {
+        RCLCPP_WARN(this->get_logger(),
+                    "[lio_sam_opt] Indeterminant linear system detected, skipping this update: %s",
+                    e.what());
+        this->a_loop_is_closed_ = false;
     }
 
     this->gtsam_graph_.resize(0);
@@ -634,6 +651,7 @@ void dlio::LioSamMapOptimizationNode::correctPoses()
         {
             std::lock_guard<std::mutex> lock(this->tf_map_odom_mtx_);
             this->T_map_odom_cached_ = T_map_odom;
+            this->tf_stamp_cached_ = this->keyframes_[latest_idx].timestamp;
         }
     }
 }
@@ -674,11 +692,14 @@ bool dlio::LioSamMapOptimizationNode::detectLoopClosureDistance(int &loop_cur, i
         this->history_keyframe_search_radius_,
         search_ind, search_dist, 0);
 
-    // Find oldest keyframe within radius that satisfies time gap
+    // Find oldest keyframe within radius that satisfies time AND index gap
     double cur_time = rclcpp::Time(this->keyframes_[loop_cur].timestamp).seconds();
     for (int i = 0; i < static_cast<int>(search_ind.size()); ++i)
     {
         int id = search_ind[i];
+        // Skip candidates that are too close in index (adjacent poses)
+        if (std::abs(loop_cur - id) < this->min_keyframe_gap_)
+            continue;
         double id_time = rclcpp::Time(this->keyframes_[id].timestamp).seconds();
         if (std::abs(cur_time - id_time) > this->history_keyframe_search_time_diff_)
         {
@@ -804,6 +825,27 @@ void dlio::LioSamMapOptimizationNode::performLoopClosure()
     double fitness_score = std::numeric_limits<double>::max();
     Eigen::Matrix4f final_T = Eigen::Matrix4f::Identity();
 
+    // Compute initial guess from SC++ heading shift (rotate around source centroid)
+    Eigen::Matrix4f initial_guess = Eigen::Matrix4f::Identity();
+    if (found_sc && sc_shift != 0)
+    {
+        float yaw = static_cast<float>(sc_shift) * 2.0f * M_PI / static_cast<float>(dlio::sc::SC_NS);
+        Eigen::AngleAxisf rot(yaw, Eigen::Vector3f::UnitZ());
+        Eigen::Matrix3f R = rot.toRotationMatrix();
+        Eigen::Vector4f centroid;
+        pcl::compute3DCentroid(*cur_keyframe_cloud, centroid);
+        Eigen::Vector3f c = centroid.head<3>();
+        initial_guess.block<3, 3>(0, 0) = R;
+        initial_guess.block<3, 1>(0, 3) = c - R * c;
+
+        if (this->debug_)
+        {
+            RCLCPP_INFO(this->get_logger(),
+                        "[lio_sam_opt] SC++ initial guess: yaw=%.1f deg (shift=%d/%d)",
+                        yaw * 180.0f / M_PI, sc_shift, dlio::sc::SC_NS);
+        }
+    }
+
     if (this->lc_registration_method_ == "gicp")
     {
         nano_gicp::NanoGICP<PointType, PointType> gicp;
@@ -814,7 +856,7 @@ void dlio::LioSamMapOptimizationNode::performLoopClosure()
         gicp.setRotationEpsilon(this->lc_rotation_ep_);
         gicp.setInputSource(cur_keyframe_cloud);
         gicp.setInputTarget(prev_keyframe_cloud);
-        gicp.align(*aligned);
+        gicp.align(*aligned, initial_guess);
         converged = gicp.hasConverged();
         fitness_score = gicp.getFitnessScore();
         final_T = gicp.getFinalTransformation();
@@ -829,7 +871,7 @@ void dlio::LioSamMapOptimizationNode::performLoopClosure()
         ndt.setTransformationEpsilon(this->lc_transformation_ep_);
         ndt.setInputSource(cur_keyframe_cloud);
         ndt.setInputTarget(prev_keyframe_cloud);
-        ndt.align(*aligned);
+        ndt.align(*aligned, initial_guess);
         converged = ndt.hasConverged();
         fitness_score = ndt.getFitnessScore();
         final_T = ndt.getFinalTransformation();
@@ -844,7 +886,7 @@ void dlio::LioSamMapOptimizationNode::performLoopClosure()
         icp.setRANSACIterations(0);
         icp.setInputSource(cur_keyframe_cloud);
         icp.setInputTarget(prev_keyframe_cloud);
-        icp.align(*aligned);
+        icp.align(*aligned, initial_guess);
         converged = icp.hasConverged();
         fitness_score = icp.getFitnessScore();
         final_T = icp.getFinalTransformation();
@@ -868,13 +910,23 @@ void dlio::LioSamMapOptimizationNode::performLoopClosure()
     Eigen::Affine3f t_wrong(cur_pose_snap.matrix().cast<float>());
     Eigen::Affine3f t_correct = correction * t_wrong;
 
+    // Log ICP correction magnitude
+    {
+        Eigen::Matrix3f R_corr = correction.rotation();
+        float angle_rad = std::acos(std::min(1.0f, std::max(-1.0f,
+                                                            (R_corr.trace() - 1.0f) / 2.0f)));
+        Eigen::Vector3f t_corr = correction.translation();
+        RCLCPP_INFO(this->get_logger(),
+                    "[lio_sam_opt] Loop ICP correction: rot=%.2f deg, trans=[%.3f,%.3f,%.3f] (norm=%.3f)",
+                    angle_rad * 180.0f / M_PI, t_corr.x(), t_corr.y(), t_corr.z(), t_corr.norm());
+    }
+
     gtsam::Pose3 pose_from = gtsam::Pose3(t_correct.matrix().cast<double>());
     gtsam::Pose3 pose_to = this->isometryToGtsamPose(pre_pose_snap);
     gtsam::Pose3 pose_between = pose_from.between(pose_to);
 
     // ICP fitness is mean squared point distance — not a good variance directly.
-    // Scale down: good ICP fit (fitness=0.1) → σ ≈ 3cm translation, ~0.3° rotation.
-    float noise_score = static_cast<float>(fitness_score) * 0.01f;
+    float noise_score = static_cast<float>(fitness_score) * static_cast<float>(this->loop_noise_multiplier_);
     float noise_rot = noise_score;
     float noise_trans = noise_score;
     gtsam::Vector6 noise_vec;

@@ -14,6 +14,8 @@
 #include "dlio/dlio.h"
 #include "dlio/scan_context.h"
 #include "dlio/occupancy_grid.h"
+#include "dlio/robust_icp.h"
+#include "dlio/voxel_hash_map.h"
 
 // g2o
 #include "g2o/core/sparse_optimizer.h"
@@ -297,9 +299,12 @@ private:
   std::vector<int> keyframe_concave;
 
   // Submap
+  std::string submap_method_;
   pcl::PointCloud<PointType>::ConstPtr submap_cloud;
   std::shared_ptr<const nano_gicp::CovarianceList> submap_normals;
   std::shared_ptr<const nanoflann::KdTreeFLANN<PointType>> submap_kdtree;
+  std::unique_ptr<dlio::VoxelHashMap> voxel_map_;
+  int voxel_map_last_kf_idx_ = 0;
 
   std::vector<int> submap_kf_idx_curr;
   std::vector<int> submap_kf_idx_prev;
@@ -322,12 +327,15 @@ private:
   double first_scan_stamp;
   double elapsed_time;
 
-  // Registration (GICP or NDT)
+  // Registration (GICP, NDT, or Robust ICP)
+  std::string registration_method_;
   bool use_gicp_;
   nano_gicp::NanoGICP<PointType, PointType> gicp;
   nano_gicp::NanoGICP<PointType, PointType> gicp_temp;
   pclomp::NormalDistributionsTransform<PointType, PointType> ndt;
   pclomp::NormalDistributionsTransform<PointType, PointType> ndt_temp;
+  dlio::RobustICP robust_icp_;
+  dlio::RobustICP robust_icp_temp_;
 
   // Transformations
   Eigen::Matrix4f T, T_prior, T_corr;
@@ -533,6 +541,8 @@ private:
   bool debug_print_;
   bool deep_debug_ = false;
   bool use_2d_imu_ = false;
+  bool use_imu_ = true;
+  Eigen::Matrix4f T_prev_ = Eigen::Matrix4f::Identity();
 
   // Map load/save
   std::string map_mode_;

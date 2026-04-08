@@ -27,6 +27,7 @@
 #include <direct_lidar_inertial_odometry/srv/save_pcd.hpp>
 
 // PCL
+#include <pcl/common/centroid.h>
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/io/pcd_io.h>
 #include <pcl/kdtree/kdtree_flann.h>
@@ -52,6 +53,7 @@
 #include <gtsam/nonlinear/Values.h>
 #include <gtsam/nonlinear/ISAM2.h>
 #include <gtsam/inference/Symbol.h>
+#include <gtsam/linear/linearExceptions.h>
 
 // TF2
 #include <tf2_ros/transform_broadcaster.h>
@@ -186,6 +188,7 @@ private:
   // TF
   std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
   Eigen::Isometry3d T_map_odom_cached_ = Eigen::Isometry3d::Identity();
+  rclcpp::Time tf_stamp_cached_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
   std::mutex tf_map_odom_mtx_;
 
   // Timers
@@ -264,6 +267,11 @@ private:
 
   // Voxel filter
   double voxel_leaf_size_;
+
+  // Noise model
+  double odom_noise_rot_;
+  double odom_noise_trans_;
+  double loop_noise_multiplier_;
 
   // GPS
   bool gps_enabled_;
