@@ -405,7 +405,7 @@ Visualization Manager:
         Filter size: 10
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: /dlio/graph_slam/corrected_map
+        Value: /dlio/lio_sam_opt/corrected_map
       Use Fixed Frame: true
       Use rainbow: true
       Value: false

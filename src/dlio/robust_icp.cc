@@ -169,6 +169,21 @@ namespace dlio
     pcl::transformPointCloud(*source_, output, final_transformation_);
   }
 
+  void RobustICP::align(pcl::PointCloud<PointType> &output, const Eigen::Matrix4f &guess)
+  {
+    // Transform source by initial guess, then run normal align
+    auto transformed_source = std::make_shared<pcl::PointCloud<PointType>>();
+    pcl::transformPointCloud(*source_, *transformed_source, guess);
+    auto original_source = source_;
+    source_ = transformed_source;
+    align(output);
+    // Final transformation includes the initial guess
+    final_transformation_ = final_transformation_ * guess;
+    source_ = original_source;
+    // Re-transform output with correct final
+    pcl::transformPointCloud(*original_source, output, final_transformation_);
+  }
+
   double RobustICP::getFitnessScore(double max_range) const
   {
     if (!source_ || !target_ || !target_kdtree_)

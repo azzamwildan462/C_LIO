@@ -342,7 +342,7 @@ dlio::OdomNode::OdomNode(const rclcpp::NodeOptions &options)
   this->save_corrected_pcd_client_ = this->create_client<direct_lidar_inertial_odometry::srv::SavePCD>(
       "save_corrected_pcd", rmw_qos_profile_services_default, this->service_cb_group_);
 
-  // Subscribe to corrected keyframe poses from graph_slam
+  // Subscribe to corrected keyframe poses from lio_sam_opt
   this->corrected_kf_poses_sub_ = this->create_subscription<geometry_msgs::msg::PoseArray>(
       "corrected_kf_poses", 10,
       [this](const geometry_msgs::msg::PoseArray::SharedPtr msg)
@@ -685,6 +685,29 @@ void dlio::OdomNode::getParams()
   dlio::declare_param(this, "odom/geo/Kgb", this->geo_Kgb_, 1.0);
   dlio::declare_param(this, "odom/geo/abias_max", this->geo_abias_max_, 1.0);
   dlio::declare_param(this, "odom/geo/gbias_max", this->geo_gbias_max_, 1.0);
+
+  // Localization registration helper (continuous loc, submap loc, SC reloc)
+  {
+    std::string loc_reg_method;
+    dlio::declare_param(this, "odom/localization/registration_method", loc_reg_method, std::string("gicp"));
+
+    auto setupHelper = [&](dlio::RegistrationHelper &h, const std::string &method, double corr_dist)
+    {
+      h.setMethod(method);
+      h.setMaxCorrespondenceDistance(corr_dist);
+      h.setMaxIterations(this->gicp_max_iter_);
+      h.setTransformationEpsilon(this->gicp_transformation_ep_);
+      h.setRotationEpsilon(this->gicp_rotation_ep_);
+      h.setGICPCorrespondenceRandomness(this->gicp_k_correspondences_);
+      h.setNDTResolution(this->ndt_resolution_);
+      h.setNDTNumThreads(this->ndt_num_threads_);
+    };
+
+    setupHelper(this->loc_registration_, loc_reg_method, this->gicp_max_corr_dist_);
+    setupHelper(this->reloc_registration_, loc_reg_method, 5.0); // wider for relocalization
+
+    RCLCPP_INFO(this->get_logger(), "[odom] Localization registration: %s", loc_reg_method.c_str());
+  }
 
   // Map load/save
   dlio::declare_param(this, "map/mode", this->map_mode_, std::string("localization"));

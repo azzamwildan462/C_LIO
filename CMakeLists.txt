@@ -120,6 +120,7 @@ add_library(dlio_odom_component SHARED
   src/dlio/odom_registration.cc
   src/dlio/robust_icp.cc
   src/dlio/voxel_hash_map.cc
+  src/dlio/registration_helper.cc
   src/dlio/odom_keyframes.cc
   src/dlio/odom_relocalization.cc
   src/dlio/odom_services.cc
@@ -151,24 +152,11 @@ ament_target_dependencies(dlio_map_component
 )
 rclcpp_components_register_nodes(dlio_map_component "dlio::MapNode")
 
-# Graph SLAM Component
-add_library(dlio_graph_slam_component SHARED
-  src/dlio/graph_slam.cc
-)
-target_compile_options(dlio_graph_slam_component PRIVATE ${OpenMP_FLAGS})
-target_link_libraries(dlio_graph_slam_component
-  ${PCL_LIBRARIES} ${OpenMP_LIBS} Threads::Threads nano_gicp ${cpp_typesupport_target}
-  g2o::core g2o::types_slam3d g2o::solver_eigen 
-  ${GeographicLib_LIBRARIES}
-)
-ament_target_dependencies(dlio_graph_slam_component
-  rclcpp rclcpp_components pcl_ros pcl_conversions nav_msgs sensor_msgs geometry_msgs visualization_msgs ndt_omp_ros2
-)
-rclcpp_components_register_nodes(dlio_graph_slam_component "dlio::GraphSlamNode")
-
 # LIO-SAM Map Optimization Component (GTSAM iSAM2)
 add_library(dlio_lio_sam_map_opt_component SHARED
   src/dlio/lio_sam_map_optimization.cc
+  src/dlio/registration_helper.cc
+  src/dlio/robust_icp.cc
 )
 target_compile_options(dlio_lio_sam_map_opt_component PRIVATE ${OpenMP_FLAGS})
 target_link_libraries(dlio_lio_sam_map_opt_component
@@ -194,10 +182,6 @@ target_link_libraries(dlio_map_node dlio_map_component)
 ament_target_dependencies(dlio_map_node rclcpp)
 
 # Graph SLAM Node
-add_executable(dlio_graph_slam_node src/dlio/graph_slam_node.cc)
-target_link_libraries(dlio_graph_slam_node dlio_graph_slam_component)
-ament_target_dependencies(dlio_graph_slam_node rclcpp)
-
 # LIO-SAM Map Optimization Node
 add_executable(dlio_lio_sam_map_opt_node src/dlio/lio_sam_map_optimization_node.cc)
 target_link_libraries(dlio_lio_sam_map_opt_node dlio_lio_sam_map_opt_component)
@@ -206,14 +190,13 @@ ament_target_dependencies(dlio_lio_sam_map_opt_node rclcpp)
 # ---- Export & Install ----
 
 ament_export_include_directories(include)
-ament_export_libraries(dlio_odom_component dlio_map_component dlio_graph_slam_component dlio_lio_sam_map_opt_component nano_gicp nanoflann)
+ament_export_libraries(dlio_odom_component dlio_map_component dlio_lio_sam_map_opt_component nano_gicp nanoflann)
 ament_export_dependencies(rclcpp rclcpp_components std_msgs sensor_msgs geometry_msgs pcl_ros)
 ament_package()
 
 install(TARGETS
   dlio_odom_component
   dlio_map_component
-  dlio_graph_slam_component
   dlio_lio_sam_map_opt_component
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib
@@ -221,7 +204,7 @@ install(TARGETS
 )
 
 install(TARGETS
-  dlio_odom_node dlio_map_node dlio_graph_slam_node dlio_lio_sam_map_opt_node
+  dlio_odom_node dlio_map_node dlio_lio_sam_map_opt_node
   DESTINATION lib/${PROJECT_NAME}
 )
 

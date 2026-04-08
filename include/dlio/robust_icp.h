@@ -24,6 +24,7 @@ namespace dlio
     void setTargetKdTree(std::shared_ptr<const nanoflann::KdTreeFLANN<PointType>> tree);
 
     void align(pcl::PointCloud<PointType> &output);
+    void align(pcl::PointCloud<PointType> &output, const Eigen::Matrix4f &guess);
 
     Eigen::Matrix4f getFinalTransformation() const { return final_transformation_; }
     double getFitnessScore(double max_range) const;

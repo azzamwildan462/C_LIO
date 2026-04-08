@@ -846,50 +846,21 @@ void dlio::LioSamMapOptimizationNode::performLoopClosure()
         }
     }
 
-    if (this->lc_registration_method_ == "gicp")
     {
-        nano_gicp::NanoGICP<PointType, PointType> gicp;
-        gicp.setCorrespondenceRandomness(this->lc_gicp_k_correspondences_);
-        gicp.setMaxCorrespondenceDistance(this->lc_max_corr_dist_);
-        gicp.setMaximumIterations(this->lc_max_iterations_);
-        gicp.setTransformationEpsilon(this->lc_transformation_ep_);
-        gicp.setRotationEpsilon(this->lc_rotation_ep_);
-        gicp.setInputSource(cur_keyframe_cloud);
-        gicp.setInputTarget(prev_keyframe_cloud);
-        gicp.align(*aligned, initial_guess);
-        converged = gicp.hasConverged();
-        fitness_score = gicp.getFitnessScore();
-        final_T = gicp.getFinalTransformation();
-    }
-    else if (this->lc_registration_method_ == "ndt")
-    {
-        pclomp::NormalDistributionsTransform<PointType, PointType> ndt;
-        ndt.setResolution(this->ndt_resolution_);
-        ndt.setNumThreads(this->ndt_num_threads_);
-        ndt.setNeighborhoodSearchMethod(pclomp::DIRECT7);
-        ndt.setMaximumIterations(this->lc_max_iterations_);
-        ndt.setTransformationEpsilon(this->lc_transformation_ep_);
-        ndt.setInputSource(cur_keyframe_cloud);
-        ndt.setInputTarget(prev_keyframe_cloud);
-        ndt.align(*aligned, initial_guess);
-        converged = ndt.hasConverged();
-        fitness_score = ndt.getFitnessScore();
-        final_T = ndt.getFinalTransformation();
-    }
-    else
-    {
-        pcl::IterativeClosestPoint<PointType, PointType> icp;
-        icp.setMaxCorrespondenceDistance(this->history_keyframe_search_radius_ * 2);
-        icp.setMaximumIterations(this->lc_max_iterations_);
-        icp.setTransformationEpsilon(this->lc_transformation_ep_);
-        icp.setEuclideanFitnessEpsilon(1e-6);
-        icp.setRANSACIterations(0);
-        icp.setInputSource(cur_keyframe_cloud);
-        icp.setInputTarget(prev_keyframe_cloud);
-        icp.align(*aligned, initial_guess);
-        converged = icp.hasConverged();
-        fitness_score = icp.getFitnessScore();
-        final_T = icp.getFinalTransformation();
+        dlio::RegistrationHelper lc_reg;
+        lc_reg.setMethod(this->lc_registration_method_);
+        lc_reg.setMaxCorrespondenceDistance(this->lc_max_corr_dist_);
+        lc_reg.setMaxIterations(this->lc_max_iterations_);
+        lc_reg.setTransformationEpsilon(this->lc_transformation_ep_);
+        lc_reg.setRotationEpsilon(this->lc_rotation_ep_);
+        lc_reg.setGICPCorrespondenceRandomness(this->lc_gicp_k_correspondences_);
+        lc_reg.setNDTResolution(this->ndt_resolution_);
+        lc_reg.setNDTNumThreads(this->ndt_num_threads_);
+
+        auto reg_result = lc_reg.align(cur_keyframe_cloud, prev_keyframe_cloud, initial_guess);
+        converged = reg_result.converged;
+        fitness_score = reg_result.fitness;
+        final_T = reg_result.transformation;
     }
 
     if (!converged || fitness_score > this->history_keyframe_fitness_score_)

@@ -487,41 +487,11 @@ bool dlio::OdomNode::runRelocalization(pcl::PointCloud<PointType>::ConstPtr scan
       float fitness = std::numeric_limits<float>::max();
       Eigen::Matrix4f T_final = Eigen::Matrix4f::Identity();
 
-      if (this->use_gicp_)
       {
-        nano_gicp::NanoGICP<PointType, PointType> gicp;
-        gicp.setCorrespondenceRandomness(this->gicp_k_correspondences_);
-        gicp.setMaxCorrespondenceDistance(5.0);
-        gicp.setMaximumIterations(64);
-        gicp.setTransformationEpsilon(0.01);
-        gicp.setRotationEpsilon(0.01);
-
-        gicp.setInputSource(raw_scan);
-        gicp.setSourceCovariances(source_covs);
-        gicp.setInputTarget(local_map);
-        gicp.calculateTargetCovariances();
-
-        gicp.align(*aligned, init_guess);
-        converged = gicp.hasConverged();
-        fitness = gicp.getFitnessScore(1.0);
-        T_final = gicp.getFinalTransformation();
-      }
-      else
-      {
-        pclomp::NormalDistributionsTransform<PointType, PointType> ndt_local;
-        ndt_local.setResolution(this->ndt_resolution_);
-        ndt_local.setNumThreads(this->ndt_num_threads_);
-        ndt_local.setNeighborhoodSearchMethod(pclomp::DIRECT7);
-        ndt_local.setMaximumIterations(64);
-        ndt_local.setTransformationEpsilon(0.01);
-
-        ndt_local.setInputSource(raw_scan);
-        ndt_local.setInputTarget(local_map);
-
-        ndt_local.align(*aligned, init_guess);
-        converged = ndt_local.hasConverged();
-        fitness = ndt_local.getFitnessScore(1.0);
-        T_final = ndt_local.getFinalTransformation();
+        auto reg_result = this->reloc_registration_.align(raw_scan, local_map, init_guess);
+        converged = reg_result.converged;
+        fitness = reg_result.fitness;
+        T_final = reg_result.transformation;
       }
 
       if (!converged)
@@ -707,7 +677,7 @@ bool dlio::OdomNode::saveCorrectedKeyframeDatabase()
 
   if (corrected_poses.empty())
   {
-    RCLCPP_INFO(this->get_logger(), "KFDB corrected: no corrected poses from graph_slam, skipping");
+    RCLCPP_INFO(this->get_logger(), "KFDB corrected: no corrected poses from lio_sam_opt, skipping");
     return false;
   }
 

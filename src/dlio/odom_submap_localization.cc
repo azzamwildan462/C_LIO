@@ -266,41 +266,11 @@ void dlio::OdomNode::submapLocalizeStage1(
     float fitness = std::numeric_limits<float>::max();
     Eigen::Matrix4f result_T = Eigen::Matrix4f::Identity();
 
-    if (this->use_gicp_)
     {
-      nano_gicp::NanoGICP<PointType, PointType> gicp;
-      gicp.setCorrespondenceRandomness(this->gicp_k_correspondences_);
-      gicp.setMaxCorrespondenceDistance(this->gicp_max_corr_dist_);
-      gicp.setMaximumIterations(64);
-      gicp.setTransformationEpsilon(0.05);
-      gicp.setRotationEpsilon(0.05);
-
-      gicp.setInputSource(scan_body);
-      gicp.calculateSourceCovariances();
-      gicp.setInputTarget(sm.cloud);
-      gicp.calculateTargetCovariances();
-
-      gicp.align(*aligned, init_guess);
-      converged = gicp.hasConverged();
-      fitness = gicp.getFitnessScore(1.0);
-      result_T = gicp.getFinalTransformation();
-    }
-    else
-    {
-      pclomp::NormalDistributionsTransform<PointType, PointType> ndt_local;
-      ndt_local.setResolution(this->ndt_resolution_);
-      ndt_local.setNumThreads(this->ndt_num_threads_);
-      ndt_local.setNeighborhoodSearchMethod(pclomp::DIRECT7);
-      ndt_local.setMaximumIterations(64);
-      ndt_local.setTransformationEpsilon(0.05);
-
-      ndt_local.setInputSource(scan_body);
-      ndt_local.setInputTarget(sm.cloud);
-
-      ndt_local.align(*aligned, init_guess);
-      converged = ndt_local.hasConverged();
-      fitness = ndt_local.getFitnessScore(1.0);
-      result_T = ndt_local.getFinalTransformation();
+      auto reg_result = this->loc_registration_.align(scan_body, sm.cloud, init_guess);
+      converged = reg_result.converged;
+      fitness = reg_result.fitness;
+      result_T = reg_result.transformation;
     }
 
     float prob = converged ? (1.0f / (1.0f + fitness)) : 0.0f;
@@ -396,41 +366,11 @@ void dlio::OdomNode::submapLocalizeStage2(
   float fitness = std::numeric_limits<float>::max();
   Eigen::Matrix4f result_T = Eigen::Matrix4f::Identity();
 
-  if (this->use_gicp_)
   {
-    nano_gicp::NanoGICP<PointType, PointType> gicp;
-    gicp.setCorrespondenceRandomness(this->gicp_k_correspondences_);
-    gicp.setMaxCorrespondenceDistance(this->gicp_max_corr_dist_);
-    gicp.setMaximumIterations(64);
-    gicp.setTransformationEpsilon(0.05);
-    gicp.setRotationEpsilon(0.05);
-
-    gicp.setInputSource(scan_body);
-    gicp.calculateSourceCovariances();
-    gicp.setInputTarget(sm.cloud);
-    gicp.calculateTargetCovariances();
-
-    gicp.align(*aligned, init_guess);
-    converged = gicp.hasConverged();
-    fitness = gicp.getFitnessScore(1.0);
-    result_T = gicp.getFinalTransformation();
-  }
-  else
-  {
-    pclomp::NormalDistributionsTransform<PointType, PointType> ndt_local;
-    ndt_local.setResolution(this->ndt_resolution_);
-    ndt_local.setNumThreads(this->ndt_num_threads_);
-    ndt_local.setNeighborhoodSearchMethod(pclomp::DIRECT7);
-    ndt_local.setMaximumIterations(64);
-    ndt_local.setTransformationEpsilon(0.05);
-
-    ndt_local.setInputSource(scan_body);
-    ndt_local.setInputTarget(sm.cloud);
-
-    ndt_local.align(*aligned, init_guess);
-    converged = ndt_local.hasConverged();
-    fitness = ndt_local.getFitnessScore(1.0);
-    result_T = ndt_local.getFinalTransformation();
+    auto reg_result = this->loc_registration_.align(scan_body, sm.cloud, init_guess);
+    converged = reg_result.converged;
+    fitness = reg_result.fitness;
+    result_T = reg_result.transformation;
   }
 
   gicp_result_pos = result_T.block<3, 1>(0, 3);

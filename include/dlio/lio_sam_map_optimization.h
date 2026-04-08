@@ -14,6 +14,7 @@
 
 #include "dlio/dlio.h"
 #include "dlio/scan_context.h"
+#include "dlio/registration_helper.h"
 
 // ROS
 #include "rclcpp/rclcpp.hpp"

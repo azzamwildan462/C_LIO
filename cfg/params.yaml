@@ -16,7 +16,6 @@
 
     deep_debug/odom: false
     debug/odom: false
-    debug/graph_slam: false
     debug/print_odom: false # Activate this to print odometry like default DLIO
 
     # TF source for map→odom: "odom" (OdomNode) or "lio_sam_opt"
@@ -51,6 +50,8 @@
     map/relocalize/sc_max_attempts: 10
     map/relocalize/sc_ground_height_threshold: 0.3 # meters, 0 = disabled. Removes flat ground for more discriminative SC
     map/relocalize/sc_search_window: 7 # SC++ sector key search window (±3 shifts around coarse alignment)
+
+    odom/localization/registration_method: "gicp" # "gicp", "ndt", or "robust_icp" (for continuous/submap/SC localization)
 
     map/continuous_localize: true
     map/continuous_localize/on_mapping: false # also run during mapping mode (drift correction vs prior map) (Masih experimental..)

@@ -74,7 +74,6 @@ def generate_launch_description():
     # Load parameters
     dlio_yaml_path = PathJoinSubstitution([current_pkg, 'cfg', 'dlio.yaml'])
     dlio_params_yaml_path = PathJoinSubstitution([current_pkg, 'cfg', 'params.yaml'])
-    graph_slam_yaml_path = PathJoinSubstitution([current_pkg, 'cfg', 'graph_slam.yaml'])
     lio_sam_opt_yaml_path = PathJoinSubstitution([current_pkg, 'cfg', 'lio_sam_map_optimization.yaml'])
 
     # Map params override (passed to both OdomNode and MapNode)
@@ -112,8 +111,8 @@ def generate_launch_description():
                     ('dlio_odom/new_map', 'dlio/odom_node/new_map'),
                     ('dlio_odom/new_map_w_zero', 'dlio/odom_node/new_map_w_zero'),
                     ('save_pcd_map', 'dlio/map_node/save_pcd'),
-                    ('save_corrected_pcd', 'dlio/graph_slam/save_corrected_pcd'),
-                    ('corrected_kf_poses', 'dlio/graph_slam/corrected_kf_poses'),
+                    ('save_corrected_pcd', 'dlio/lio_sam_opt/save_corrected_pcd'),
+                    ('corrected_kf_poses', 'dlio/lio_sam_opt/corrected_kf_poses'),
                     ('occupancy_grid', 'dlio/odom_node/occupancy_grid'),
                 ],
                 extra_arguments=[{'use_intra_process_comms': True}],
@@ -131,24 +130,7 @@ def generate_launch_description():
             #     ],
             #     extra_arguments=[{'use_intra_process_comms': False}],
             # ),
-            # DLIO Graph SLAM Component (g2o-based, experimental)
-            # ComposableNode(
-            #     package='direct_lidar_inertial_odometry',
-            #     plugin='dlio::GraphSlamNode',
-            #     name='dlio_graph_slam',
-            #     parameters=[dlio_yaml_path, dlio_params_yaml_path, graph_slam_yaml_path, map_params, {'gps/topic': gps_topic}],
-            #     remappings=[
-            #         ('keyframe_stamped', 'dlio/odom_node/keyframe_stamped'),
-            #         ('deskewed', 'dlio/odom_node/pointcloud/deskewed_raw'),
-            #         ('corrected_path', 'dlio/graph_slam/corrected_path'),
-            #         ('corrected_map', 'dlio/graph_slam/corrected_map'),
-            #         ('corrected_kf_poses', 'dlio/graph_slam/corrected_kf_poses'),
-            #         ('loop_closures', 'dlio/graph_slam/loop_closures'),
-            #         ('save_corrected_pcd', 'dlio/graph_slam/save_corrected_pcd'),
-            #     ],
-            #     extra_arguments=[{'use_intra_process_comms': True}],
-            # ),
-            # LIO-SAM Map Optimization moved to separate process (see lio_sam_opt_node below)
+            # LIO-SAM Map Optimization moved to separate process (see lio_sam_opt_container below)
             # to prevent heavy ICP/GTSAM work from starving OdomNode threads.
         ],
         output='screen',
@@ -171,7 +153,7 @@ def generate_launch_description():
                     ('keyframe_stamped', 'dlio/odom_node/keyframe_stamped'),
                     ('corrected_path', 'dlio/lio_sam_opt/corrected_path'),
                     ('corrected_map', 'dlio/lio_sam_opt/corrected_map'),
-                    ('corrected_kf_poses', 'dlio/graph_slam/corrected_kf_poses'),
+                    ('corrected_kf_poses', 'dlio/lio_sam_opt/corrected_kf_poses'),
                     ('loop_closures', 'dlio/lio_sam_opt/loop_closures'),
                     ('save_corrected_pcd', 'dlio/lio_sam_opt/save_corrected_pcd'),
                 ],

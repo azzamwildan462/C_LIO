@@ -16,6 +16,7 @@
 #include "dlio/occupancy_grid.h"
 #include "dlio/robust_icp.h"
 #include "dlio/voxel_hash_map.h"
+#include "dlio/registration_helper.h"
 
 // g2o
 #include "g2o/core/sparse_optimizer.h"
@@ -336,6 +337,8 @@ private:
   pclomp::NormalDistributionsTransform<PointType, PointType> ndt_temp;
   dlio::RobustICP robust_icp_;
   dlio::RobustICP robust_icp_temp_;
+  dlio::RegistrationHelper loc_registration_;   // continuous/submap localization
+  dlio::RegistrationHelper reloc_registration_; // SC relocalization (wider params)
 
   // Transformations
   Eigen::Matrix4f T, T_prior, T_corr;
@@ -577,7 +580,7 @@ private:
   std::mutex kfdb_mutex_;
   Eigen::Quaternionf kfdb_gravity_q_{1.f, 0.f, 0.f, 0.f}; // gravity quaternion for KFDB SC frame
 
-  // Corrected keyframe poses from graph_slam (for corrected KFDB)
+  // Corrected keyframe poses from lio_sam_opt (for corrected KFDB)
   rclcpp::Subscription<geometry_msgs::msg::PoseArray>::SharedPtr corrected_kf_poses_sub_;
   std::vector<geometry_msgs::msg::Pose> corrected_kf_poses_;
   std::mutex corrected_kf_poses_mutex_;

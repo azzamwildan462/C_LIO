@@ -32,7 +32,7 @@ namespace dlio::kfdb
               float sc_max_range,
               const Eigen::Quaternionf &gravity_q);
 
-    // Save KFDB with corrected poses from graph_slam.
+    // Save KFDB with corrected poses from lio_sam_opt.
     // Derives path as <stem>_corrected.kfdb from map_path.
     // Returns true on success.
     bool saveCorrected(const std::string &map_path,
