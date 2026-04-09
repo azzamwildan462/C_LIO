@@ -24,9 +24,9 @@ def generate_launch_description():
     pointcloud_topic = LaunchConfiguration('pointcloud_topic', default='points_raw')
     imu_topic = LaunchConfiguration('imu_topic', default='imu_raw')
     gps_topic = LaunchConfiguration('gps_topic', default='gps_raw')
-    map_mode = LaunchConfiguration('map_mode', default='localization')
+    map_mode = LaunchConfiguration('map_mode', default='mapping')
     map_path = LaunchConfiguration('map_path', default='')
-    relocalize = LaunchConfiguration('relocalize', default='true')
+    relocalize = LaunchConfiguration('relocalize', default='false')
     use_corrected = LaunchConfiguration('use_corrected', default='true')
 
     # Define arguments
@@ -117,20 +117,7 @@ def generate_launch_description():
                 ],
                 extra_arguments=[{'use_intra_process_comms': True}],
             ),
-            # DLIO Mapping Component (IPC disabled — kf_cloud published from detached thread)
-            # ComposableNode(
-            #     package='direct_lidar_inertial_odometry',
-            #     plugin='dlio::MapNode',
-            #     name='dlio_map',
-            #     parameters=[dlio_yaml_path, dlio_params_yaml_path, map_params],
-            #     remappings=[
-            #         ('keyframes', 'dlio/odom_node/pointcloud/keyframe'),
-            #         ('map', 'dlio/map_node/map'),
-            #         ('save_pcd', 'dlio/map_node/save_pcd'),
-            #     ],
-            #     extra_arguments=[{'use_intra_process_comms': False}],
-            # ),
-            # LIO-SAM Map Optimization moved to separate process (see lio_sam_opt_container below)
+            # LIO-SAM Map Optimization runs in separate process (see lio_sam_opt_container below)
             # to prevent heavy ICP/GTSAM work from starving OdomNode threads.
         ],
         output='screen',

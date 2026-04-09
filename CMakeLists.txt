@@ -10,7 +10,7 @@
 #                                                         #
 ###########################################################
 
-cmake_minimum_required(VERSION 3.12.4)
+cmake_minimum_required(VERSION 3.18)
 project(direct_lidar_inertial_odometry)
 
 set(CMAKE_BUILD_TYPE "Release")
@@ -36,6 +36,7 @@ find_package(PCL REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(Threads REQUIRED)
 find_package(ndt_omp_ros2 REQUIRED)
+find_package(ndt_cuda_ros2 QUIET)
 find_package(GeographicLib REQUIRED)
 
 # g2o (from ros-humble-libg2o)
@@ -53,6 +54,22 @@ if(OPENMP_FOUND)
   set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} ${OpenMP_EXE_LINKER_FLAGS}")
 else()
   message("ERROR: OpenMP could not be found.")
+endif()
+
+# ---- CUDA (optional) ----
+find_package(CUDAToolkit QUIET)
+
+if(CUDAToolkit_FOUND AND ndt_cuda_ros2_FOUND)
+  set(DLIO_HAS_CUDA ON)
+  message(STATUS "CUDA + ndt_cuda_ros2 found — GPU acceleration enabled")
+  link_directories(${CUDAToolkit_LIBRARY_DIR})
+else()
+  set(DLIO_HAS_CUDA OFF)
+  if(NOT CUDAToolkit_FOUND)
+    message(STATUS "CUDAToolkit not found — building CPU-only")
+  elseif(NOT ndt_cuda_ros2_FOUND)
+    message(STATUS "ndt_cuda_ros2 not found — building CPU-only")
+  endif()
 endif()
 
 # Not all machines have <cpuid.h> available
@@ -100,111 +117,160 @@ rosidl_get_typesupport_target(cpp_typesupport_target
 
 # NanoFLANN
 add_library(nanoflann STATIC
-  src/nano_gicp/nanoflann.cc
+  src/dlio/algorithms/nano_gicp/nanoflann.cc
 )
 target_link_libraries(nanoflann ${PCL_LIBRARIES})
 
 # NanoGICP
 add_library(nano_gicp STATIC
-  src/nano_gicp/lsq_registration.cc
-  src/nano_gicp/nano_gicp.cc
+  src/dlio/algorithms/nano_gicp/lsq_registration.cc
+  src/dlio/algorithms/nano_gicp/nano_gicp.cc
 )
 target_link_libraries(nano_gicp ${PCL_LIBRARIES} ${OpenMP_LIBS} nanoflann)
+
+# ---- CUDA (conditional, after rosidl to avoid linker language conflicts) ----
+if(DLIO_HAS_CUDA)
+  enable_language(CUDA)
+  set(CMAKE_CUDA_STANDARD 17)
+  set(CMAKE_CUDA_ARCHITECTURES "75;80;86;89")
+
+  add_library(dlio_cuda STATIC
+    src/dlio/cuda/transforms.cu
+    src/dlio/cuda/nn_search.cu
+    src/dlio/cuda/linearize.cu
+    src/dlio/cuda/gicp_gpu_wrapper.cu
+    src/dlio/cuda/robust_icp_cuda.cu
+    src/dlio/cuda/preprocess_cuda.cu
+  )
+  target_include_directories(dlio_cuda PUBLIC include ${PCL_INCLUDE_DIRS})
+  target_link_libraries(dlio_cuda CUDA::cudart)
+  target_compile_options(dlio_cuda PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda>
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xcudafe=--diag_suppress=20013>
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xcudafe=--diag_suppress=20015>
+  )
+  set_target_properties(dlio_cuda PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    POSITION_INDEPENDENT_CODE ON
+  )
+endif()
+
+# ---- Compile definitions for DLIO_HAS_CUDA ----
+if(DLIO_HAS_CUDA)
+  set(_DLIO_CUDA_DEF DLIO_HAS_CUDA=1)
+else()
+  set(_DLIO_CUDA_DEF DLIO_HAS_CUDA=0)
+endif()
+target_compile_definitions(nano_gicp PRIVATE ${_DLIO_CUDA_DEF})
 
 # ---- Component Shared Libraries ----
 
 # Odometry Component
 add_library(dlio_odom_component SHARED
-  src/dlio/odom.cc
-  src/dlio/odom_callbacks.cc
-  src/dlio/odom_registration.cc
-  src/dlio/robust_icp.cc
-  src/dlio/voxel_hash_map.cc
-  src/dlio/registration_helper.cc
-  src/dlio/odom_keyframes.cc
-  src/dlio/odom_relocalization.cc
-  src/dlio/odom_services.cc
-  src/dlio/odom_submap_localization.cc
-  src/dlio/kfdb_io.cc
-  src/dlio/occupancy_grid.cc
+  src/dlio/odom/odom.cc
+  src/dlio/odom/odom_callbacks.cc
+  src/dlio/odom/odom_registration.cc
+  src/dlio/odom/odom_keyframes.cc
+  src/dlio/odom/odom_relocalization.cc
+  src/dlio/odom/odom_services.cc
+  src/dlio/odom/odom_submap_localization.cc
+  src/dlio/odom/kfdb_io.cc
+  src/dlio/odom/occupancy_grid.cc
+  src/dlio/engines/registration_engine.cc
+  src/dlio/engines/prefilter_engine.cc
+  src/dlio/engines/appearance_engine.cc
+  src/dlio/algorithms/robust_icp.cc
+  src/dlio/algorithms/voxel_hash_map.cc
 )
 target_compile_options(dlio_odom_component PRIVATE ${OpenMP_FLAGS})
-target_link_libraries(dlio_odom_component
-  ${PCL_LIBRARIES} ${OpenMP_LIBS} Threads::Threads nano_gicp ${cpp_typesupport_target}
-  g2o::core g2o::types_slam3d g2o::solver_eigen
-  ${GeographicLib_LIBRARIES}
-)
-ament_target_dependencies(dlio_odom_component
-  rclcpp rclcpp_components tf2_ros pcl_ros nav_msgs pcl_conversions sensor_msgs geometry_msgs ndt_omp_ros2
-)
+target_compile_definitions(dlio_odom_component PRIVATE ${_DLIO_CUDA_DEF})
+if(DLIO_HAS_CUDA)
+  target_link_libraries(dlio_odom_component
+    ${PCL_LIBRARIES} ${OpenMP_LIBS} Threads::Threads nano_gicp dlio_cuda ${cpp_typesupport_target}
+    g2o::core g2o::types_slam3d g2o::solver_eigen
+    ${GeographicLib_LIBRARIES}
+    ${ndt_cuda_ros2_LIBRARIES}
+  )
+  ament_target_dependencies(dlio_odom_component
+    rclcpp rclcpp_components tf2_ros pcl_ros nav_msgs pcl_conversions sensor_msgs geometry_msgs ndt_omp_ros2 ndt_cuda_ros2
+  )
+else()
+  target_link_libraries(dlio_odom_component
+    ${PCL_LIBRARIES} ${OpenMP_LIBS} Threads::Threads nano_gicp ${cpp_typesupport_target}
+    g2o::core g2o::types_slam3d g2o::solver_eigen
+    ${GeographicLib_LIBRARIES}
+  )
+  ament_target_dependencies(dlio_odom_component
+    rclcpp rclcpp_components tf2_ros pcl_ros nav_msgs pcl_conversions sensor_msgs geometry_msgs ndt_omp_ros2
+  )
+endif()
 rclcpp_components_register_nodes(dlio_odom_component "dlio::OdomNode")
-
-# Map Component
-add_library(dlio_map_component SHARED
-  src/dlio/map.cc
-)
-target_compile_options(dlio_map_component PRIVATE ${OpenMP_FLAGS})
-target_link_libraries(dlio_map_component
-  ${PCL_LIBRARIES} ${cpp_typesupport_target}
-)
-ament_target_dependencies(dlio_map_component
-  rclcpp rclcpp_components tf2_ros pcl_ros pcl_conversions sensor_msgs geometry_msgs
-)
-rclcpp_components_register_nodes(dlio_map_component "dlio::MapNode")
 
 # LIO-SAM Map Optimization Component (GTSAM iSAM2)
 add_library(dlio_lio_sam_map_opt_component SHARED
-  src/dlio/lio_sam_map_optimization.cc
-  src/dlio/registration_helper.cc
-  src/dlio/robust_icp.cc
+  src/dlio/mapping/lio_sam_map_optimization.cc
+  src/dlio/engines/registration_engine.cc
+  src/dlio/engines/appearance_engine.cc
+  src/dlio/algorithms/robust_icp.cc
 )
 target_compile_options(dlio_lio_sam_map_opt_component PRIVATE ${OpenMP_FLAGS})
-target_link_libraries(dlio_lio_sam_map_opt_component
-  ${PCL_LIBRARIES} ${OpenMP_LIBS} Threads::Threads nano_gicp ${cpp_typesupport_target}
-  gtsam
-  ${GeographicLib_LIBRARIES}
-)
-ament_target_dependencies(dlio_lio_sam_map_opt_component
-  rclcpp rclcpp_components pcl_ros pcl_conversions nav_msgs sensor_msgs geometry_msgs visualization_msgs ndt_omp_ros2 tf2_ros
-)
+target_compile_definitions(dlio_lio_sam_map_opt_component PRIVATE ${_DLIO_CUDA_DEF})
+if(DLIO_HAS_CUDA)
+  target_link_libraries(dlio_lio_sam_map_opt_component
+    ${PCL_LIBRARIES} ${OpenMP_LIBS} Threads::Threads nano_gicp dlio_cuda ${cpp_typesupport_target}
+    gtsam
+    ${GeographicLib_LIBRARIES}
+    ${ndt_cuda_ros2_LIBRARIES}
+  )
+  ament_target_dependencies(dlio_lio_sam_map_opt_component
+    rclcpp rclcpp_components pcl_ros pcl_conversions nav_msgs sensor_msgs geometry_msgs visualization_msgs ndt_omp_ros2 ndt_cuda_ros2 tf2_ros
+  )
+else()
+  target_link_libraries(dlio_lio_sam_map_opt_component
+    ${PCL_LIBRARIES} ${OpenMP_LIBS} Threads::Threads nano_gicp ${cpp_typesupport_target}
+    gtsam
+    ${GeographicLib_LIBRARIES}
+  )
+  ament_target_dependencies(dlio_lio_sam_map_opt_component
+    rclcpp rclcpp_components pcl_ros pcl_conversions nav_msgs sensor_msgs geometry_msgs visualization_msgs ndt_omp_ros2 tf2_ros
+  )
+endif()
 rclcpp_components_register_nodes(dlio_lio_sam_map_opt_component "dlio::LioSamMapOptimizationNode")
 
 # ---- Standalone Executables (backward compatibility) ----
 
-# Odometry Node
-add_executable(dlio_odom_node src/dlio/odom_node.cc)
+add_executable(dlio_odom_node src/dlio/odom/odom_node.cc)
 target_link_libraries(dlio_odom_node dlio_odom_component)
 ament_target_dependencies(dlio_odom_node rclcpp)
 
-# Mapping Node
-add_executable(dlio_map_node src/dlio/map_node.cc)
-target_link_libraries(dlio_map_node dlio_map_component)
-ament_target_dependencies(dlio_map_node rclcpp)
-
-# Graph SLAM Node
-# LIO-SAM Map Optimization Node
-add_executable(dlio_lio_sam_map_opt_node src/dlio/lio_sam_map_optimization_node.cc)
+add_executable(dlio_lio_sam_map_opt_node src/dlio/mapping/lio_sam_map_optimization_node.cc)
 target_link_libraries(dlio_lio_sam_map_opt_node dlio_lio_sam_map_opt_component)
 ament_target_dependencies(dlio_lio_sam_map_opt_node rclcpp)
 
 # ---- Export & Install ----
 
 ament_export_include_directories(include)
-ament_export_libraries(dlio_odom_component dlio_map_component dlio_lio_sam_map_opt_component nano_gicp nanoflann)
+if(DLIO_HAS_CUDA)
+  ament_export_libraries(dlio_odom_component dlio_lio_sam_map_opt_component nano_gicp nanoflann dlio_cuda)
+else()
+  ament_export_libraries(dlio_odom_component dlio_lio_sam_map_opt_component nano_gicp nanoflann)
+endif()
 ament_export_dependencies(rclcpp rclcpp_components std_msgs sensor_msgs geometry_msgs pcl_ros)
 ament_package()
 
-install(TARGETS
-  dlio_odom_component
-  dlio_map_component
-  dlio_lio_sam_map_opt_component
+set(_install_lib_targets dlio_odom_component dlio_lio_sam_map_opt_component)
+if(DLIO_HAS_CUDA)
+  list(APPEND _install_lib_targets dlio_cuda)
+endif()
+install(TARGETS ${_install_lib_targets}
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib
   RUNTIME DESTINATION bin
 )
 
 install(TARGETS
-  dlio_odom_node dlio_map_node dlio_lio_sam_map_opt_node
+  dlio_odom_node dlio_lio_sam_map_opt_node
   DESTINATION lib/${PROJECT_NAME}
 )
 

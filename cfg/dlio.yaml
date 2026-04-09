@@ -14,7 +14,7 @@
   ros__parameters:
     version: 1.1.1
 
-    adaptive: false
+    adaptive: true
 
     pointcloud/deskew: true
     pointcloud/voxelize: true
@@ -24,8 +24,8 @@
     imu/intrinsics/accel/sm: [1., 0., 0., 0., 1., 0., 0., 0., 1.]
     imu/intrinsics/gyro/bias: [0.0, 0.0, 0.0]
 
-    extrinsics/baselink2imu/t: [0.0, 0.0, 0.0]
-    extrinsics/baselink2imu/rpy: [0.0, 0.0, 0.0] # roll, pitch, yaw in degrees
+    extrinsics/baselink2imu/t: [0.0, 0.0, -0.08]
+    extrinsics/baselink2imu/rpy: [0.46, 0.37, 179.54] # roll, pitch, yaw in degrees
 
     extrinsics/baselink2lidar/t: [0.0, 0.0, 0.0]
     extrinsics/baselink2lidar/rpy: [0.0, 0.0, 0.0] # roll, pitch, yaw in degrees

@@ -52,7 +52,7 @@ std::string to_string_with_precision(const T a_value, const int n = 6)
 #define PCL_NO_PRECOMPILE
 
 // DLIO
-#include <nano_gicp/nano_gicp.h>
+#include "dlio/algorithms/nano_gicp/nano_gicp.h"
 
 namespace dlio
 {
@@ -67,7 +67,6 @@ namespace dlio
   };
 
   class OdomNode;
-  class MapNode;
   class GraphSlamNode;
   class LioSamMapOptimizationNode;
 

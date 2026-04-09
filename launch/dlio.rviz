@@ -160,7 +160,7 @@ Visualization Manager:
           Position Transformer: XYZ
           Selectable: true
           Size (Pixels): 1
-          Size (m): 0.05000000074505806
+          Size (m): 0.04000000074505806
           Style: Points
           Topic:
             Depth: 5
@@ -168,7 +168,7 @@ Visualization Manager:
             Filter size: 10
             History Policy: Keep Last
             Reliability Policy: Reliable
-            Value: /dlio/map_node/map
+            Value: /dlio/lio_sam_opt/corrected_map
           Use Fixed Frame: true
           Use rainbow: true
           Value: false
@@ -328,7 +328,7 @@ Visualization Manager:
       Position Transformer: XYZ
       Selectable: true
       Size (Pixels): 3
-      Size (m): 0.20000000298023224
+      Size (m): 0.04000000074505806
       Style: Flat Squares
       Topic:
         Depth: 5
@@ -336,7 +336,7 @@ Visualization Manager:
         Filter size: 10
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: /dlio/map_node/map
+        Value: /dlio/lio_sam_opt/corrected_map
       Use Fixed Frame: true
       Use rainbow: true
       Value: true
@@ -397,7 +397,7 @@ Visualization Manager:
       Position Transformer: XYZ
       Selectable: true
       Size (Pixels): 3
-      Size (m): 0.30000001192092896
+      Size (m): 0.04000000074505806
       Style: Flat Squares
       Topic:
         Depth: 5

@@ -30,9 +30,9 @@
 
     map/waitUntilMove: true
     map/dense/filtered: false
-    map/sparse/leafSize: 0.25
+    map/sparse/leafSize: 0.75
 
-    map/mode: "localization"
+    map/mode: "mapping"
     map/path: "" # empty = defaults to $HOME/.ros/dlio_map.pcd
     map/use_corrected: true # load graph-optimized _corrected files in localization mode
     map/voxel_size: 0.25
@@ -43,15 +43,16 @@
     map/initial_pose/y: 0.0
     map/initial_pose/z: 0.0
     map/initial_pose/yaw: 0.0
-    map/relocalize: true
+    map/relocalize: false
     map/relocalize/sc_max_range: 150.0
     map/relocalize/sc_num_candidates: 50
     map/relocalize/sc_distance_threshold: 2.0
     map/relocalize/sc_max_attempts: 10
     map/relocalize/sc_ground_height_threshold: 0.3 # meters, 0 = disabled. Removes flat ground for more discriminative SC
     map/relocalize/sc_search_window: 7 # SC++ sector key search window (±3 shifts around coarse alignment)
+    map/appearance_method: "sc++" # "sc++", "sc++_cuda", "std", "std_cuda"
 
-    odom/localization/registration_method: "gicp" # "gicp", "ndt", or "robust_icp" (for continuous/submap/SC localization)
+    odom/localization/registration_method: "gicp" # "gicp", "gicp_cuda", "ndt", "ndt_cuda", "robust_icp", "robust_icp_cuda"
 
     map/continuous_localize: true
     map/continuous_localize/on_mapping: false # also run during mapping mode (drift correction vs prior map) (Masih experimental..)
@@ -107,23 +108,35 @@
     odom/imu/bufferSize: 5000
 
     odom/preprocessing/cropBoxFilter/size: 1.0
-    odom/preprocessing/voxelFilter/res: 0.5
+    odom/preprocessing/voxelFilter/res: 0.75
+    odom/preprocessing/gpu: true # GPU deskewing + voxel grid filter (requires CUDA)
 
-    odom/keyframe/threshD: 0.3
+    # Prefilter (noise removal) — applied after deskewing
+    odom/prefilter/method: "sor_cuda" # "none", "sor", "sor_cuda", "ror", "dror", i prefer using sor_cuda for real-time applications
+    odom/prefilter/mean_k: 10 # SOR: number of neighbors for mean distance
+    odom/prefilter/stddev_mul: 1.0 # SOR: std deviation multiplier threshold
+    odom/prefilter/radius: 0.5 # ROR: search radius (meters)
+    odom/prefilter/min_neighbors: 3 # ROR: minimum neighbors within radius
+    odom/prefilter/dror_min_radius: 0.1 # DROR: minimum radius near sensor
+    odom/prefilter/dror_max_radius: 3.0 # DROR: maximum radius far from sensor
+    odom/prefilter/dror_range_scale: 0.01 # DROR: radius = max(min, range * scale)
+    odom/prefilter/dror_min_neighbors: 3 # DROR: minimum neighbor count
+
+    odom/keyframe/threshD: 1.0
     odom/keyframe/threshR: 10.0
 
     odom/submap/method: "voxel_hash_map" # "keyframe" or "voxel_hash_map"
-    odom/submap/keyframe/knn: 10
-    odom/submap/keyframe/kcv: 10
-    odom/submap/keyframe/kcc: 10
-    odom/submap/voxel_hash_map/voxel_size: 1.0
-    odom/submap/voxel_hash_map/max_distance: 100.0
-    odom/submap/voxel_hash_map/max_points_per_voxel: 20
-    odom/registration_method: "ndt" # "gicp", "ndt", or "robust_icp"
+    odom/submap/keyframe/knn: 15
+    odom/submap/keyframe/kcv: 15
+    odom/submap/keyframe/kcc: 15
+    odom/submap/voxel_hash_map/voxel_size: 0.75
+    odom/submap/voxel_hash_map/max_distance: 150.0
+    odom/submap/voxel_hash_map/max_points_per_voxel: 40
+    odom/registration_method: "gicp_cuda" # "gicp", "gicp_cuda", "ndt", "ndt_cuda", "robust_icp", "robust_icp_cuda"
 
     odom/robust_icp/kernel_scale: 0.0 # GM kernel sigma (0 = auto from maxCorrespondenceDistance)
 
-    odom/ndt/resolution: 2.0
+    odom/ndt/resolution: 5.0
     odom/ndt/num_threads: 8
     odom/ndt/search_method: "DIRECT7" # KDTREE, DIRECT1, DIRECT7, DIRECT26
     odom/ndt/step_size: 0.3
