@@ -186,10 +186,16 @@ void dlio::LioSamMapOptimizationNode::getParams()
     double gps_ma = 5.0;
     dlio::declare_param(this, "gps/min_accuracy", gps_ma, 5.0);
     this->gps_min_accuracy_ = static_cast<float>(gps_ma);
+    dlio::declare_param(this, "gps/gating_mode", this->gps_gating_mode_, std::string("covariance"));
+    double gps_lc_r = 20.0;
+    dlio::declare_param(this, "gps/lc_search_radius", gps_lc_r, 20.0);
+    this->gps_lc_search_radius_ = static_cast<float>(gps_lc_r);
 
     // iSAM2
     dlio::declare_param(this, "isam/relinearize_threshold", this->isam_relinearize_threshold_, 0.1);
     dlio::declare_param(this, "isam/relinearize_skip", this->isam_relinearize_skip_, 1);
+    dlio::declare_param(this, "isam/batch_optimization", this->batch_optimization_, false);
+    dlio::declare_param(this, "isam/batch_optimization_interval", this->batch_optimization_interval_, 100);
 
     // Noise model
     dlio::declare_param(this, "odom_noise/rotation", this->odom_noise_rot_, 0.1);
@@ -365,6 +371,7 @@ void dlio::LioSamMapOptimizationNode::callbackKeyframe(
         {
             kf.gps_valid = this->gpsToLocal(gps.latitude, gps.longitude, gps.altitude,
                                             kf.gps_x, kf.gps_y, kf.gps_z);
+            kf.gps_horizontal_accuracy = gps.horizontal_accuracy;
         }
     }
 
@@ -401,8 +408,8 @@ void dlio::LioSamMapOptimizationNode::callbackKeyframe(
             this->addLoopFactors();
         }
         this->updateISAM();
-
         this->keyframes_.push_back(kf);
+        this->batchOptimize();
 
         pcl::PointXYZ pose_pt;
         pose_pt.x = static_cast<float>(kf.pose.translation().x());
@@ -519,9 +526,13 @@ void dlio::LioSamMapOptimizationNode::addGPSFactor(int idx, const Keyframe &kf)
         return;
 
     // Only add GPS when pose covariance is high (uncertain)
-    if (this->pose_covariance_(3, 3) < this->pose_cov_threshold_ &&
-        this->pose_covariance_(4, 4) < this->pose_cov_threshold_)
-        return;
+    // In "always" mode, skip this gate to ensure GPS anchors at tunnel entry/exit
+    if (this->gps_gating_mode_ == "covariance")
+    {
+        if (this->pose_covariance_(3, 3) < this->pose_cov_threshold_ &&
+            this->pose_covariance_(4, 4) < this->pose_cov_threshold_)
+            return;
+    }
 
     float gps_x = kf.gps_x;
     float gps_y = kf.gps_y;
@@ -549,10 +560,13 @@ void dlio::LioSamMapOptimizationNode::addGPSFactor(int idx, const Keyframe &kf)
         return;
     last_gps_pt = cur_gps_pt;
 
-    // Noise: use horizontal accuracy with 1.0m floor
-    float noise_x = std::max(kf.gps_x != 0.f ? 1.0f : 2.0f, 1.0f);
-    float noise_y = std::max(1.0f, 1.0f);
-    float noise_z = this->use_gps_elevation_ ? std::max(1.0f, 1.0f) : 0.01f;
+    // Noise: use actual GPS horizontal accuracy (sigma) with 1.0m floor
+    // horizontal_accuracy is sigma (std dev) from sqrt(position_covariance[0])
+    // GTSAM Diagonal::Variances expects variance = sigma^2
+    float h_sigma = std::max(kf.gps_horizontal_accuracy, 1.0f);
+    float noise_x = h_sigma * h_sigma;
+    float noise_y = h_sigma * h_sigma;
+    float noise_z = this->use_gps_elevation_ ? (h_sigma * h_sigma) : 0.01f;
 
     gtsam::Vector3 gps_noise_vec;
     gps_noise_vec << noise_x, noise_y, noise_z;
@@ -565,8 +579,9 @@ void dlio::LioSamMapOptimizationNode::addGPSFactor(int idx, const Keyframe &kf)
 
     if (this->debug_)
     {
-        RCLCPP_INFO(this->get_logger(), "[lio_sam_opt] GPS factor added at idx %d: [%.2f, %.2f, %.2f]",
-                    idx, gps_x, gps_y, gps_z);
+        RCLCPP_INFO(this->get_logger(),
+                    "[lio_sam_opt] GPS factor added at idx %d: [%.2f, %.2f, %.2f] (h_acc=%.2fm, var=%.2f)",
+                    idx, gps_x, gps_y, gps_z, kf.gps_horizontal_accuracy, noise_x);
     }
 }
 
@@ -631,6 +646,60 @@ void dlio::LioSamMapOptimizationNode::updateISAM()
         this->gtsam_graph_.resize(0);
         this->initial_estimate_.clear();
         this->a_loop_is_closed_ = false;
+    }
+}
+
+void dlio::LioSamMapOptimizationNode::batchOptimize()
+{
+    if (!this->batch_optimization_ || !this->isam_)
+        return;
+
+    int num_kf = static_cast<int>(this->keyframes_.size());
+    if (num_kf < 10)
+        return;
+
+    // Only run every N keyframes
+    if (num_kf % this->batch_optimization_interval_ != 0)
+        return;
+
+    try
+    {
+        // Extract full accumulated graph from iSAM2
+        gtsam::NonlinearFactorGraph full_graph = this->isam_->getFactorsUnsafe();
+        gtsam::Values current_values = this->isam_->calculateEstimate();
+
+        // Run Levenberg-Marquardt batch optimization on the full graph
+        gtsam::LevenbergMarquardtParams lm_params;
+        lm_params.maxIterations = 100;
+        lm_params.verbosityLM = gtsam::LevenbergMarquardtParams::SILENT;
+
+        gtsam::LevenbergMarquardtOptimizer lm(full_graph, current_values, lm_params);
+        double initial_error = lm.error();
+        gtsam::Values result = lm.optimize();
+        double final_error = lm.error();
+
+        // Reinitialize iSAM2 with the batch-optimized result
+        // so future incremental updates start from the corrected state
+        gtsam::ISAM2Params isam_params;
+        isam_params.relinearizeThreshold = this->isam_relinearize_threshold_;
+        isam_params.relinearizeSkip = this->isam_relinearize_skip_;
+        delete this->isam_;
+        this->isam_ = new gtsam::ISAM2(isam_params);
+        this->isam_->update(full_graph, result);
+        this->isam_->update(); // extra iteration for convergence
+
+        this->isam_current_estimate_ = this->isam_->calculateEstimate();
+        this->a_loop_is_closed_ = true;
+
+        RCLCPP_INFO(this->get_logger(),
+                    "[lio_sam_opt] Batch LM optimization done (%d poses, %zu factors, %d iters, error %.4f -> %.4f)",
+                    num_kf, full_graph.size(), lm.iterations(),
+                    initial_error, final_error);
+    }
+    catch (const std::exception &e)
+    {
+        RCLCPP_WARN(this->get_logger(),
+                    "[lio_sam_opt] Batch optimization failed: %s", e.what());
     }
 }
 
@@ -775,12 +844,73 @@ bool dlio::LioSamMapOptimizationNode::detectLoopClosureSC(int &loop_cur, int &lo
     return (loop_pre >= 0);
 }
 
+bool dlio::LioSamMapOptimizationNode::detectLoopClosureGPS(int &loop_cur, int &loop_pre)
+{
+    if (!this->gps_enabled_)
+        return false;
+
+    int num_kf = static_cast<int>(this->keyframes_.size());
+    if (num_kf < this->min_keyframe_gap_ + 1)
+        return false;
+
+    loop_cur = num_kf - 1;
+    loop_pre = -1;
+    const auto &cur_kf = this->keyframes_[loop_cur];
+
+    if (!cur_kf.gps_valid)
+        return false;
+
+    // Check duplicate
+    if (this->loop_index_container_.count(loop_cur))
+        return false;
+
+    float search_r = this->gps_lc_search_radius_ + cur_kf.gps_horizontal_accuracy;
+    float best_dist = std::numeric_limits<float>::max();
+
+    for (int i = 0; i < loop_cur - this->min_keyframe_gap_; ++i)
+    {
+        const auto &cand_kf = this->keyframes_[i];
+        if (!cand_kf.gps_valid)
+            continue;
+
+        // Temporal constraint
+        double dt = std::abs(
+            rclcpp::Time(cur_kf.timestamp).seconds() -
+            rclcpp::Time(cand_kf.timestamp).seconds());
+        if (dt < this->history_keyframe_search_time_diff_)
+            continue;
+
+        // GPS distance (2D — elevation GPS is less reliable)
+        float dx = cur_kf.gps_x - cand_kf.gps_x;
+        float dy = cur_kf.gps_y - cand_kf.gps_y;
+        float gps_dist = std::sqrt(dx * dx + dy * dy);
+
+        // Effective radius = base + uncertainty of both keyframes
+        float effective_r = search_r + cand_kf.gps_horizontal_accuracy;
+
+        if (gps_dist < effective_r && gps_dist < best_dist)
+        {
+            best_dist = gps_dist;
+            loop_pre = i;
+        }
+    }
+
+    if (loop_pre >= 0 && this->debug_)
+    {
+        RCLCPP_INFO(this->get_logger(),
+                    "[lio_sam_opt] GPS loop candidate: %d <-> %d (gps_dist=%.2fm)",
+                    loop_cur, loop_pre, best_dist);
+    }
+
+    return (loop_pre >= 0);
+}
+
 void dlio::LioSamMapOptimizationNode::performLoopClosure()
 {
     // ---- Phase 1: brief lock to detect candidates + build clouds ----
     int loop_cur = -1, loop_pre = -1;
     int sc_shift = 0;
-    bool found_distance = false, found_sc = false;
+    bool found_distance = false, found_sc = false, found_gps = false;
     pcl::PointCloud<PointType>::Ptr cur_keyframe_cloud(new pcl::PointCloud<PointType>());
     pcl::PointCloud<PointType>::Ptr prev_keyframe_cloud(new pcl::PointCloud<PointType>());
     Eigen::Isometry3d cur_pose_snap, pre_pose_snap;
@@ -794,8 +924,10 @@ void dlio::LioSamMapOptimizationNode::performLoopClosure()
         found_distance = this->detectLoopClosureDistance(loop_cur, loop_pre);
         if (!found_distance)
             found_sc = this->detectLoopClosureSC(loop_cur, loop_pre, sc_shift);
-
         if (!found_distance && !found_sc)
+            found_gps = this->detectLoopClosureGPS(loop_cur, loop_pre);
+
+        if (!found_distance && !found_sc && !found_gps)
             return;
 
         // Snapshot poses

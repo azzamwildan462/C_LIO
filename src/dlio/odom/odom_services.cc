@@ -54,6 +54,88 @@ void dlio::OdomNode::publishPose()
 
   this->pose_pub->publish(this->pose_ros);
 
+  // Publish IMU debug markers: forward direction (red) + velocity direction (green)
+  if (this->imu_debug_markers_pub_->get_subscription_count() > 0)
+  {
+    visualization_msgs::msg::MarkerArray markers;
+
+    // Arrow 1: Body X-axis (forward direction according to IMU orientation) — RED
+    {
+      visualization_msgs::msg::Marker m;
+      m.header.stamp = this->imu_stamp;
+      m.header.frame_id = this->odom_frame;
+      m.ns = "imu_forward";
+      m.id = 0;
+      m.type = visualization_msgs::msg::Marker::ARROW;
+      m.action = visualization_msgs::msg::Marker::ADD;
+
+      // Start: current position
+      geometry_msgs::msg::Point start, end;
+      start.x = this->state.p[0];
+      start.y = this->state.p[1];
+      start.z = this->state.p[2];
+
+      // End: position + forward direction (body X in world frame) * 3m
+      Eigen::Vector3f fwd_body(1.0f, 0.0f, 0.0f);
+      Eigen::Vector3f fwd_world = this->state.q * fwd_body;
+      end.x = start.x + 3.0 * fwd_world[0];
+      end.y = start.y + 3.0 * fwd_world[1];
+      end.z = start.z + 3.0 * fwd_world[2];
+
+      m.points.push_back(start);
+      m.points.push_back(end);
+      m.scale.x = 0.15; // shaft diameter
+      m.scale.y = 0.3;  // head diameter
+      m.scale.z = 0.3;  // head length
+      m.color.r = 1.0;
+      m.color.g = 0.0;
+      m.color.b = 0.0;
+      m.color.a = 1.0;
+      m.lifetime = rclcpp::Duration(0, 200000000); // 200ms
+      markers.markers.push_back(m);
+    }
+
+    // Arrow 2: Velocity direction — GREEN
+    {
+      float speed = this->state.v.lin.w.norm();
+      if (speed > 0.5f) // only show when moving
+      {
+        visualization_msgs::msg::Marker m;
+        m.header.stamp = this->imu_stamp;
+        m.header.frame_id = this->odom_frame;
+        m.ns = "imu_velocity";
+        m.id = 1;
+        m.type = visualization_msgs::msg::Marker::ARROW;
+        m.action = visualization_msgs::msg::Marker::ADD;
+
+        geometry_msgs::msg::Point start, end;
+        start.x = this->state.p[0];
+        start.y = this->state.p[1];
+        start.z = this->state.p[2];
+
+        Eigen::Vector3f vel_dir = this->state.v.lin.w.normalized();
+        float arrow_len = std::min(speed, 5.0f); // scale arrow by speed, max 5m
+        end.x = start.x + arrow_len * vel_dir[0];
+        end.y = start.y + arrow_len * vel_dir[1];
+        end.z = start.z + arrow_len * vel_dir[2];
+
+        m.points.push_back(start);
+        m.points.push_back(end);
+        m.scale.x = 0.1;
+        m.scale.y = 0.25;
+        m.scale.z = 0.25;
+        m.color.r = 0.0;
+        m.color.g = 1.0;
+        m.color.b = 0.0;
+        m.color.a = 1.0;
+        m.lifetime = rclcpp::Duration(0, 200000000);
+        markers.markers.push_back(m);
+      }
+    }
+
+    this->imu_debug_markers_pub_->publish(markers);
+  }
+
   if (this->debug_print_)
   {
     if (this->debug_print_counter_++ >= 2)
@@ -868,94 +950,73 @@ void dlio::OdomNode::srvNewMapWZero(
 
 void dlio::OdomNode::debug()
 {
-  if (!this->geo.first_opt_done)
-  {
+  if (!this->geo.first_opt_done || !this->first_imu_received)
     return;
-  }
 
-  if (!this->first_imu_received)
-  {
-    return;
-  }
-
-  // length_traversed is updated incrementally in callbackPointCloud
-
-  // Average computation time
+  // Computation time
   double avg_comp_time =
       std::accumulate(this->comp_times.begin(), this->comp_times.end(), 0.0) / this->comp_times.size();
 
-  // Average sensor rates
+  // Sensor rates (windowed)
   int win_size = 100;
-  double avg_imu_rate;
-  double avg_lidar_rate;
-  if (this->imu_rates.size() < win_size)
+  double avg_imu_rate = 0., avg_lidar_rate = 0.;
+  if (!this->imu_rates.empty())
+    avg_imu_rate = (this->imu_rates.size() < win_size)
+                       ? std::accumulate(this->imu_rates.begin(), this->imu_rates.end(), 0.0) / this->imu_rates.size()
+                       : std::accumulate(this->imu_rates.end() - win_size, this->imu_rates.end(), 0.0) / win_size;
+  if (!this->lidar_rates.empty())
+    avg_lidar_rate = (this->lidar_rates.size() < win_size)
+                         ? std::accumulate(this->lidar_rates.begin(), this->lidar_rates.end(), 0.0) / this->lidar_rates.size()
+                         : std::accumulate(this->lidar_rates.end() - win_size, this->lidar_rates.end(), 0.0) / win_size;
+
+  // Spaciousness / density
+  float sp = 0.f, den = 0.f;
   {
-    avg_imu_rate =
-        std::accumulate(this->imu_rates.begin(), this->imu_rates.end(), 0.0) / this->imu_rates.size();
-  }
-  else
-  {
-    avg_imu_rate =
-        std::accumulate(this->imu_rates.end() - win_size, this->imu_rates.end(), 0.0) / win_size;
-  }
-  if (this->lidar_rates.size() < win_size)
-  {
-    avg_lidar_rate =
-        std::accumulate(this->lidar_rates.begin(), this->lidar_rates.end(), 0.0) / this->lidar_rates.size();
-  }
-  else
-  {
-    avg_lidar_rate =
-        std::accumulate(this->lidar_rates.end() - win_size, this->lidar_rates.end(), 0.0) / win_size;
+    std::lock_guard<std::mutex> lock(this->metrics_mtx_);
+    if (!this->metrics.spaciousness.empty())
+      sp = this->metrics.spaciousness.back();
+    if (!this->metrics.density.empty())
+      den = this->metrics.density.back();
   }
 
-  // RAM Usage
-  double vm_usage = 0.0;
-  double resident_set = 0.0;
-  std::ifstream stat_stream("/proc/self/stat", std::ios_base::in); // get info from proc directory
-  std::string pid, comm, state, ppid, pgrp, session, tty_nr;
-  std::string tpgid, flags, minflt, cminflt, majflt, cmajflt;
-  std::string utime, stime, cutime, cstime, priority, nice;
-  std::string num_threads, itrealvalue, starttime;
-  unsigned long vsize;
-  long rss;
-  stat_stream >> pid >> comm >> state >> ppid >> pgrp >> session >> tty_nr >> tpgid >> flags >> minflt >> cminflt >> majflt >> cmajflt >> utime >> stime >> cutime >> cstime >> priority >> nice >> num_threads >> itrealvalue >> starttime >> vsize >> rss; // don't care about the rest
-  stat_stream.close();
-  long page_size_kb = sysconf(_SC_PAGE_SIZE) / 1024; // for x86-64 is configured to use 2MB pages
-  vm_usage = vsize / 1024.0;
-  resident_set = rss * page_size_kb;
+  // Innovation
+  float innovation = (this->lidarPose.p - this->state.p).norm();
 
-  // CPU Usage
-  struct tms timeSample;
-  clock_t now;
-  double cpu_percent;
-  now = times(&timeSample);
-  if (now <= this->lastCPU || timeSample.tms_stime < this->lastSysCPU ||
-      timeSample.tms_utime < this->lastUserCPU)
-  {
-    cpu_percent = -1.0;
-  }
-  else
-  {
-    cpu_percent = (timeSample.tms_stime - this->lastSysCPU) + (timeSample.tms_utime - this->lastUserCPU);
-    cpu_percent /= (now - this->lastCPU);
-    cpu_percent /= this->numProcessors;
-    cpu_percent *= 100.;
-  }
-  this->lastCPU = now;
-  this->lastSysCPU = timeSample.tms_stime;
-  this->lastUserCPU = timeSample.tms_utime;
-  this->cpu_percents.push_back(cpu_percent);
-  double avg_cpu_usage =
-      std::accumulate(this->cpu_percents.begin(), this->cpu_percents.end(), 0.0) / this->cpu_percents.size();
+  // Scan dt
+  double scan_dt = this->scan_stamp - this->prev_scan_stamp;
 
-  // Print to terminal
+  // Fusion method string
+  const char *fusion_str = "geo";
+  if (this->fusion_method_ == dlio::FusionMethod::KF)
+    fusion_str = "kf";
+  else if (this->fusion_method_ == dlio::FusionMethod::EKF)
+    fusion_str = "ekf";
+
+  // Motion model string
+  const char *mm_str = "none";
+  if (this->motion_model_type_ == dlio::MotionModelType::ACKERMANN)
+    mm_str = "ackermann";
+  else if (this->motion_model_type_ == dlio::MotionModelType::DIFF_DRIVE)
+    mm_str = "diff_drive";
+  else if (this->motion_model_type_ == dlio::MotionModelType::HOLONOMIC)
+    mm_str = "holonomic";
+
+  // Speed (body frame)
+  float speed = this->state.v.lin.b.norm();
+
+  // Print
   printf("\033[2J\033[1;1H");
+
+  auto W = [](int w)
+  { return std::setw(w); };
+  auto L = [](const std::string &s)
+  {
+    std::cout << "| " << std::left << std::setfill(' ') << std::setw(66) << s << "|" << std::endl;
+  };
 
   std::cout << std::endl
             << "+-------------------------------------------------------------------+" << std::endl;
-  std::cout << "|               Direct LiDAR-Inertial Odometry v" << this->version_ << "               |"
-            << std::endl;
+  std::cout << "|               AWM-ATD LiDAR-Inertial Odometry v" << this->version_ << "               |" << std::endl;
   std::cout << "+-------------------------------------------------------------------+" << std::endl;
 
   std::time_t curr_time = this->scan_stamp;
@@ -963,100 +1024,87 @@ void dlio::OdomNode::debug()
   asc_time.pop_back();
   std::cout << "| " << std::left << asc_time;
   std::cout << std::right << std::setfill(' ') << std::setw(42)
-            << "Elapsed Time: " + to_string_with_precision(this->elapsed_time, 2) + " seconds "
+            << "Elapsed: " + to_string_with_precision(this->elapsed_time, 2) + "s "
             << "|" << std::endl;
 
-  if (!this->cpu_type.empty())
-  {
-    std::cout << "| " << std::left << std::setfill(' ') << std::setw(66)
-              << this->cpu_type + " x " + std::to_string(this->numProcessors)
-              << "|" << std::endl;
-  }
+  L("Rates :: LiDAR " + to_string_with_precision(avg_lidar_rate, 1) + " Hz | IMU " + to_string_with_precision(avg_imu_rate, 1) + " Hz | Scan dt " + to_string_with_precision(scan_dt * 1000., 1) + " ms");
+  L("Fusion: " + std::string(fusion_str) + " | Motion: " + std::string(mm_str) + " | Gate: " + (this->gate_enabled_ ? "ON" : "OFF"));
+  L("ExtOdom: " + std::string(this->ext_odom_enabled_ ? "ON" : "OFF") +
+    (this->ext_odom_enabled_ ? (" | Recv: " + std::string(this->ext_odom_received_.load() ? "YES" : "NO") +
+                                " | v={" + to_string_with_precision(this->ext_odom_vel_body_[0], 2) + "," +
+                                to_string_with_precision(this->ext_odom_vel_body_[1], 2) + "," +
+                                to_string_with_precision(this->ext_odom_vel_body_[2], 2) + "}")
+                             : ""));
 
-  if (this->sensor == dlio::SensorType::OUSTER)
+  std::cout << "|===================================================================|" << std::endl;
+  L("                         --- STATE ---");
+  L("Position     {W}  [xyz] :: " + to_string_with_precision(this->state.p[0], 4) + " " + to_string_with_precision(this->state.p[1], 4) + " " + to_string_with_precision(this->state.p[2], 4));
+  L("Orientation  {W} [wxyz] :: " + to_string_with_precision(this->state.q.w(), 4) + " " + to_string_with_precision(this->state.q.x(), 4) + " " + to_string_with_precision(this->state.q.y(), 4) + " " + to_string_with_precision(this->state.q.z(), 4));
+  L("Lin Velocity {W}  [xyz] :: " + to_string_with_precision(this->state.v.lin.w[0], 4) + " " + to_string_with_precision(this->state.v.lin.w[1], 4) + " " + to_string_with_precision(this->state.v.lin.w[2], 4));
+  L("Lin Velocity {B}  [xyz] :: " + to_string_with_precision(this->state.v.lin.b[0], 4) + " " + to_string_with_precision(this->state.v.lin.b[1], 4) + " " + to_string_with_precision(this->state.v.lin.b[2], 4));
+  L("Ang Velocity {B}  [xyz] :: " + to_string_with_precision(this->state.v.ang.b[0], 4) + " " + to_string_with_precision(this->state.v.ang.b[1], 4) + " " + to_string_with_precision(this->state.v.ang.b[2], 4));
+  L("Accel Bias        [xyz] :: " + to_string_with_precision(this->state.b.accel[0], 8) + " " + to_string_with_precision(this->state.b.accel[1], 8) + " " + to_string_with_precision(this->state.b.accel[2], 8));
+  L("Gyro Bias         [xyz] :: " + to_string_with_precision(this->state.b.gyro[0], 8) + " " + to_string_with_precision(this->state.b.gyro[1], 8) + " " + to_string_with_precision(this->state.b.gyro[2], 8));
+  L("Speed :: " + to_string_with_precision(speed, 2) + " m/s (" + to_string_with_precision(speed * 3.6, 1) + " km/h)");
+
+  std::cout << "|===================================================================|" << std::endl;
+  L("                       --- LIDAR POSE ---");
+  L("LiDAR Pos    {W}  [xyz] :: " + to_string_with_precision(this->lidarPose.p[0], 4) + " " + to_string_with_precision(this->lidarPose.p[1], 4) + " " + to_string_with_precision(this->lidarPose.p[2], 4));
+  L("LiDAR Ori    {W} [wxyz] :: " + to_string_with_precision(this->lidarPose.q.w(), 4) + " " + to_string_with_precision(this->lidarPose.q.x(), 4) + " " + to_string_with_precision(this->lidarPose.q.y(), 4) + " " + to_string_with_precision(this->lidarPose.q.z(), 4));
+  L("Innovation |state-lidar| :: " + to_string_with_precision(innovation, 4) + " m");
+
+  std::cout << "|===================================================================|" << std::endl;
+  L("                      --- REGISTRATION ---");
+  L("Fitness :: " + to_string_with_precision(this->last_fitness_, 6) + " | Converged: " + (this->gicp_hasConverged.load() ? "YES" : "NO"));
+  L("T_prior  [xyz] :: " + to_string_with_precision(this->T_prior(0, 3), 4) + " " + to_string_with_precision(this->T_prior(1, 3), 4) + " " + to_string_with_precision(this->T_prior(2, 3), 4));
+  L("T_corr   [xyz] :: " + to_string_with_precision(this->T_corr(0, 3), 4) + " " + to_string_with_precision(this->T_corr(1, 3), 4) + " " + to_string_with_precision(this->T_corr(2, 3), 4));
+  L("T        [xyz] :: " + to_string_with_precision(this->T(0, 3), 4) + " " + to_string_with_precision(this->T(1, 3), 4) + " " + to_string_with_precision(this->T(2, 3), 4));
+  L("Spaciousness :: " + to_string_with_precision(sp, 2) + " | Density :: " + to_string_with_precision(den, 4));
+  L("Keyframes :: " + std::to_string(this->keyframes.size()) + " | Submap pts :: " + std::to_string(this->submap_cloud ? this->submap_cloud->size() : 0));
+  L("Scan pts :: " + std::to_string(this->current_scan ? this->current_scan->size() : 0) + " | Deskew :: " + std::to_string(this->deskew_size) + (this->deskew_status ? " OK" : " FAIL"));
+
+  if (this->gate_enabled_)
   {
-    std::cout << "| " << std::left << std::setfill(' ') << std::setw(66)
-              << "Sensor Rates: Ouster @ " + to_string_with_precision(avg_lidar_rate, 2) + " Hz, IMU @ " + to_string_with_precision(avg_imu_rate, 2) + " Hz"
-              << "|" << std::endl;
-  }
-  else if (this->sensor == dlio::SensorType::VELODYNE)
-  {
-    std::cout << "| " << std::left << std::setfill(' ') << std::setw(66)
-              << "Sensor Rates: Velodyne @ " + to_string_with_precision(avg_lidar_rate, 2) + " Hz, IMU @ " + to_string_with_precision(avg_imu_rate, 2) + " Hz"
-              << "|" << std::endl;
-  }
-  else if (this->sensor == dlio::SensorType::HESAI)
-  {
-    std::cout << "| " << std::left << std::setfill(' ') << std::setw(66)
-              << "Sensor Rates: Hesai @ " + to_string_with_precision(avg_lidar_rate, 2) + " Hz, IMU @ " + to_string_with_precision(avg_imu_rate, 2) + " Hz"
-              << "|" << std::endl;
-  }
-  else if (this->sensor == dlio::SensorType::LIVOX)
-  {
-    std::cout << "| " << std::left << std::setfill(' ') << std::setw(66)
-              << "Sensor Rates: Livox @ " + to_string_with_precision(avg_lidar_rate, 2) + " Hz, IMU @ " + to_string_with_precision(avg_imu_rate, 2) + " Hz"
-              << "|" << std::endl;
-  }
-  else
-  {
-    std::cout << "| " << std::left << std::setfill(' ') << std::setw(66)
-              << "Sensor Rates: Unknown LiDAR @ " + to_string_with_precision(avg_lidar_rate, 2) + " Hz, IMU @ " + to_string_with_precision(avg_imu_rate, 2) + " Hz"
-              << "|" << std::endl;
+    std::cout << "|===================================================================|" << std::endl;
+    L("                          --- GATE ---");
+    L("Gate passed :: " + std::string(this->last_gate_passed_ ? "YES" : "NO") + " | Consecutive rejects :: " + std::to_string(this->consecutive_gate_rejects_));
   }
 
   std::cout << "|===================================================================|" << std::endl;
-
-  std::cout << "| " << std::left << std::setfill(' ') << std::setw(66)
-            << "Position     {W}  [xyz] :: " + to_string_with_precision(this->state.p[0], 4) + " " + to_string_with_precision(this->state.p[1], 4) + " " + to_string_with_precision(this->state.p[2], 4)
-            << "|" << std::endl;
-  std::cout << "| " << std::left << std::setfill(' ') << std::setw(66)
-            << "Orientation  {W} [wxyz] :: " + to_string_with_precision(this->state.q.w(), 4) + " " + to_string_with_precision(this->state.q.x(), 4) + " " + to_string_with_precision(this->state.q.y(), 4) + " " + to_string_with_precision(this->state.q.z(), 4)
-            << "|" << std::endl;
-  std::cout << "| " << std::left << std::setfill(' ') << std::setw(66)
-            << "Lin Velocity {B}  [xyz] :: " + to_string_with_precision(this->state.v.lin.b[0], 4) + " " + to_string_with_precision(this->state.v.lin.b[1], 4) + " " + to_string_with_precision(this->state.v.lin.b[2], 4)
-            << "|" << std::endl;
-  std::cout << "| " << std::left << std::setfill(' ') << std::setw(66)
-            << "Ang Velocity {B}  [xyz] :: " + to_string_with_precision(this->state.v.ang.b[0], 4) + " " + to_string_with_precision(this->state.v.ang.b[1], 4) + " " + to_string_with_precision(this->state.v.ang.b[2], 4)
-            << "|" << std::endl;
-  std::cout << "| " << std::left << std::setfill(' ') << std::setw(66)
-            << "Accel Bias        [xyz] :: " + to_string_with_precision(this->state.b.accel[0], 8) + " " + to_string_with_precision(this->state.b.accel[1], 8) + " " + to_string_with_precision(this->state.b.accel[2], 8)
-            << "|" << std::endl;
-  std::cout << "| " << std::left << std::setfill(' ') << std::setw(66)
-            << "Gyro Bias         [xyz] :: " + to_string_with_precision(this->state.b.gyro[0], 8) + " " + to_string_with_precision(this->state.b.gyro[1], 8) + " " + to_string_with_precision(this->state.b.gyro[2], 8)
-            << "|" << std::endl;
-
-  std::cout << "|                                                                   |" << std::endl;
-
-  std::cout << "| " << std::left << std::setfill(' ') << std::setw(66)
-            << "Distance Traveled  :: " + to_string_with_precision(this->length_traversed, 4) + " meters"
-            << "|" << std::endl;
-  std::cout << "| " << std::left << std::setfill(' ') << std::setw(66)
-            << "Distance to Origin :: " + to_string_with_precision(sqrt(pow(this->state.p[0] - this->origin[0], 2) + pow(this->state.p[1] - this->origin[1], 2) + pow(this->state.p[2] - this->origin[2], 2)), 4) + " meters"
-            << "|" << std::endl;
-  std::cout << "| " << std::left << std::setfill(' ') << std::setw(66)
-            << "Registration       :: keyframes: " + std::to_string(this->keyframes.size()) + ", " + "deskewed points: " + std::to_string(this->deskew_size)
-            << "|" << std::endl;
-  std::cout << "|                                                                   |" << std::endl;
+  L("Distance Traveled :: " + to_string_with_precision(this->length_traversed, 4) + " m | To Origin :: " + to_string_with_precision(sqrt(pow(this->state.p[0] - this->origin[0], 2) + pow(this->state.p[1] - this->origin[1], 2) + pow(this->state.p[2] - this->origin[2], 2)), 4) + " m");
 
   std::cout << std::right << std::setprecision(2) << std::fixed;
-  std::cout << "| Computation Time :: "
-            << std::setfill(' ') << std::setw(6) << this->comp_times.back() * 1000. << " ms    // Avg: "
-            << std::setw(6) << avg_comp_time * 1000. << " / Max: "
-            << std::setw(6) << *std::max_element(this->comp_times.begin(), this->comp_times.end()) * 1000.
-            << "     |" << std::endl;
-  std::cout << "| Cores Utilized   :: "
-            << std::setfill(' ') << std::setw(6) << (cpu_percent / 100.) * this->numProcessors << " cores // Avg: "
-            << std::setw(6) << (avg_cpu_usage / 100.) * this->numProcessors << " / Max: "
-            << std::setw(6) << (*std::max_element(this->cpu_percents.begin(), this->cpu_percents.end()) / 100.) * this->numProcessors
-            << "     |" << std::endl;
-  std::cout << "| CPU Load         :: "
-            << std::setfill(' ') << std::setw(6) << cpu_percent << " %     // Avg: "
-            << std::setw(6) << avg_cpu_usage << " / Max: "
-            << std::setw(6) << *std::max_element(this->cpu_percents.begin(), this->cpu_percents.end())
-            << "     |" << std::endl;
-  std::cout << "| " << std::left << std::setfill(' ') << std::setw(66)
-            << "RAM Allocation   :: " + to_string_with_precision(resident_set / 1000., 2) + " MB"
-            << "|" << std::endl;
+  std::cout << "| Comp Time :: "
+            << std::setfill(' ') << W(6) << this->comp_times.back() * 1000. << " ms  Avg: "
+            << W(6) << avg_comp_time * 1000. << "  Max: "
+            << W(6) << *std::max_element(this->comp_times.begin(), this->comp_times.end()) * 1000.
+            << "          |" << std::endl;
+
+  std::cout << "|===================================================================|" << std::endl;
+  L("                     --- VELOCITY DEBUG ---");
+
+  // T_corr translation (what GICP corrected)
+  float t_corr_x = this->T_corr(0, 3), t_corr_y = this->T_corr(1, 3), t_corr_z = this->T_corr(2, 3);
+  float t_corr_norm = std::sqrt(t_corr_x * t_corr_x + t_corr_y * t_corr_y + t_corr_z * t_corr_z);
+  L("T_corr trans   :: " + to_string_with_precision(t_corr_x, 4) + " " + to_string_with_precision(t_corr_y, 4) + " " + to_string_with_precision(t_corr_z, 4) + " |" + to_string_with_precision(t_corr_norm, 4) + "|");
+
+  // Expected displacement vs actual
+  float speed_body = this->state.v.lin.b.norm();
+  float scan_dt_f = static_cast<float>(this->scan_stamp - this->prev_scan_stamp);
+  float expected_disp = speed_body * scan_dt_f;
+  L("Expected disp  :: " + to_string_with_precision(expected_disp, 4) + " m (speed=" + to_string_with_precision(speed_body, 2) + " dt=" + to_string_with_precision(scan_dt_f * 1000.f, 1) + "ms)");
+
+  // IMU accel and velocities
+  L("IMU accel  {B}  :: " + to_string_with_precision(this->imu_meas.lin_accel[0], 4) + " " + to_string_with_precision(this->imu_meas.lin_accel[1], 4) + " " + to_string_with_precision(this->imu_meas.lin_accel[2], 4));
+  L("Pure IMU v{B}  :: " + to_string_with_precision(this->imu_only_vel_b_[0], 4) + " " + to_string_with_precision(this->imu_only_vel_b_[1], 4) + " " + to_string_with_precision(this->imu_only_vel_b_[2], 4));
+  L("State vel {B}  :: " + to_string_with_precision(this->state.v.lin.b[0], 4) + " " + to_string_with_precision(this->state.v.lin.b[1], 4) + " " + to_string_with_precision(this->state.v.lin.b[2], 4));
+  L("State vel {W}  :: " + to_string_with_precision(this->state.v.lin.w[0], 4) + " " + to_string_with_precision(this->state.v.lin.w[1], 4) + " " + to_string_with_precision(this->state.v.lin.w[2], 4));
+  L("Last good spd  :: " + to_string_with_precision(this->last_good_forward_speed_, 2) + " m/s");
+
+  // Gate status detail
+  L("Gate :: " + std::string(this->last_gate_passed_ ? "PASS" : "REJECT") +
+    " | Converged: " + std::string(this->gicp_hasConverged.load() ? "Y" : "N") +
+    " | Consec rejects: " + std::to_string(this->consecutive_gate_rejects_));
 
   std::cout << "+-------------------------------------------------------------------+" << std::endl;
 }

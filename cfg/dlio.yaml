@@ -1,31 +1,24 @@
 ###########################################################
-#                                                         #
-# Copyright (c)                                           #
-#                                                         #
-# The Verifiable & Control-Theoretic Robotics (VECTR) Lab #
-# University of California, Los Angeles                   #
-#                                                         #
-# Authors: Kenny J. Chen, Ryan Nemiroff, Brett T. Lopez   #
-# Contact: {kennyjchen, ryguyn, btlopez}@ucla.edu         #
-#                                                         #
+#                       DLIO General                      #
 ###########################################################
 
 /**:
   ros__parameters:
     version: 1.1.1
-
+    use_sim_time: true
     adaptive: true
 
-    pointcloud/deskew: true
-    pointcloud/voxelize: true
+    # Debug
+    deep_debug/odom: false
+    debug/odom: false
+    debug/print_odom: true
 
-    imu/calibration: true
-    imu/intrinsics/accel/bias: [0.0, 0.0, 0.0]
-    imu/intrinsics/accel/sm: [1., 0., 0., 0., 1., 0., 0., 0., 1.]
-    imu/intrinsics/gyro/bias: [0.0, 0.0, 0.0]
+    # TF source for map->odom: "odom" (OdomNode) or "lio_sam_opt"
+    map/tf_source: "odom"
 
-    extrinsics/baselink2imu/t: [0.0, 0.0, -0.08]
-    extrinsics/baselink2imu/rpy: [0.46, 0.37, 179.54] # roll, pitch, yaw in degrees
-
-    extrinsics/baselink2lidar/t: [0.0, 0.0, 0.0]
-    extrinsics/baselink2lidar/rpy: [0.0, 0.0, 0.0] # roll, pitch, yaw in degrees
+    # Frames
+    frames/map: map
+    frames/odom: odom
+    frames/baselink: base_link
+    frames/lidar: lidar
+    frames/imu: imu

@@ -1,0 +1,26 @@
+###########################################################
+#                   Occupancy Grid                        #
+###########################################################
+
+/**:
+  ros__parameters:
+    occupancy_grid/enabled: false
+    occupancy_grid/grid_size_x: 100.0
+    occupancy_grid/grid_size_y: 100.0
+    occupancy_grid/resolution: 0.4
+    occupancy_grid/ground_threshold: -0.3
+    occupancy_grid/obstacle_min_height: 0.1
+    occupancy_grid/obstacle_max_height: 3.0
+    occupancy_grid/p_occupied: 0.7
+    occupancy_grid/p_free: 0.3
+    occupancy_grid/p_prior: 0.5
+    occupancy_grid/lo_clamped_min: -4.0
+    occupancy_grid/lo_clamped_max: 4.0
+    occupancy_grid/decay_rate: 0.0
+    occupancy_grid/obstacle_margin: 0.3
+    occupancy_grid/height_offset: 0.0
+    occupancy_grid/adaptive_ground: true
+    occupancy_grid/ground_slope_threshold: 30.0
+    occupancy_grid/scan_angle_target: 0.0
+    occupancy_grid/scan_angle_tolerance: 180.0
+    occupancy_grid/update_rate: 2.0

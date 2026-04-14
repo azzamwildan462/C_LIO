@@ -16,9 +16,18 @@
 #include "dlio/odom/occupancy_grid.h"
 #include "dlio/algorithms/robust_icp.h"
 #include "dlio/algorithms/voxel_hash_map.h"
+#include "dlio/algorithms/error_state_ekf.h"
 #include "dlio/engines/registration_engine.h"
 #include "dlio/engines/prefilter_engine.h"
 // registration_helper.h removed — using registration_engine.h
+
+namespace dlio {
+  enum class FusionMethod { GEO, KF, EKF };
+  FusionMethod parseFusionMethod(const std::string& s);
+
+  enum class MotionModelType { NONE, ACKERMANN, DIFF_DRIVE, HOLONOMIC };
+  MotionModelType parseMotionModelType(const std::string& s);
+}
 
 // g2o
 #include "g2o/core/sparse_optimizer.h"
@@ -35,12 +44,14 @@
 #include <nav_msgs/msg/occupancy_grid.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/pose_array.hpp>
+#include <geometry_msgs/msg/twist_with_covariance_stamped.hpp>
 #include <nav_msgs/msg/path.hpp>
 #include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/nav_sat_fix.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <std_msgs/msg/float32.hpp>
 #include <std_msgs/msg/bool.hpp>
+#include <visualization_msgs/msg/marker_array.hpp>
 #include <tf2_ros/transform_broadcaster.h>
 #include <tf2_ros/static_transform_broadcaster.h>
 #include <GeographicLib/LocalCartesian.hpp>
@@ -89,10 +100,48 @@ private:
   struct State;
   struct ImuMeas;
 
+  // Alpha-Beta-Gamma tracker for lidarPose prediction-based gating
+  struct LidarPoseTracker
+  {
+    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+
+    // Position ABG state
+    Eigen::Vector3f p = Eigen::Vector3f::Zero();
+    Eigen::Vector3f v = Eigen::Vector3f::Zero();
+    Eigen::Vector3f a = Eigen::Vector3f::Zero();
+
+    // Rotation ABG state
+    Eigen::Quaternionf q = Eigen::Quaternionf::Identity();
+    Eigen::Vector3f omega = Eigen::Vector3f::Zero();
+    Eigen::Vector3f alpha_rot = Eigen::Vector3f::Zero();
+
+    // ABG gains (position)
+    float alpha_p = 0.5f;
+    float beta_p = 0.4f;
+    float gamma_p = 0.1f;
+
+    // ABG gains (rotation)
+    float alpha_q = 0.5f;
+    float beta_q = 0.3f;
+    float gamma_q = 0.05f;
+
+    // Gate thresholds on residual
+    float max_pos_residual = 2.0f;
+    float max_rot_residual_deg = 30.0f;
+
+    double prev_stamp = 0.0;
+    bool initialized = false;
+
+    void initialize(const Eigen::Vector3f &z_p, const Eigen::Quaternionf &z_q, double stamp);
+    std::pair<float, float> predictAndGate(const Eigen::Vector3f &z_p, const Eigen::Quaternionf &z_q, double stamp);
+    void update(const Eigen::Vector3f &z_p, const Eigen::Quaternionf &z_q, double stamp);
+  };
+
   void getParams();
 
   void callbackPointCloud(const sensor_msgs::msg::PointCloud2::SharedPtr pc);
   void callbackImu(const sensor_msgs::msg::Imu::SharedPtr imu);
+  void callbackExternalOdom(const geometry_msgs::msg::TwistWithCovarianceStamped::SharedPtr msg);
 
   void publishPose();
 
@@ -132,6 +181,13 @@ private:
 
   void propagateState();
   void updateState();
+  void updateStateGeo();
+  void updateStateKF();
+  void updateStateEKF();
+  void propagateStateKF(double dt);
+  bool evaluatePoseGate();
+  void applyMotionModelConstraint();
+  void applyMotionModelConstraintImu(Eigen::Vector3f &v, const Eigen::Quaternionf &q);
 
   void setAdaptiveParams();
 
@@ -483,6 +539,7 @@ private:
   double gravity_;
 
   bool time_offset_;
+  bool imu_gravity_removed_; // true if IMU driver already removed gravity from accel
 
   bool adaptive_params_;
 
@@ -536,6 +593,62 @@ private:
   double geo_Kgb_;
   double geo_abias_max_;
   double geo_gbias_max_;
+
+  // Fusion strategy
+  dlio::FusionMethod fusion_method_ = dlio::FusionMethod::GEO;
+
+  // Pose safety gate
+  bool gate_enabled_ = false;
+  double gate_fitness_threshold_ = 1.0;
+  double gate_min_spaciousness_ = 0.5;
+  double gate_max_translation_ = 5.0;
+  double gate_max_rotation_deg_ = 45.0;
+  int gate_max_consecutive_rejects_ = 10;
+  int consecutive_gate_rejects_ = 0;
+  bool last_gate_passed_ = true;
+  float last_good_forward_speed_ = 0.0f; // last known forward speed when GICP was good
+  Eigen::Vector3f prev_state_p_ = Eigen::Vector3f::Zero(); // previous state position for motion model pose filter
+  Pose prev_lidarPose_;  // previous scan matching result for gate comparison
+  LidarPoseTracker lidar_tracker_;  // ABG prediction-based gate
+
+  // KF state (15x15 covariance)
+  Eigen::Matrix<float, 15, 15> kf_P_;
+  bool kf_initialized_ = false;
+  double kf_sigma_accel_ = 0.1;
+  double kf_sigma_gyro_ = 0.01;
+  double kf_sigma_accel_bias_ = 0.001;
+  double kf_sigma_gyro_bias_ = 0.0001;
+  double kf_sigma_pos_meas_ = 0.1;
+  double kf_sigma_rot_meas_ = 0.02;
+
+  // Error-State EKF
+  dlio::ErrorStateEkf ekf_;
+  dlio::EkfParams ekf_params_;
+
+  // Motion model constraint
+  dlio::MotionModelType motion_model_type_ = dlio::MotionModelType::NONE;
+  struct MotionModelParams
+  {
+    // Ackermann
+    float ack_max_fwd_vel = 30.f, ack_max_rev_vel = 5.f;
+    float ack_max_lat_vel = 0.5f, ack_max_vert_vel = 1.f;
+    float ack_max_fwd_accel = 8.f, ack_max_lat_accel = 3.f;
+    float ack_max_yaw_rate = 1.5f, ack_max_roll_rate = 0.3f, ack_max_pitch_rate = 0.3f;
+    // Diff drive
+    float dd_max_fwd_vel = 5.f, dd_max_rev_vel = 2.f;
+    float dd_max_lat_vel = 0.1f, dd_max_vert_vel = 0.5f;
+    float dd_max_fwd_accel = 5.f, dd_max_lat_accel = 1.f;
+    float dd_max_yaw_rate = 3.f, dd_max_roll_rate = 0.2f, dd_max_pitch_rate = 0.2f;
+    // Holonomic
+    float holo_max_horiz_vel = 5.f, holo_max_vert_vel = 0.5f;
+    float holo_max_horiz_accel = 5.f;
+    float holo_max_yaw_rate = 3.f, holo_max_roll_rate = 0.2f, holo_max_pitch_rate = 0.2f;
+  };
+  MotionModelParams mm_params_;
+
+  // Debug: pure IMU velocity (no fusion correction)
+  Eigen::Vector3f imu_only_vel_w_ = Eigen::Vector3f::Zero();
+  Eigen::Vector3f imu_only_vel_b_ = Eigen::Vector3f::Zero();
 
   bool debug_;
   bool debug_print_;
@@ -614,6 +727,7 @@ private:
 
   // Confidence publisher + global correction control
   rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr confidence_pub_;
+  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr imu_debug_markers_pub_;
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr global_correction_sub_;
   std::atomic<bool> enable_global_correction_{true};
   float last_confidence_{0.0f};
@@ -649,6 +763,22 @@ private:
   double gps_origin_lat_ = 0.0;
   double gps_origin_lon_ = 0.0;
   double gps_origin_alt_ = 0.0;
+
+  // External velocity source (wheel encoder / INS twist)
+  bool ext_odom_enabled_ = false;
+  std::string ext_odom_topic_;
+  Eigen::Vector3f ext_odom_scale_ = Eigen::Vector3f::Ones();
+  struct
+  {
+    Eigen::Vector3f t = Eigen::Vector3f::Zero();
+    Eigen::Matrix3f R = Eigen::Matrix3f::Identity();
+  } ext_baselink2odom_;
+  rclcpp::Subscription<geometry_msgs::msg::TwistWithCovarianceStamped>::SharedPtr ext_odom_sub_;
+  rclcpp::CallbackGroup::SharedPtr ext_odom_cb_group_;
+  Eigen::Vector3f ext_odom_vel_body_ = Eigen::Vector3f::Zero();
+  std::mutex ext_odom_mtx_;
+  std::atomic<bool> ext_odom_received_{false};
+  double ext_odom_stamp_ = 0.0;
 
   // GPS params
   bool gps_enabled_ = false;

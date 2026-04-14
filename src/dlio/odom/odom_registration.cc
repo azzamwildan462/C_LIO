@@ -52,6 +52,7 @@ void dlio::OdomNode::getNextPose()
   this->engine_.align(*aligned);
   this->T_corr = this->engine_.getFinalTransformation();
   this->last_fitness_ = this->engine_.getFitnessScore(1.0);
+  this->gicp_hasConverged = this->engine_.hasConverged();
 
   if (this->deep_debug_)
     RCLCPP_INFO(this->get_logger(), "[DEEP] getNextPose: align done, fitness=%.4f", this->last_fitness_);
@@ -78,11 +79,7 @@ void dlio::OdomNode::getNextPose()
   if (this->deep_debug_)
     RCLCPP_INFO(this->get_logger(), "[DEEP] getNextPose: propagateGICP done");
 
-  // Geometric observer update
-  this->updateState();
-
-  if (this->deep_debug_)
-    RCLCPP_INFO(this->get_logger(), "[DEEP] getNextPose: updateState done");
+  // NOTE: updateState() is now called from callbackPointCloud() after gate evaluation
 }
 
 bool dlio::OdomNode::imuMeasFromTimeRange(double start_time, double end_time,
@@ -250,10 +247,25 @@ dlio::OdomNode::integrateImuInternal(Eigen::Quaternionf q_init, Eigen::Vector3f 
         q.z() + 0.5 * (q.x() * omega[1] - q.y() * omega[0] + q.w() * omega[2]) * dt);
     q.normalize();
 
-    // Acceleration
+    // Acceleration & velocity propagation
     Eigen::Vector3f a0 = a;
-    a = q._transformVector(f.lin_accel);
-    a[2] -= this->gravity_;
+
+    if (this->ext_odom_enabled_ && this->ext_odom_received_.load())
+    {
+      // External odom: use odom velocity, skip accel integration
+      Eigen::Vector3f vel_body;
+      {
+        std::lock_guard<std::mutex> odom_lock(this->ext_odom_mtx_);
+        vel_body = this->ext_odom_vel_body_;
+      }
+      v = q * vel_body; // body → world
+      a = Eigen::Vector3f::Zero();
+    }
+    else
+    {
+      a = q._transformVector(f.lin_accel);
+      a[2] -= this->gravity_;
+    }
 
     // Jerk
     Eigen::Vector3f j_dt = a - a0;
@@ -262,7 +274,6 @@ dlio::OdomNode::integrateImuInternal(Eigen::Quaternionf q_init, Eigen::Vector3f 
     // Interpolate for given timestamps
     while (stamp_it != sorted_timestamps.end() && *stamp_it <= f.stamp)
     {
-      // Time between previous IMU sample and given timestamp
       double idt = *stamp_it - f0.stamp;
 
       // Average angular velocity
@@ -279,11 +290,9 @@ dlio::OdomNode::integrateImuInternal(Eigen::Quaternionf q_init, Eigen::Vector3f 
       // Position
       Eigen::Vector3f p_i = p + v * idt + 0.5 * a0 * idt * idt + (1 / 6.) * j * idt * idt * idt;
 
-      // Transformation
       Eigen::Matrix4f T = Eigen::Matrix4f::Identity();
       T.block(0, 0, 3, 3) = q_i.toRotationMatrix();
       T.block(0, 3, 3, 1) = p_i;
-
       imu_se3.push_back(T);
 
       stamp_it++;
@@ -293,7 +302,13 @@ dlio::OdomNode::integrateImuInternal(Eigen::Quaternionf q_init, Eigen::Vector3f 
     p += v * dt + 0.5 * a0 * dt * dt + (1 / 6.) * j_dt * dt * dt;
 
     // Velocity
-    v += a0 * dt + 0.5 * j_dt * dt;
+    if (!(this->ext_odom_enabled_ && this->ext_odom_received_.load()))
+    {
+      v += a0 * dt + 0.5 * j_dt * dt;
+    }
+
+    // Motion model constraint on velocity
+    this->applyMotionModelConstraintImu(v, q);
 
     prev_imu_it = imu_it;
   }
@@ -337,22 +352,43 @@ void dlio::OdomNode::propagateState()
   }
 
   Eigen::Quaternionf qhat = this->state.q, omega;
-  Eigen::Vector3f world_accel;
 
-  // Transform accel from body to world frame
-  world_accel = qhat._transformVector(this->imu_meas.lin_accel);
+  // --- Position propagation ---
+  if (this->ext_odom_enabled_ && this->ext_odom_received_.load())
+  {
+    // External odom: use velocity directly (no accel integration, no gravity)
+    Eigen::Vector3f vel_body, vel_world;
+    {
+      std::lock_guard<std::mutex> odom_lock(this->ext_odom_mtx_);
+      vel_body = this->ext_odom_vel_body_;
+    }
+    vel_world = qhat * vel_body;
+    this->state.p += vel_world * dt;
+    this->state.v.lin.w = vel_world;
+    this->state.v.lin.b = vel_body;
+  }
+  else
+  {
+    // IMU accel integration (original)
+    Eigen::Vector3f world_accel = qhat._transformVector(this->imu_meas.lin_accel);
 
-  // Accel propogation
-  this->state.p[0] += this->state.v.lin.w[0] * dt + 0.5 * dt * dt * world_accel[0];
-  this->state.p[1] += this->state.v.lin.w[1] * dt + 0.5 * dt * dt * world_accel[1];
-  this->state.p[2] += this->state.v.lin.w[2] * dt + 0.5 * dt * dt * (world_accel[2] - this->gravity_);
+    this->state.p[0] += this->state.v.lin.w[0] * dt + 0.5 * dt * dt * world_accel[0];
+    this->state.p[1] += this->state.v.lin.w[1] * dt + 0.5 * dt * dt * world_accel[1];
+    this->state.p[2] += this->state.v.lin.w[2] * dt + 0.5 * dt * dt * (world_accel[2] - this->gravity_);
 
-  this->state.v.lin.w[0] += world_accel[0] * dt;
-  this->state.v.lin.w[1] += world_accel[1] * dt;
-  this->state.v.lin.w[2] += (world_accel[2] - this->gravity_) * dt;
-  this->state.v.lin.b = this->state.q.toRotationMatrix().inverse() * this->state.v.lin.w;
+    this->state.v.lin.w[0] += world_accel[0] * dt;
+    this->state.v.lin.w[1] += world_accel[1] * dt;
+    this->state.v.lin.w[2] += (world_accel[2] - this->gravity_) * dt;
+    this->state.v.lin.b = this->state.q.toRotationMatrix().inverse() * this->state.v.lin.w;
 
-  // Gyro propogation
+    // Debug: track pure IMU velocity
+    this->imu_only_vel_w_[0] += world_accel[0] * dt;
+    this->imu_only_vel_w_[1] += world_accel[1] * dt;
+    this->imu_only_vel_w_[2] += (world_accel[2] - this->gravity_) * dt;
+    this->imu_only_vel_b_ = this->state.q.toRotationMatrix().inverse() * this->imu_only_vel_w_;
+  }
+
+  // --- Gyro propagation (ALWAYS from IMU) ---
   omega.w() = 0;
   omega.vec() = this->imu_meas.ang_vel;
   Eigen::Quaternionf tmp = qhat * omega;
@@ -366,9 +402,40 @@ void dlio::OdomNode::propagateState()
 
   this->state.v.ang.b = this->imu_meas.ang_vel;
   this->state.v.ang.w = this->state.q.toRotationMatrix() * this->state.v.ang.b;
+
+  // Motion model constraint (clamp velocity/angular rate to physical limits)
+  this->applyMotionModelConstraint();
+
+  // Covariance propagation for KF/EKF
+  if (this->fusion_method_ == dlio::FusionMethod::KF)
+  {
+    this->propagateStateKF(dt);
+  }
+  else if (this->fusion_method_ == dlio::FusionMethod::EKF)
+  {
+    this->ekf_.predict(dt, this->imu_meas.lin_accel, this->imu_meas.ang_vel,
+                       this->state.q, static_cast<float>(this->gravity_));
+  }
 }
 
 void dlio::OdomNode::updateState()
+{
+  switch (this->fusion_method_)
+  {
+  case dlio::FusionMethod::KF:
+    this->updateStateKF();
+    break;
+  case dlio::FusionMethod::EKF:
+    this->updateStateEKF();
+    break;
+  case dlio::FusionMethod::GEO:
+  default:
+    this->updateStateGeo();
+    break;
+  }
+}
+
+void dlio::OdomNode::updateStateGeo()
 {
 
   // Lock thread to prevent state from being accessed by PropagateState
@@ -435,6 +502,338 @@ void dlio::OdomNode::updateState()
                 this->state.b.accel[0], this->state.b.accel[1], this->state.b.accel[2],
                 this->state.b.gyro[0], this->state.b.gyro[1], this->state.b.gyro[2]);
   }
+}
+
+void dlio::OdomNode::updateStateKF()
+{
+  std::lock_guard<std::mutex> lock(this->geo.mtx);
+
+  Eigen::Vector3f pin = this->lidarPose.p;
+  Eigen::Quaternionf qin = this->lidarPose.q;
+
+  // Innovation vector (6x1): [pos_error(3), rot_error(3)]
+  Eigen::Matrix<float, 6, 1> y;
+  y.segment<3>(0) = pin - this->state.p;
+
+  Eigen::Quaternionf qe = this->state.q.conjugate() * qin;
+  float sgn = (qe.w() < 0) ? -1.0f : 1.0f;
+  y.segment<3>(3) = 2.0f * sgn * qe.vec();
+
+  // Observation matrix H (6x15): identity blocks for position and rotation error
+  Eigen::Matrix<float, 6, 15> H = Eigen::Matrix<float, 6, 15>::Zero();
+  H.block<3, 3>(0, 0) = Eigen::Matrix3f::Identity(); // position
+  H.block<3, 3>(3, 6) = Eigen::Matrix3f::Identity(); // rotation error
+
+  // Measurement noise R (6x6)
+  float sp2 = static_cast<float>(this->kf_sigma_pos_meas_ * this->kf_sigma_pos_meas_);
+  float sr2 = static_cast<float>(this->kf_sigma_rot_meas_ * this->kf_sigma_rot_meas_);
+  Eigen::Matrix<float, 6, 6> R = Eigen::Matrix<float, 6, 6>::Zero();
+  R.block<3, 3>(0, 0) = Eigen::Matrix3f::Identity() * sp2;
+  R.block<3, 3>(3, 3) = Eigen::Matrix3f::Identity() * sr2;
+
+  // Innovation covariance S = H*P*H^T + R
+  Eigen::Matrix<float, 6, 6> S = H * this->kf_P_ * H.transpose() + R;
+
+  // Kalman gain K = P * H^T * S^{-1}
+  Eigen::Matrix<float, 6, 6> S_inv = S.inverse();
+  Eigen::Matrix<float, 15, 6> K = this->kf_P_ * H.transpose() * S_inv;
+
+  // State correction
+  Eigen::Matrix<float, 15, 1> dx = K * y;
+
+  // Apply correction to nominal state
+  this->state.p += dx.segment<3>(0);
+  this->state.v.lin.w += dx.segment<3>(3);
+
+  // Quaternion: apply small rotation dtheta
+  Eigen::Vector3f dtheta = dx.segment<3>(6);
+  Eigen::Quaternionf dq(1.0f, dtheta.x() / 2.0f, dtheta.y() / 2.0f, dtheta.z() / 2.0f);
+  dq.normalize();
+  this->state.q = (this->state.q * dq).normalized();
+
+  // Bias corrections
+  this->state.b.accel += dx.segment<3>(9);
+  this->state.b.gyro += dx.segment<3>(12);
+  this->state.b.accel = this->state.b.accel.array().min(this->geo_abias_max_).max(-this->geo_abias_max_);
+  this->state.b.gyro = this->state.b.gyro.array().min(this->geo_gbias_max_).max(-this->geo_gbias_max_);
+
+  // Joseph-form covariance update: P = (I-KH)*P*(I-KH)^T + K*R*K^T
+  Eigen::Matrix<float, 15, 15> I_KH = Eigen::Matrix<float, 15, 15>::Identity() - K * H;
+  this->kf_P_ = I_KH * this->kf_P_ * I_KH.transpose() + K * R * K.transpose();
+  this->kf_P_ = 0.5f * (this->kf_P_ + this->kf_P_.transpose());
+
+  this->geo.prev_p = this->state.p;
+  this->geo.prev_q = this->state.q;
+  this->geo.prev_vel = this->state.v.lin.w;
+
+  if (this->debug_)
+  {
+    RCLCPP_INFO(this->get_logger(),
+                "[odom] updateStateKF: innovation=[%.4f,%.4f,%.4f] |y_pos|=%.4f |y_rot|=%.4f",
+                y(0), y(1), y(2), y.segment<3>(0).norm(), y.segment<3>(3).norm());
+  }
+}
+
+void dlio::OdomNode::updateStateEKF()
+{
+  std::lock_guard<std::mutex> lock(this->geo.mtx);
+
+  // Compute adaptive measurement noise from fitness + spaciousness + scatter
+  float sp;
+  {
+    std::lock_guard<std::mutex> mlock(this->metrics_mtx_);
+    sp = this->metrics.spaciousness.empty() ? 5.0f : this->metrics.spaciousness.back();
+  }
+  double scatter = dlio::ErrorStateEkf::computeScanScatter(this->current_scan);
+
+  auto [sigma_pos, sigma_rot] = dlio::ErrorStateEkf::computeMeasurementNoise(
+      this->ekf_params_, this->last_fitness_, static_cast<double>(sp), scatter);
+
+  // EKF update (includes Mahalanobis gate)
+  bool accepted = this->ekf_.update(this->lidarPose.p, this->lidarPose.q,
+                                    this->state.p, this->state.q,
+                                    sigma_pos, sigma_rot);
+
+  if (accepted)
+  {
+    const auto &dx = this->ekf_.getDeltaState();
+    this->state.p += dx.segment<3>(0);
+    this->state.v.lin.w += dx.segment<3>(3);
+
+    Eigen::Vector3f dtheta = dx.segment<3>(6);
+    Eigen::Quaternionf dq(1.0f, dtheta.x() / 2.0f, dtheta.y() / 2.0f, dtheta.z() / 2.0f);
+    dq.normalize();
+    this->state.q = (this->state.q * dq).normalized();
+
+    this->state.b.accel += dx.segment<3>(9);
+    this->state.b.gyro += dx.segment<3>(12);
+    this->state.b.accel = this->state.b.accel.array()
+                              .min(this->ekf_params_.abias_max)
+                              .max(-this->ekf_params_.abias_max);
+    this->state.b.gyro = this->state.b.gyro.array()
+                             .min(this->ekf_params_.gbias_max)
+                             .max(-this->ekf_params_.gbias_max);
+  }
+
+  this->geo.prev_p = this->state.p;
+  this->geo.prev_q = this->state.q;
+  this->geo.prev_vel = this->state.v.lin.w;
+
+  if (this->debug_)
+  {
+    RCLCPP_INFO(this->get_logger(),
+                "[odom] updateStateEKF: accepted=%d mahal=%.2f sigma_p=%.4f sigma_r=%.4f rejects=%d",
+                (int)accepted, this->ekf_.lastMahalanobis(),
+                sigma_pos, sigma_rot, this->ekf_.consecutiveRejects());
+  }
+}
+
+void dlio::OdomNode::propagateStateKF(double dt)
+{
+  // Linear covariance propagation (called inside propagateState which holds geo.mtx)
+  float dtf = static_cast<float>(dt);
+  Eigen::Matrix3f R = this->state.q.toRotationMatrix();
+
+  // State transition matrix F (15x15)
+  Eigen::Matrix<float, 15, 15> F = Eigen::Matrix<float, 15, 15>::Identity();
+  F.block<3, 3>(0, 3) = Eigen::Matrix3f::Identity() * dtf; // dp/dv = I*dt
+
+  // Simplified linear model: skip rotation-dependent terms for KF
+  // (EKF handles those properly; KF is a simpler alternative)
+  F.block<3, 3>(3, 9) = -R * dtf;                            // dv/dba = -R*dt
+  F.block<3, 3>(6, 12) = -Eigen::Matrix3f::Identity() * dtf; // dtheta/dbg = -I*dt
+
+  // Process noise input matrix G (15x12)
+  Eigen::Matrix<float, 15, 12> G = Eigen::Matrix<float, 15, 12>::Zero();
+  G.block<3, 3>(3, 0) = -R;
+  G.block<3, 3>(6, 3) = -Eigen::Matrix3f::Identity();
+  G.block<3, 3>(9, 6) = Eigen::Matrix3f::Identity();
+  G.block<3, 3>(12, 9) = Eigen::Matrix3f::Identity();
+
+  // Continuous-time spectral densities
+  float sa2 = this->kf_sigma_accel_ * this->kf_sigma_accel_;
+  float sg2 = this->kf_sigma_gyro_ * this->kf_sigma_gyro_;
+  float sba2 = this->kf_sigma_accel_bias_ * this->kf_sigma_accel_bias_;
+  float sbg2 = this->kf_sigma_gyro_bias_ * this->kf_sigma_gyro_bias_;
+
+  Eigen::Matrix<float, 12, 12> Qi = Eigen::Matrix<float, 12, 12>::Zero();
+  Qi.block<3, 3>(0, 0) = Eigen::Matrix3f::Identity() * sa2;
+  Qi.block<3, 3>(3, 3) = Eigen::Matrix3f::Identity() * sg2;
+  Qi.block<3, 3>(6, 6) = Eigen::Matrix3f::Identity() * sba2;
+  Qi.block<3, 3>(9, 9) = Eigen::Matrix3f::Identity() * sbg2;
+
+  this->kf_P_ = F * this->kf_P_ * F.transpose() + G * Qi * G.transpose() * dtf;
+
+  // Periodic symmetrization for numerical stability
+  static int kf_prop_count = 0;
+  if (++kf_prop_count % 100 == 0)
+  {
+    this->kf_P_ = 0.5f * (this->kf_P_ + this->kf_P_.transpose());
+
+    // Clamp diagonal to prevent covariance explosion
+    // Max std: pos=100m, vel=50m/s, rot=1rad, abias=5m/s², gbias=0.5rad/s
+    Eigen::Matrix<float, 15, 1> max_var;
+    max_var << 1e4, 1e4, 1e4, // position variance (100m)^2
+        2500, 2500, 2500,     // velocity variance (50m/s)^2
+        1, 1, 1,              // rotation variance (1rad)^2
+        25, 25, 25,           // accel bias variance (5m/s²)^2
+        0.25, 0.25, 0.25;     // gyro bias variance (0.5rad/s)^2
+    for (int i = 0; i < 15; i++)
+    {
+      if (this->kf_P_(i, i) > max_var(i))
+        this->kf_P_(i, i) = max_var(i);
+    }
+  }
+}
+
+bool dlio::OdomNode::evaluatePoseGate()
+{
+  if (!this->gate_enabled_)
+    return true; // backward compatible: no gating
+
+  // Gate 0: GICP convergence check
+  if (!this->gicp_hasConverged.load())
+  {
+    return false;
+  }
+
+  // Gate 0b: T_corr sanity — if vehicle is moving but T_corr ≈ identity, GICP failed silently
+  {
+    float t_corr_trans = Eigen::Vector3f(this->T_corr(0, 3), this->T_corr(1, 3), this->T_corr(2, 3)).norm();
+    float speed = this->state.v.lin.b.norm();
+    float dt = this->scan_stamp - this->prev_scan_stamp;
+    float expected_displacement = speed * dt;
+
+    // If we're moving (>1m/s) and expected displacement is significant (>0.1m),
+    // but T_corr shows near-zero correction, GICP likely failed silently
+    if (speed > 1.0f && expected_displacement > 0.1f && t_corr_trans < 0.01f)
+    {
+      return false;
+    }
+  }
+
+  // Gate 1: Fitness score (skip if infinite/nan — GICP failed completely)
+  if (std::isfinite(this->last_fitness_) && this->last_fitness_ > this->gate_fitness_threshold_)
+  {
+    return false;
+  }
+  if (!std::isfinite(this->last_fitness_))
+  {
+    return false;
+  }
+
+  // Gate 2: Structure complexity (spaciousness)
+  float sp;
+  {
+    std::lock_guard<std::mutex> lock(this->metrics_mtx_);
+    sp = this->metrics.spaciousness.empty() ? 10.0f : this->metrics.spaciousness.back();
+  }
+  if (sp < this->gate_min_spaciousness_)
+  {
+    return false;
+  }
+
+  // Gate 3: Max translation jump (vs current state pose)
+  float trans = (this->lidarPose.p - this->state.p).norm();
+  if (trans > this->gate_max_translation_)
+  {
+    return false;
+  }
+
+  // Gate 4: Max rotation jump (vs current state orientation)
+  Eigen::Quaternionf dq = this->state.q.conjugate() * this->lidarPose.q;
+  double angle_deg = 2.0 * std::acos(std::min(1.0f, std::abs(dq.w()))) * 180.0 / M_PI;
+  if (angle_deg > this->gate_max_rotation_deg_)
+  {
+    return false;
+  }
+
+  return true;
+}
+
+void dlio::OdomNode::applyMotionModelConstraint()
+{
+  // Called from propagateState() which already holds geo.mtx
+  if (this->motion_model_type_ == dlio::MotionModelType::NONE)
+    return;
+
+  // Convert world-frame velocity to body-frame
+  Eigen::Vector3f v_body = this->state.q.toRotationMatrix().inverse() * this->state.v.lin.w;
+  Eigen::Vector3f omega = this->state.v.ang.b;
+
+  const auto &p = this->mm_params_;
+
+  switch (this->motion_model_type_)
+  {
+  case dlio::MotionModelType::ACKERMANN:
+    v_body[0] = std::clamp(v_body[0], -p.ack_max_rev_vel, p.ack_max_fwd_vel);
+    v_body[1] = std::clamp(v_body[1], -p.ack_max_lat_vel, p.ack_max_lat_vel);
+    v_body[2] = std::clamp(v_body[2], -p.ack_max_vert_vel, p.ack_max_vert_vel);
+    omega[0] = std::clamp(omega[0], -p.ack_max_roll_rate, p.ack_max_roll_rate);
+    omega[1] = std::clamp(omega[1], -p.ack_max_pitch_rate, p.ack_max_pitch_rate);
+    omega[2] = std::clamp(omega[2], -p.ack_max_yaw_rate, p.ack_max_yaw_rate);
+    break;
+
+  case dlio::MotionModelType::DIFF_DRIVE:
+    v_body[0] = std::clamp(v_body[0], -p.dd_max_rev_vel, p.dd_max_fwd_vel);
+    v_body[1] = std::clamp(v_body[1], -p.dd_max_lat_vel, p.dd_max_lat_vel);
+    v_body[2] = std::clamp(v_body[2], -p.dd_max_vert_vel, p.dd_max_vert_vel);
+    omega[0] = std::clamp(omega[0], -p.dd_max_roll_rate, p.dd_max_roll_rate);
+    omega[1] = std::clamp(omega[1], -p.dd_max_pitch_rate, p.dd_max_pitch_rate);
+    omega[2] = std::clamp(omega[2], -p.dd_max_yaw_rate, p.dd_max_yaw_rate);
+    break;
+
+  case dlio::MotionModelType::HOLONOMIC:
+    v_body[0] = std::clamp(v_body[0], -p.holo_max_horiz_vel, p.holo_max_horiz_vel);
+    v_body[1] = std::clamp(v_body[1], -p.holo_max_horiz_vel, p.holo_max_horiz_vel);
+    v_body[2] = std::clamp(v_body[2], -p.holo_max_vert_vel, p.holo_max_vert_vel);
+    omega[0] = std::clamp(omega[0], -p.holo_max_roll_rate, p.holo_max_roll_rate);
+    omega[1] = std::clamp(omega[1], -p.holo_max_pitch_rate, p.holo_max_pitch_rate);
+    omega[2] = std::clamp(omega[2], -p.holo_max_yaw_rate, p.holo_max_yaw_rate);
+    break;
+
+  default:
+    return;
+  }
+
+  // Write back to state
+  this->state.v.lin.b = v_body;
+  this->state.v.lin.w = this->state.q.toRotationMatrix() * v_body;
+  this->state.v.ang.b = omega;
+  this->state.v.ang.w = this->state.q.toRotationMatrix() * omega;
+}
+
+void dlio::OdomNode::applyMotionModelConstraintImu(Eigen::Vector3f &v, const Eigen::Quaternionf &q)
+{
+  // Lightweight version for integrateImuInternal() — only clamps velocity
+  if (this->motion_model_type_ == dlio::MotionModelType::NONE)
+    return;
+
+  Eigen::Vector3f v_body = q.toRotationMatrix().inverse() * v;
+  const auto &p = this->mm_params_;
+
+  switch (this->motion_model_type_)
+  {
+  case dlio::MotionModelType::ACKERMANN:
+    v_body[0] = std::clamp(v_body[0], -p.ack_max_rev_vel, p.ack_max_fwd_vel);
+    v_body[1] = std::clamp(v_body[1], -p.ack_max_lat_vel, p.ack_max_lat_vel);
+    v_body[2] = std::clamp(v_body[2], -p.ack_max_vert_vel, p.ack_max_vert_vel);
+    break;
+  case dlio::MotionModelType::DIFF_DRIVE:
+    v_body[0] = std::clamp(v_body[0], -p.dd_max_rev_vel, p.dd_max_fwd_vel);
+    v_body[1] = std::clamp(v_body[1], -p.dd_max_lat_vel, p.dd_max_lat_vel);
+    v_body[2] = std::clamp(v_body[2], -p.dd_max_vert_vel, p.dd_max_vert_vel);
+    break;
+  case dlio::MotionModelType::HOLONOMIC:
+    v_body[0] = std::clamp(v_body[0], -p.holo_max_horiz_vel, p.holo_max_horiz_vel);
+    v_body[1] = std::clamp(v_body[1], -p.holo_max_horiz_vel, p.holo_max_horiz_vel);
+    v_body[2] = std::clamp(v_body[2], -p.holo_max_vert_vel, p.holo_max_vert_vel);
+    break;
+  default:
+    return;
+  }
+
+  v = q.toRotationMatrix() * v_body;
 }
 
 void dlio::OdomNode::setAdaptiveParams()

@@ -23,6 +23,26 @@
 // Global pointer for KFDB atexit handler
 std::atomic<dlio::OdomNode *> g_odom_node{nullptr};
 
+dlio::FusionMethod dlio::parseFusionMethod(const std::string &s)
+{
+  if (s == "kf" || s == "KF")
+    return dlio::FusionMethod::KF;
+  if (s == "ekf" || s == "EKF")
+    return dlio::FusionMethod::EKF;
+  return dlio::FusionMethod::GEO;
+}
+
+dlio::MotionModelType dlio::parseMotionModelType(const std::string &s)
+{
+  if (s == "ackermann" || s == "ACKERMANN")
+    return dlio::MotionModelType::ACKERMANN;
+  if (s == "diff_drive" || s == "DIFF_DRIVE")
+    return dlio::MotionModelType::DIFF_DRIVE;
+  if (s == "holonomic" || s == "HOLONOMIC")
+    return dlio::MotionModelType::HOLONOMIC;
+  return dlio::MotionModelType::NONE;
+}
+
 static void odomAtexitSave()
 {
   auto *node = g_odom_node.exchange(nullptr);
@@ -78,6 +98,7 @@ dlio::OdomNode::OdomNode(const rclcpp::NodeOptions &options)
   this->deskewed_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>("deskewed", 1);
   this->deskewed_raw_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>("deskewed_raw", 1);
   this->kf_stamped_pub = this->create_publisher<direct_lidar_inertial_odometry::msg::KeyframeStamped>("kf_stamped", 10);
+  this->imu_debug_markers_pub_ = this->create_publisher<visualization_msgs::msg::MarkerArray>("imu_debug_markers", 1);
 
   this->br = std::make_shared<tf2_ros::TransformBroadcaster>(*this);
 
@@ -98,6 +119,19 @@ dlio::OdomNode::OdomNode(const rclcpp::NodeOptions &options)
         std::bind(&dlio::OdomNode::publishOccupancyGrid, this));
 
     RCLCPP_INFO(this->get_logger(), "Occupancy grid enabled: rate=%.1fHz", og_rate);
+  }
+
+  // External odometry subscriber
+  if (this->ext_odom_enabled_)
+  {
+    this->ext_odom_cb_group_ = this->create_callback_group(
+        rclcpp::CallbackGroupType::MutuallyExclusive);
+    auto odom_sub_opt = rclcpp::SubscriptionOptions();
+    odom_sub_opt.callback_group = this->ext_odom_cb_group_;
+    this->ext_odom_sub_ = this->create_subscription<geometry_msgs::msg::TwistWithCovarianceStamped>(
+        this->ext_odom_topic_, rclcpp::SensorDataQoS(),
+        std::bind(&dlio::OdomNode::callbackExternalOdom, this, std::placeholders::_1),
+        odom_sub_opt);
   }
 
   // GPS subscriber
@@ -146,6 +180,8 @@ dlio::OdomNode::OdomNode(const rclcpp::NodeOptions &options)
 
   this->lidarPose.p = Eigen::Vector3f(0., 0., 0.);
   this->lidarPose.q = Eigen::Quaternionf(1., 0., 0., 0.);
+  this->prev_lidarPose_.p = Eigen::Vector3f(0., 0., 0.);
+  this->prev_lidarPose_.q = Eigen::Quaternionf(1., 0., 0., 0.);
 
   this->imu_meas.stamp = 0.;
   this->imu_meas.ang_vel[0] = 0.;
@@ -210,6 +246,27 @@ dlio::OdomNode::OdomNode(const rclcpp::NodeOptions &options)
 
   this->geo.first_opt_done = false;
   this->geo.prev_vel = Eigen::Vector3f(0., 0., 0.);
+
+  // Initialize KF covariance
+  if (this->fusion_method_ == dlio::FusionMethod::KF)
+  {
+    this->kf_P_.setZero();
+    float p_pos = 1.0f, p_vel = 1.0f, p_rot = 0.01f, p_ba = 0.25f, p_bg = 0.01f;
+    this->kf_P_.diagonal() << p_pos, p_pos, p_pos,
+        p_vel, p_vel, p_vel,
+        p_rot, p_rot, p_rot,
+        p_ba, p_ba, p_ba,
+        p_bg, p_bg, p_bg;
+    this->kf_initialized_ = true;
+    RCLCPP_INFO(this->get_logger(), "[odom] KF covariance initialized (15x15)");
+  }
+
+  // Initialize EKF
+  if (this->fusion_method_ == dlio::FusionMethod::EKF)
+  {
+    this->ekf_.init(this->ekf_params_);
+    RCLCPP_INFO(this->get_logger(), "[odom] Error-State EKF initialized (15-state)");
+  }
 
   pcl::console::setVerbosityLevel(pcl::console::L_ERROR);
 
@@ -457,6 +514,12 @@ void dlio::OdomNode::getParams()
   // Compute time offset between lidar and imu
   dlio::declare_param(this, "odom/computeTimeOffset", this->time_offset_, false);
 
+  // IMU gravity removed: set true if IMU driver already removes gravity from accel
+  // (accel Z ≈ 0 at rest instead of ≈ 9.8). DLIO will add gravity back using IMU orientation.
+  dlio::declare_param(this, "odom/imu/gravityRemoved", this->imu_gravity_removed_, false);
+  if (this->imu_gravity_removed_)
+    RCLCPP_INFO(this->get_logger(), "[odom] IMU gravity-removed mode: will reconstruct raw accel from orientation");
+
   // Keyframe Threshold
   dlio::declare_param(this, "odom/keyframe/threshD", this->keyframe_thresh_dist_, 0.1);
   dlio::declare_param(this, "odom/keyframe/threshR", this->keyframe_thresh_rot_, 1.0);
@@ -681,6 +744,124 @@ void dlio::OdomNode::getParams()
   dlio::declare_param(this, "odom/geo/abias_max", this->geo_abias_max_, 1.0);
   dlio::declare_param(this, "odom/geo/gbias_max", this->geo_gbias_max_, 1.0);
 
+  // Fusion strategy: "geo", "kf", "ekf"
+  {
+    std::string fusion_method_str;
+    dlio::declare_param(this, "odom/fusion/method", fusion_method_str, std::string("geo"));
+    this->fusion_method_ = dlio::parseFusionMethod(fusion_method_str);
+    RCLCPP_INFO(this->get_logger(), "[odom] Fusion method: %s", fusion_method_str.c_str());
+  }
+
+  // Pose safety gate
+  dlio::declare_param(this, "odom/fusion/gate/enabled", this->gate_enabled_, false);
+  dlio::declare_param(this, "odom/fusion/gate/fitness_threshold", this->gate_fitness_threshold_, 1.0);
+  dlio::declare_param(this, "odom/fusion/gate/min_spaciousness", this->gate_min_spaciousness_, 0.5);
+  dlio::declare_param(this, "odom/fusion/gate/max_translation", this->gate_max_translation_, 5.0);
+  dlio::declare_param(this, "odom/fusion/gate/max_rotation_deg", this->gate_max_rotation_deg_, 45.0);
+  dlio::declare_param(this, "odom/fusion/gate/max_consecutive_rejects", this->gate_max_consecutive_rejects_, 10);
+  // ABG LiDAR pose tracker (prediction-based gate)
+  {
+    double ap, bp, gp, aq, bq, gq, mpr, mrr;
+    dlio::declare_param(this, "odom/fusion/gate/tracker/alpha_p", ap, 0.5);
+    dlio::declare_param(this, "odom/fusion/gate/tracker/beta_p", bp, 0.4);
+    dlio::declare_param(this, "odom/fusion/gate/tracker/gamma_p", gp, 0.1);
+    dlio::declare_param(this, "odom/fusion/gate/tracker/alpha_q", aq, 0.5);
+    dlio::declare_param(this, "odom/fusion/gate/tracker/beta_q", bq, 0.3);
+    dlio::declare_param(this, "odom/fusion/gate/tracker/gamma_q", gq, 0.05);
+    dlio::declare_param(this, "odom/fusion/gate/tracker/max_pos_residual", mpr, 2.0);
+    dlio::declare_param(this, "odom/fusion/gate/tracker/max_rot_residual_deg", mrr, 30.0);
+    this->lidar_tracker_.alpha_p = ap;
+    this->lidar_tracker_.beta_p = bp;
+    this->lidar_tracker_.gamma_p = gp;
+    this->lidar_tracker_.alpha_q = aq;
+    this->lidar_tracker_.beta_q = bq;
+    this->lidar_tracker_.gamma_q = gq;
+    this->lidar_tracker_.max_pos_residual = mpr;
+    this->lidar_tracker_.max_rot_residual_deg = mrr;
+  }
+
+  if (this->gate_enabled_)
+  {
+    RCLCPP_INFO(this->get_logger(),
+                "[odom] Gate enabled: fitness<%.2f, spaciousness>%.2f, max_trans=%.1fm, max_rot=%.1fdeg, "
+                "ABG tracker: max_pos_res=%.1fm, max_rot_res=%.1fdeg",
+                this->gate_fitness_threshold_, this->gate_min_spaciousness_,
+                this->gate_max_translation_, this->gate_max_rotation_deg_,
+                this->lidar_tracker_.max_pos_residual, this->lidar_tracker_.max_rot_residual_deg);
+  }
+
+  // KF parameters
+  dlio::declare_param(this, "odom/fusion/kf/sigma_accel", this->kf_sigma_accel_, 0.1);
+  dlio::declare_param(this, "odom/fusion/kf/sigma_gyro", this->kf_sigma_gyro_, 0.01);
+  dlio::declare_param(this, "odom/fusion/kf/sigma_accel_bias", this->kf_sigma_accel_bias_, 0.001);
+  dlio::declare_param(this, "odom/fusion/kf/sigma_gyro_bias", this->kf_sigma_gyro_bias_, 0.0001);
+  dlio::declare_param(this, "odom/fusion/kf/sigma_pos_meas", this->kf_sigma_pos_meas_, 0.1);
+  dlio::declare_param(this, "odom/fusion/kf/sigma_rot_meas", this->kf_sigma_rot_meas_, 0.02);
+
+  // EKF parameters
+  dlio::declare_param(this, "odom/fusion/ekf/sigma_accel", this->ekf_params_.sigma_accel, 0.1);
+  dlio::declare_param(this, "odom/fusion/ekf/sigma_gyro", this->ekf_params_.sigma_gyro, 0.01);
+  dlio::declare_param(this, "odom/fusion/ekf/sigma_accel_bias", this->ekf_params_.sigma_accel_bias, 0.001);
+  dlio::declare_param(this, "odom/fusion/ekf/sigma_gyro_bias", this->ekf_params_.sigma_gyro_bias, 0.0001);
+  dlio::declare_param(this, "odom/fusion/ekf/sigma_pos_base", this->ekf_params_.sigma_pos_base, 0.1);
+  dlio::declare_param(this, "odom/fusion/ekf/sigma_rot_base", this->ekf_params_.sigma_rot_base, 0.02);
+  dlio::declare_param(this, "odom/fusion/ekf/fitness_weight", this->ekf_params_.fitness_weight, 10.0);
+  dlio::declare_param(this, "odom/fusion/ekf/space_weight", this->ekf_params_.space_weight, 0.5);
+  dlio::declare_param(this, "odom/fusion/ekf/degeneracy_weight", this->ekf_params_.degeneracy_weight, 5.0);
+  dlio::declare_param(this, "odom/fusion/ekf/gate_threshold", this->ekf_params_.gate_threshold, 22.46);
+  dlio::declare_param(this, "odom/fusion/ekf/max_fitness", this->ekf_params_.max_fitness, 5.0);
+  {
+    int max_rej = 5;
+    dlio::declare_param(this, "odom/fusion/ekf/max_consecutive_rejects", max_rej, 5);
+    this->ekf_params_.max_consecutive_rejects = max_rej;
+  }
+  this->ekf_params_.abias_max = this->geo_abias_max_;
+  this->ekf_params_.gbias_max = this->geo_gbias_max_;
+
+  // Motion model constraint
+  {
+    std::string mm_type_str;
+    dlio::declare_param(this, "motion_model/type", mm_type_str, std::string("none"));
+    this->motion_model_type_ = dlio::parseMotionModelType(mm_type_str);
+
+    auto &m = this->mm_params_;
+
+    // Ackermann
+    { double v; dlio::declare_param(this, "motion_model/ackermann/max_forward_vel", v, 30.0); m.ack_max_fwd_vel = v; }
+    { double v; dlio::declare_param(this, "motion_model/ackermann/max_reverse_vel", v, 5.0); m.ack_max_rev_vel = v; }
+    { double v; dlio::declare_param(this, "motion_model/ackermann/max_lateral_vel", v, 0.5); m.ack_max_lat_vel = v; }
+    { double v; dlio::declare_param(this, "motion_model/ackermann/max_vertical_vel", v, 1.0); m.ack_max_vert_vel = v; }
+    { double v; dlio::declare_param(this, "motion_model/ackermann/max_forward_accel", v, 8.0); m.ack_max_fwd_accel = v; }
+    { double v; dlio::declare_param(this, "motion_model/ackermann/max_lateral_accel", v, 3.0); m.ack_max_lat_accel = v; }
+    { double v; dlio::declare_param(this, "motion_model/ackermann/max_yaw_rate", v, 1.5); m.ack_max_yaw_rate = v; }
+    { double v; dlio::declare_param(this, "motion_model/ackermann/max_roll_rate", v, 0.3); m.ack_max_roll_rate = v; }
+    { double v; dlio::declare_param(this, "motion_model/ackermann/max_pitch_rate", v, 0.3); m.ack_max_pitch_rate = v; }
+
+    // Diff drive
+    { double v; dlio::declare_param(this, "motion_model/diff_drive/max_forward_vel", v, 5.0); m.dd_max_fwd_vel = v; }
+    { double v; dlio::declare_param(this, "motion_model/diff_drive/max_reverse_vel", v, 2.0); m.dd_max_rev_vel = v; }
+    { double v; dlio::declare_param(this, "motion_model/diff_drive/max_lateral_vel", v, 0.1); m.dd_max_lat_vel = v; }
+    { double v; dlio::declare_param(this, "motion_model/diff_drive/max_vertical_vel", v, 0.5); m.dd_max_vert_vel = v; }
+    { double v; dlio::declare_param(this, "motion_model/diff_drive/max_forward_accel", v, 5.0); m.dd_max_fwd_accel = v; }
+    { double v; dlio::declare_param(this, "motion_model/diff_drive/max_lateral_accel", v, 1.0); m.dd_max_lat_accel = v; }
+    { double v; dlio::declare_param(this, "motion_model/diff_drive/max_yaw_rate", v, 3.0); m.dd_max_yaw_rate = v; }
+    { double v; dlio::declare_param(this, "motion_model/diff_drive/max_roll_rate", v, 0.2); m.dd_max_roll_rate = v; }
+    { double v; dlio::declare_param(this, "motion_model/diff_drive/max_pitch_rate", v, 0.2); m.dd_max_pitch_rate = v; }
+
+    // Holonomic
+    { double v; dlio::declare_param(this, "motion_model/holonomic/max_horizontal_vel", v, 5.0); m.holo_max_horiz_vel = v; }
+    { double v; dlio::declare_param(this, "motion_model/holonomic/max_vertical_vel", v, 0.5); m.holo_max_vert_vel = v; }
+    { double v; dlio::declare_param(this, "motion_model/holonomic/max_horizontal_accel", v, 5.0); m.holo_max_horiz_accel = v; }
+    { double v; dlio::declare_param(this, "motion_model/holonomic/max_yaw_rate", v, 3.0); m.holo_max_yaw_rate = v; }
+    { double v; dlio::declare_param(this, "motion_model/holonomic/max_roll_rate", v, 0.2); m.holo_max_roll_rate = v; }
+    { double v; dlio::declare_param(this, "motion_model/holonomic/max_pitch_rate", v, 0.2); m.holo_max_pitch_rate = v; }
+
+    if (this->motion_model_type_ != dlio::MotionModelType::NONE)
+    {
+      RCLCPP_INFO(this->get_logger(), "[odom] Motion model: %s", mm_type_str.c_str());
+    }
+  }
+
   // Localization registration helper (continuous loc, submap loc, SC reloc)
   {
     std::string loc_reg_method;
@@ -799,6 +980,36 @@ void dlio::OdomNode::getParams()
     this->submap_loc_sc_dist_thresh_ = static_cast<float>(sc_thresh);
   }
   dlio::declare_param(this, "map/submap_localize/sc_accum_scans", this->submap_loc_sc_accum_scans_, 5);
+
+  // External odometry (wheel encoder / visual odom)
+  dlio::declare_param(this, "odom/external_odom/enabled", this->ext_odom_enabled_, false);
+  dlio::declare_param(this, "odom/external_odom/topic", this->ext_odom_topic_, std::string("/odom"));
+  {
+    std::vector<double> scale_default{1.0, 1.0, 1.0};
+    std::vector<double> scale_vec;
+    dlio::declare_param(this, "odom/external_odom/odom2meter", scale_vec, scale_default);
+    this->ext_odom_scale_ = Eigen::Vector3f(scale_vec[0], scale_vec[1], scale_vec[2]);
+
+    std::vector<double> t_default{0.0, 0.0, 0.0};
+    std::vector<double> rpy_default{0.0, 0.0, 0.0};
+    std::vector<double> odom_t, odom_rpy;
+    dlio::declare_param(this, "extrinsics/baselink2odom/t", odom_t, t_default);
+    dlio::declare_param(this, "extrinsics/baselink2odom/rpy", odom_rpy, rpy_default);
+    this->ext_baselink2odom_.t = Eigen::Vector3f(odom_t[0], odom_t[1], odom_t[2]);
+    if (odom_rpy != rpy_default)
+    {
+      float r = odom_rpy[0] * M_PI / 180.0f;
+      float p = odom_rpy[1] * M_PI / 180.0f;
+      float y = odom_rpy[2] * M_PI / 180.0f;
+      this->ext_baselink2odom_.R = (Eigen::AngleAxisf(y, Eigen::Vector3f::UnitZ()) *
+                                     Eigen::AngleAxisf(p, Eigen::Vector3f::UnitY()) *
+                                     Eigen::AngleAxisf(r, Eigen::Vector3f::UnitX()))
+                                        .toRotationMatrix();
+    }
+  }
+  if (this->ext_odom_enabled_)
+    RCLCPP_INFO(this->get_logger(), "[odom] External velocity enabled: topic=%s (TwistWithCovarianceStamped)",
+                this->ext_odom_topic_.c_str());
 
   // GPS
   dlio::declare_param(this, "gps/enabled", this->gps_enabled_, false);

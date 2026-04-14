@@ -1,0 +1,75 @@
+###########################################################
+#               Mapping & Localization                    #
+# Map mode, relocalization, continuous loc, GPS            #
+###########################################################
+
+/**:
+  ros__parameters:
+
+    # --- Map general ---
+    map/mode: "mapping"                     # "mapping" or "localization"
+    map/path: ""                            # empty = defaults to $HOME/.ros/dlio_map.pcd
+    map/use_corrected: true                 # load graph-optimized _corrected files in localization mode
+    map/voxel_size: 0.25
+    map/chunk_size: 20.0
+    map/auto_save_interval: 30.0
+    map/publish_interval: 5.0
+    map/waitUntilMove: true
+    map/dense/filtered: false
+    map/sparse/leafSize: 0.75
+    map/initial_pose/x: 0.0
+    map/initial_pose/y: 0.0
+    map/initial_pose/z: 0.0
+    map/initial_pose/yaw: 0.0
+
+    # --- Relocalization (Scan Context) ---
+    map/relocalize: false
+    map/relocalize/sc_max_range: 150.0
+    map/relocalize/sc_num_candidates: 50
+    map/relocalize/sc_distance_threshold: 2.0
+    map/relocalize/sc_max_attempts: 10
+    map/relocalize/sc_ground_height_threshold: 0.3
+    map/relocalize/sc_search_window: 7
+    map/appearance_method: "sc++"           # "sc++", "sc++_cuda", "std", "std_cuda"
+
+    # --- Continuous localization (Bayesian) ---
+    map/continuous_localize: true
+    map/continuous_localize/on_mapping: false
+    map/continuous_localize/interval: 2.0
+    map/continuous_localize/fitness_threshold: 0.10
+    map/continuous_localize/virtual_place_prior: 0.8
+    map/continuous_localize/loop_threshold: 0.5
+    map/continuous_localize/min_consecutive: 2
+    map/continuous_localize/max_correction: 2000.0
+    map/continuous_localize/enable_global_correction: true
+    map/continuous_localize/sc_distance_threshold: 1.0
+    map/continuous_localize/sc_top_k: 3
+    map/continuous_localize/g2o_verification: true
+    map/continuous_localize/g2o_chi2_threshold: 1.0
+    map/continuous_localize/g2o_iterations: 10
+
+    # --- Submap localization (GPS-denied) ---
+    map/submap_localize: true
+    map/submap_localize/interval: 1.0
+    map/submap_localize/group_size: 10
+    map/submap_localize/search_radius: 50.0
+    map/submap_localize/fitness_threshold: 0.17
+    map/submap_localize/prob_threshold: 0.6
+    map/submap_localize/motion_error_threshold: 1.0
+    map/submap_localize/motion_rot_threshold: 5.0
+    map/submap_localize/min_motion_validations: 3
+    map/submap_localize/prob_drop_threshold: 0.3
+    map/submap_localize/sc_distance_threshold: 0.6
+    map/submap_localize/sc_accum_scans: 10
+    map/submap_localize/max_correction: 555555555.0
+
+    # --- GPS ---
+    gps/enabled: true
+    gps/topic: "/carla/ego_vehicle/gnss"
+    gps/origin/latitude: 0.0
+    gps/origin/longitude: 0.0
+    gps/origin/altitude: 0.0
+    gps/search_radius: 69.0
+    gps/min_accuracy: 5.0
+    gps/publish_earth_tf: true
+    gps/trust_all: true

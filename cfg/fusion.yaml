@@ -1,0 +1,87 @@
+###########################################################
+#                 Fusion & Safety Gate                    #
+# Geometric Observer, KF, EKF, Gate, Motion Model         #
+###########################################################
+
+/**:
+  ros__parameters:
+
+    # --- Geometric Observer gains ---
+    odom/geo/Kp: 4.5
+    odom/geo/Kv: 11.25
+    odom/geo/Kq: 4.0
+    odom/geo/Kab: 2.25
+    odom/geo/Kgb: 1.0
+    odom/geo/abias_max: 1.0
+    odom/geo/gbias_max: 0.5
+
+    # --- Fusion strategy ---
+    # "geo" (geometric observer), "kf" (Kalman filter), "ekf" (error-state EKF)
+    odom/fusion/method: "kf"
+
+    # --- KF noise parameters ---
+    odom/fusion/kf/sigma_accel: 0.5
+    odom/fusion/kf/sigma_gyro: 0.01
+    odom/fusion/kf/sigma_accel_bias: 0.001
+    odom/fusion/kf/sigma_gyro_bias: 0.0001
+    odom/fusion/kf/sigma_pos_meas: 0.1
+    odom/fusion/kf/sigma_rot_meas: 0.02
+
+    # --- EKF noise parameters ---
+    odom/fusion/ekf/sigma_accel: 0.1
+    odom/fusion/ekf/sigma_gyro: 0.01
+    odom/fusion/ekf/sigma_accel_bias: 0.001
+    odom/fusion/ekf/sigma_gyro_bias: 0.0001
+    odom/fusion/ekf/sigma_pos_base: 0.1
+    odom/fusion/ekf/sigma_rot_base: 0.02
+    odom/fusion/ekf/fitness_weight: 10.0
+    odom/fusion/ekf/space_weight: 0.5
+    odom/fusion/ekf/degeneracy_weight: 5.0
+    odom/fusion/ekf/gate_threshold: 22.46   # chi2(6,0.999) Mahalanobis gate
+    odom/fusion/ekf/max_fitness: 5.0
+    odom/fusion/ekf/max_consecutive_rejects: 5
+
+    # --- Pose safety gate ---
+    # Pattern: Registration -> Gate -> State Update / Keyframe / Submap
+    # When rejected: use IMU pose, still update keyframe/submap (keeps map fresh)
+    odom/fusion/gate/enabled: false
+    odom/fusion/gate/fitness_threshold: 1.0         # max GICP fitness score
+    odom/fusion/gate/min_spaciousness: 7.0          # min structure complexity
+    odom/fusion/gate/max_translation: 5.0           # max position jump (m)
+    odom/fusion/gate/max_rotation_deg: 45.0         # max rotation jump (deg)
+    odom/fusion/gate/max_consecutive_rejects: 10
+
+    # --- Motion model ---
+    # "none", "ackermann", "diff_drive", "holonomic"
+    # Constrains IMU propagation and final pose to physically plausible motion
+    motion_model/type: "ackermann"
+
+    # Ackermann (car-like)
+    motion_model/ackermann/max_forward_vel: 50.0    # m/s
+    motion_model/ackermann/max_reverse_vel: 5.0
+    motion_model/ackermann/max_lateral_vel: 0.5
+    motion_model/ackermann/max_vertical_vel: 1.0
+    motion_model/ackermann/max_forward_accel: 10.0
+    motion_model/ackermann/max_lateral_accel: 3.0
+    motion_model/ackermann/max_yaw_rate: 1.5
+    motion_model/ackermann/max_roll_rate: 0.05
+    motion_model/ackermann/max_pitch_rate: 0.05
+
+    # Differential drive (2-wheel)
+    motion_model/diff_drive/max_forward_vel: 5.0
+    motion_model/diff_drive/max_reverse_vel: 2.0
+    motion_model/diff_drive/max_lateral_vel: 0.1
+    motion_model/diff_drive/max_vertical_vel: 0.5
+    motion_model/diff_drive/max_forward_accel: 5.0
+    motion_model/diff_drive/max_lateral_accel: 1.0
+    motion_model/diff_drive/max_yaw_rate: 3.0
+    motion_model/diff_drive/max_roll_rate: 0.2
+    motion_model/diff_drive/max_pitch_rate: 0.2
+
+    # Holonomic (omni-directional)
+    motion_model/holonomic/max_horizontal_vel: 5.0
+    motion_model/holonomic/max_vertical_vel: 0.5
+    motion_model/holonomic/max_horizontal_accel: 5.0
+    motion_model/holonomic/max_yaw_rate: 3.0
+    motion_model/holonomic/max_roll_rate: 0.2
+    motion_model/holonomic/max_pitch_rate: 0.2

@@ -53,6 +53,8 @@
 #include <gtsam/nonlinear/NonlinearFactorGraph.h>
 #include <gtsam/nonlinear/Values.h>
 #include <gtsam/nonlinear/ISAM2.h>
+#include <gtsam/nonlinear/LevenbergMarquardtOptimizer.h>
+#include <gtsam/nonlinear/LevenbergMarquardtParams.h>
 #include <gtsam/inference/Symbol.h>
 #include <gtsam/linear/linearExceptions.h>
 
@@ -87,6 +89,7 @@ private:
     dlio::AppearanceDescriptor appearance_desc;
     // GPS local coords
     float gps_x = 0.f, gps_y = 0.f, gps_z = 0.f;
+    float gps_horizontal_accuracy = 0.f;
     bool gps_valid = false;
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
   };
@@ -123,12 +126,14 @@ private:
   void addGPSFactor(int idx, const Keyframe &kf);
   void addLoopFactors();
   void updateISAM();
+  void batchOptimize();
   void correctPoses();
 
   // --- Loop closure (separate timer thread) ---
   void loopClosureThread();
   bool detectLoopClosureDistance(int &loop_cur, int &loop_pre);
   bool detectLoopClosureSC(int &loop_cur, int &loop_pre, int &sc_shift);
+  bool detectLoopClosureGPS(int &loop_cur, int &loop_pre);
   void performLoopClosure();
 
   // --- Publishing ---
@@ -284,10 +289,14 @@ private:
   double pose_cov_threshold_;
   bool use_gps_elevation_;
   float gps_min_accuracy_;
+  std::string gps_gating_mode_;
+  float gps_lc_search_radius_;
 
-  // iSAM2
+  // iSAM2 / Batch
   double isam_relinearize_threshold_;
   int isam_relinearize_skip_;
+  bool batch_optimization_;
+  int batch_optimization_interval_;
 
   // Map save / TF
   std::string map_mode_;

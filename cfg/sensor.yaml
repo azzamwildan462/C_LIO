@@ -1,0 +1,46 @@
+###########################################################
+#                   Sensor Configuration                  #
+# IMU, LiDAR, External Odom, Extrinsics, Calibration     #
+###########################################################
+
+/**:
+  ros__parameters:
+
+    # --- IMU ---
+    odom/gravity: 9.80665
+    odom/use_imu: true
+    odom/use_2d_imu: false
+    odom/imu/gravityRemoved: false        # true if IMU driver already removed gravity from accel
+    odom/computeTimeOffset: true
+
+    # IMU calibration
+    odom/imu/approximateGravity: true
+    odom/imu/calibration/gyro: true
+    odom/imu/calibration/accel: true
+    odom/imu/calibration/time: 6.0
+    odom/imu/bufferSize: 5000
+    imu/calibration: true
+    imu/intrinsics/accel/bias: [0.0, 0.0, 0.0]
+    imu/intrinsics/accel/sm: [1., 0., 0., 0., 1., 0., 0., 0., 1.]
+    imu/intrinsics/gyro/bias: [0.0, 0.0, 0.0]
+
+    # --- LiDAR ---
+    pointcloud/deskew: true
+    pointcloud/voxelize: true
+
+    # --- Extrinsics (all RPY in degrees) ---
+    extrinsics/baselink2imu/t: [0.990, -0.035, 1.230]
+    extrinsics/baselink2imu/rpy: [0.415, -0.414, 1.369]
+
+    extrinsics/baselink2lidar/t: [0.990, -0.035, 1.376]
+    extrinsics/baselink2lidar/rpy: [0.0, 0.0, -178.167]
+
+    extrinsics/baselink2odom/t: [0.0, 0.0, 0.0]
+    extrinsics/baselink2odom/rpy: [0.0, 0.0, 0.0]
+
+    # --- External velocity source (wheel encoder / INS twist) ---
+    # Subscribes to geometry_msgs/msg/TwistWithCovarianceStamped
+    # Replaces IMU accelerometer for velocity — gyro still from IMU
+    odom/external_odom/enabled: true
+    odom/external_odom/topic: "/applanix/lvx_client/twist"
+    odom/external_odom/odom2meter: [1.0, 1.0, 1.0]

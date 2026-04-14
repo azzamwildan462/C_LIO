@@ -17,6 +17,27 @@ void dlio::OdomNode::getScanFromROS(const sensor_msgs::msg::PointCloud2::SharedP
   pcl::PointCloud<PointType>::Ptr original_scan_ = std::make_shared<pcl::PointCloud<PointType>>();
   pcl::fromROSMsg(*pc, *original_scan_);
 
+  // Handle "time_stamp" field that PCL can't auto-map (e.g. Hesai Pandar XT32)
+  // Manually copy uint32 time_stamp → double timestamp per point
+  for (const auto &field : pc->fields)
+  {
+    if (field.name == "time_stamp" && field.datatype == sensor_msgs::msg::PointField::UINT32)
+    {
+      uint32_t point_step = pc->point_step;
+      uint32_t offset = field.offset;
+      const uint8_t *raw = pc->data.data();
+      size_t n_pts = std::min<size_t>(original_scan_->points.size(),
+                                      pc->width * pc->height);
+      for (size_t i = 0; i < n_pts; i++)
+      {
+        uint32_t ts_ns;
+        memcpy(&ts_ns, raw + i * point_step + offset, sizeof(uint32_t));
+        original_scan_->points[i].timestamp = static_cast<double>(ts_ns) * 1e-9;
+      }
+      break;
+    }
+  }
+
   // Remove NaNs
   std::vector<int> idx;
   original_scan_->is_dense = false;
@@ -55,6 +76,14 @@ void dlio::OdomNode::getScanFromROS(const sensor_msgs::msg::PointCloud2::SharedP
       {
         this->sensor = dlio::SensorType::ROBOSENSE; // relative offset in seconds from scan start
       }
+      break;
+    }
+    else if (field.name == "time_stamp")
+    {
+      // time_stamp field (e.g. Hesai Pandar XT32): uint32 nanoseconds from scan start
+      // After manual copy above, timestamp = relative offset in seconds
+      // Use ROBOSENSE path which adds sweep_ref_time to relative offset
+      this->sensor = dlio::SensorType::ROBOSENSE;
       break;
     }
   }
@@ -388,8 +417,8 @@ void dlio::OdomNode::deskewPointcloud()
 
     // Run GPU deskew kernel (in-place)
     dlio::cuda::deskewPointCloud(d_points.data(), d_points.data(), N,
-                                  d_transforms.data(), d_frame_indices.data(),
-                                  num_frames);
+                                 d_transforms.data(), d_frame_indices.data(),
+                                 num_frames);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     // Download results
@@ -687,25 +716,97 @@ void dlio::OdomNode::callbackPointCloud(const sensor_msgs::msg::PointCloud2::Sha
     return;
   }
 
-  // Get the next pose via IMU + S2M + GEO
+  // Save previous lidarPose for gate comparison (scan-to-scan jump detection)
+  this->prev_lidarPose_ = this->lidarPose;
+
+  // Registration: Get the next pose via IMU + Scan-to-Map
   if (this->deep_debug_)
     RCLCPP_INFO(this->get_logger(), "[DEEP] getNextPose start");
   {
     std::lock_guard<std::mutex> state_lock(this->state_mtx_);
-    this->getNextPose();
+    this->getNextPose(); // GICP align + propagateGICP only (no state update)
   }
   if (this->deep_debug_)
-    RCLCPP_INFO(this->get_logger(), "[DEEP] getNextPose done, pos=[%.2f,%.2f,%.2f]",
-                this->state.p[0], this->state.p[1], this->state.p[2]);
+    RCLCPP_INFO(this->get_logger(), "[DEEP] getNextPose done, lidarPose=[%.2f,%.2f,%.2f]",
+                this->lidarPose.p[0], this->lidarPose.p[1], this->lidarPose.p[2]);
 
-  // Update current keyframe poses and map
+  // Gate: evaluate scan matching quality before accepting
+  bool gate_ok = this->evaluatePoseGate();
+
+  if (gate_ok)
+  {
+    this->consecutive_gate_rejects_ = 0;
+    this->last_gate_passed_ = true;
+
+    // Save last known good forward speed from GICP-corrected state
+    Eigen::Vector3f v_body = this->state.q.toRotationMatrix().inverse() * this->state.v.lin.w;
+    this->last_good_forward_speed_ = v_body[0];
+  }
+  else
+  {
+    // Gate rejected: use IMU-propagated state instead of bad GICP result
+    this->consecutive_gate_rejects_++;
+    this->last_gate_passed_ = false;
+
+    this->lidarPose.p = this->state.p;
+    this->lidarPose.q = this->state.q;
+    this->geo.prev_vel = this->state.v.lin.w;
+    this->T.block(0, 0, 3, 3) = this->state.q.toRotationMatrix();
+    this->T.block(0, 3, 3, 1) = this->state.p;
+    this->T_corr = Eigen::Matrix4f::Identity();
+  }
+
+  // Always: update state, keyframes, submap (with GICP pose or IMU pose)
+  {
+    std::lock_guard<std::mutex> state_lock(this->state_mtx_);
+    this->updateState();
+  }
+
   if (this->deep_debug_)
-    RCLCPP_INFO(this->get_logger(), "[DEEP] updateKeyframes start");
+    RCLCPP_INFO(this->get_logger(), "[DEEP] gate=%s, updateState done",
+                gate_ok ? "PASS" : "REJECT(IMU)");
+
+  // Motion model pose filter: constraint scan-to-scan displacement
+  // Runs at scan rate (10Hz), after all corrections — doesn't fight GICP
+  if (this->motion_model_type_ != dlio::MotionModelType::NONE)
+  {
+    Eigen::Vector3f dp_world = this->state.p - this->prev_state_p_;
+    Eigen::Matrix3f R_inv = this->state.q.toRotationMatrix().inverse();
+    Eigen::Vector3f dp_body = R_inv * dp_world;
+
+    float scan_dt = std::max(0.01f, static_cast<float>(this->scan_stamp - this->prev_scan_stamp));
+    const auto &p = this->mm_params_;
+
+    switch (this->motion_model_type_)
+    {
+    case dlio::MotionModelType::ACKERMANN:
+      dp_body[0] = std::clamp(dp_body[0], -p.ack_max_rev_vel * scan_dt, p.ack_max_fwd_vel * scan_dt);
+      dp_body[1] = std::clamp(dp_body[1], -p.ack_max_lat_vel * scan_dt, p.ack_max_lat_vel * scan_dt);
+      dp_body[2] = std::clamp(dp_body[2], -p.ack_max_vert_vel * scan_dt, p.ack_max_vert_vel * scan_dt);
+      break;
+    case dlio::MotionModelType::DIFF_DRIVE:
+      dp_body[0] = std::clamp(dp_body[0], -p.dd_max_rev_vel * scan_dt, p.dd_max_fwd_vel * scan_dt);
+      dp_body[1] = std::clamp(dp_body[1], -p.dd_max_lat_vel * scan_dt, p.dd_max_lat_vel * scan_dt);
+      dp_body[2] = std::clamp(dp_body[2], -p.dd_max_vert_vel * scan_dt, p.dd_max_vert_vel * scan_dt);
+      break;
+    case dlio::MotionModelType::HOLONOMIC:
+      dp_body[0] = std::clamp(dp_body[0], -p.holo_max_horiz_vel * scan_dt, p.holo_max_horiz_vel * scan_dt);
+      dp_body[1] = std::clamp(dp_body[1], -p.holo_max_horiz_vel * scan_dt, p.holo_max_horiz_vel * scan_dt);
+      dp_body[2] = std::clamp(dp_body[2], -p.holo_max_vert_vel * scan_dt, p.holo_max_vert_vel * scan_dt);
+      break;
+    default:
+      break;
+    }
+
+    this->state.p = this->prev_state_p_ + this->state.q.toRotationMatrix() * dp_body;
+    this->lidarPose.p = this->state.p;
+    this->T.block(0, 3, 3, 1) = this->state.p;
+  }
+  this->prev_state_p_ = this->state.p;
+
   this->updateKeyframes();
-  if (this->deep_debug_)
-    RCLCPP_INFO(this->get_logger(), "[DEEP] updateKeyframes done");
 
-  // Build keyframe normals and submap if needed (and if we're not already waiting)
+  // Build keyframe normals and submap if needed
   if (this->new_submap_is_ready)
   {
     this->main_loop_running = false;
@@ -784,10 +885,37 @@ void dlio::OdomNode::callbackPointCloud(const sensor_msgs::msg::PointCloud2::Sha
   this->geo.first_opt_done = true;
 }
 
+void dlio::OdomNode::callbackExternalOdom(const geometry_msgs::msg::TwistWithCovarianceStamped::SharedPtr msg)
+{
+  Eigen::Vector3f vel_odom(
+      static_cast<float>(msg->twist.twist.linear.x),
+      static_cast<float>(msg->twist.twist.linear.y),
+      static_cast<float>(msg->twist.twist.linear.z));
+
+  vel_odom = vel_odom.cwiseProduct(this->ext_odom_scale_);
+
+  {
+    std::lock_guard<std::mutex> lock(this->ext_odom_mtx_);
+    this->ext_odom_vel_body_ = this->ext_baselink2odom_.R * vel_odom;
+  }
+
+  this->ext_odom_received_ = true;
+  this->ext_odom_stamp_ = rclcpp::Time(msg->header.stamp).seconds();
+}
+
 void dlio::OdomNode::callbackImu(const sensor_msgs::msg::Imu::SharedPtr imu_raw)
 {
 
   this->first_imu_received = true;
+
+  // If IMU driver already removed gravity from accel:
+  // Simply add gravity back as [0, 0, +g] in sensor frame (assuming Z-up IMU).
+  // propagateState() will subtract gravity in world frame, cancelling it out.
+  // This avoids circular dependency on state.q for gravity reconstruction.
+  if (this->imu_gravity_removed_)
+  {
+    imu_raw->linear_acceleration.z += this->gravity_;
+  }
 
   sensor_msgs::msg::Imu::SharedPtr imu = this->transformImu(imu_raw);
   this->imu_stamp = imu->header.stamp;

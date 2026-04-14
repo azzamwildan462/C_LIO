@@ -182,6 +182,7 @@ add_library(dlio_odom_component SHARED
   src/dlio/engines/appearance_engine.cc
   src/dlio/algorithms/robust_icp.cc
   src/dlio/algorithms/voxel_hash_map.cc
+  src/dlio/algorithms/error_state_ekf.cc
 )
 target_compile_options(dlio_odom_component PRIVATE ${OpenMP_FLAGS})
 target_compile_definitions(dlio_odom_component PRIVATE ${_DLIO_CUDA_DEF})
@@ -193,7 +194,7 @@ if(DLIO_HAS_CUDA)
     ${ndt_cuda_ros2_LIBRARIES}
   )
   ament_target_dependencies(dlio_odom_component
-    rclcpp rclcpp_components tf2_ros pcl_ros nav_msgs pcl_conversions sensor_msgs geometry_msgs ndt_omp_ros2 ndt_cuda_ros2
+    rclcpp rclcpp_components tf2_ros pcl_ros nav_msgs pcl_conversions sensor_msgs geometry_msgs visualization_msgs ndt_omp_ros2 ndt_cuda_ros2
   )
 else()
   target_link_libraries(dlio_odom_component
@@ -202,7 +203,7 @@ else()
     ${GeographicLib_LIBRARIES}
   )
   ament_target_dependencies(dlio_odom_component
-    rclcpp rclcpp_components tf2_ros pcl_ros nav_msgs pcl_conversions sensor_msgs geometry_msgs ndt_omp_ros2
+    rclcpp rclcpp_components tf2_ros pcl_ros nav_msgs pcl_conversions sensor_msgs geometry_msgs visualization_msgs ndt_omp_ros2
   )
 endif()
 rclcpp_components_register_nodes(dlio_odom_component "dlio::OdomNode")
@@ -269,8 +270,13 @@ install(TARGETS ${_install_lib_targets}
   RUNTIME DESTINATION bin
 )
 
+# ---- IMU Integrator (lightweight debug tool) ----
+add_executable(imu_integrator_node src/dlio/tools/imu_integrator_node.cc)
+target_include_directories(imu_integrator_node PRIVATE ${EIGEN3_INCLUDE_DIR})
+ament_target_dependencies(imu_integrator_node rclcpp sensor_msgs nav_msgs geometry_msgs)
+
 install(TARGETS
-  dlio_odom_node dlio_lio_sam_map_opt_node
+  dlio_odom_node dlio_lio_sam_map_opt_node imu_integrator_node
   DESTINATION lib/${PROJECT_NAME}
 )
 

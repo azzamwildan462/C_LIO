@@ -24,6 +24,7 @@ def generate_launch_description():
     pointcloud_topic = LaunchConfiguration('pointcloud_topic', default='points_raw')
     imu_topic = LaunchConfiguration('imu_topic', default='imu_raw')
     gps_topic = LaunchConfiguration('gps_topic', default='gps_raw')
+    ext_odom_topic = LaunchConfiguration('ext_odom_topic', default='/odom')
     map_mode = LaunchConfiguration('map_mode', default='mapping')
     map_path = LaunchConfiguration('map_path', default='')
     relocalize = LaunchConfiguration('relocalize', default='false')
@@ -65,6 +66,11 @@ def generate_launch_description():
         default_value=relocalize,
         description='Enable Scan Context relocalization for initial pose'
     )
+    declare_ext_odom_topic_arg = DeclareLaunchArgument(
+        'ext_odom_topic',
+        default_value=ext_odom_topic,
+        description='External odometry topic (wheel encoder / visual odom)'
+    )
     declare_use_corrected_arg = DeclareLaunchArgument(
         'use_corrected',
         default_value=use_corrected,
@@ -73,7 +79,11 @@ def generate_launch_description():
 
     # Load parameters
     dlio_yaml_path = PathJoinSubstitution([current_pkg, 'cfg', 'dlio.yaml'])
-    dlio_params_yaml_path = PathJoinSubstitution([current_pkg, 'cfg', 'params.yaml'])
+    sensor_yaml_path = PathJoinSubstitution([current_pkg, 'cfg', 'sensor.yaml'])
+    odom_yaml_path = PathJoinSubstitution([current_pkg, 'cfg', 'odom.yaml'])
+    fusion_yaml_path = PathJoinSubstitution([current_pkg, 'cfg', 'fusion.yaml'])
+    map_yaml_path = PathJoinSubstitution([current_pkg, 'cfg', 'map.yaml'])
+    occupancy_yaml_path = PathJoinSubstitution([current_pkg, 'cfg', 'occupancy_grid.yaml'])
     lio_sam_opt_yaml_path = PathJoinSubstitution([current_pkg, 'cfg', 'lio_sam_map_optimization.yaml'])
 
     # Map params override (passed to both OdomNode and MapNode)
@@ -92,7 +102,7 @@ def generate_launch_description():
                 package='direct_lidar_inertial_odometry',
                 plugin='dlio::OdomNode',
                 name='dlio_odom',
-                parameters=[dlio_yaml_path, dlio_params_yaml_path, map_params, odom_extra_params, {'gps/topic': gps_topic}],
+                parameters=[dlio_yaml_path, sensor_yaml_path, odom_yaml_path, fusion_yaml_path, map_yaml_path, occupancy_yaml_path, map_params, odom_extra_params, {'gps/topic': gps_topic, 'odom/external_odom/topic': ext_odom_topic}],
                 remappings=[
                     ('pointcloud', pointcloud_topic),
                     ('imu', imu_topic),
@@ -135,7 +145,7 @@ def generate_launch_description():
                 package='direct_lidar_inertial_odometry',
                 plugin='dlio::LioSamMapOptimizationNode',
                 name='dlio_lio_sam_map_opt',
-                parameters=[dlio_yaml_path, dlio_params_yaml_path, lio_sam_opt_yaml_path, map_params, {'gps/topic': gps_topic}],
+                parameters=[dlio_yaml_path, sensor_yaml_path, map_yaml_path, lio_sam_opt_yaml_path, map_params, {'gps/topic': gps_topic}],
                 remappings=[
                     ('keyframe_stamped', 'dlio/odom_node/keyframe_stamped'),
                     ('corrected_path', 'dlio/lio_sam_opt/corrected_path'),
@@ -145,6 +155,18 @@ def generate_launch_description():
                     ('save_corrected_pcd', 'dlio/lio_sam_opt/save_corrected_pcd'),
                 ],
             ),
+        ],
+        output='screen',
+    )
+
+    # IMU Integrator (debug: pure IMU trajectory)
+    imu_integrator_node = Node(
+        package='direct_lidar_inertial_odometry',
+        executable='imu_integrator_node',
+        name='imu_integrator',
+        parameters=[dlio_yaml_path, sensor_yaml_path],
+        remappings=[
+            ('imu', imu_topic),
         ],
         output='screen',
     )
@@ -165,11 +187,13 @@ def generate_launch_description():
         declare_pointcloud_topic_arg,
         declare_imu_topic_arg,
         declare_gps_topic_arg,
+        declare_ext_odom_topic_arg,
         declare_map_mode_arg,
         declare_map_path_arg,
         declare_relocalize_arg,
         declare_use_corrected_arg,
         dlio_container,
         lio_sam_opt_container,
+        # imu_integrator_node,
         rviz_node
     ])

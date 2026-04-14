@@ -587,43 +587,10 @@ void dlio::OdomNode::computeAndStoreKeyframeSC()
     entry.gps_valid = false;
   }
 
-  // Debug: log first 3 entries
-  {
-    std::lock_guard<std::mutex> lock(this->kfdb_mutex_);
-    int idx = this->kfdb_entries_.size();
-    if (idx < 3)
-    {
-      int nz = 0;
-      float mx = 0.f;
-      const auto &ed = entry.descriptor.sc_descriptor;
-      for (int r = 0; r < ed.rows(); r++)
-        for (int s = 0; s < ed.cols(); s++)
-        {
-          if (ed(r, s) != 0.f)
-            nz++;
-          if (ed(r, s) > mx)
-            mx = ed(r, s);
-        }
-      RCLCPP_INFO(this->get_logger(),
-                  "KFDB save[%d]: orig=%zu filtered=%zu nonzero=%d max_z=%.2f q=[%.4f,%.4f,%.4f,%.4f] pos=[%.2f,%.2f,%.2f]",
-                  idx, this->original_scan ? this->original_scan->size() : 0,
-                  raw_scan->size(), nz, mx,
-                  this->state.q.w(), this->state.q.x(), this->state.q.y(), this->state.q.z(),
-                  entry.position[0], entry.position[1], entry.position[2]);
-    }
-  }
-
-  // 5. Store and periodically save to disk
+  // 5. Store entry (disk save deferred to shutdown / mode switch)
   {
     std::lock_guard<std::mutex> lock(this->kfdb_mutex_);
     this->kfdb_entries_.push_back(std::move(entry));
-  }
-
-  // Auto-save KFDB every 20 keyframes (cheap — a few KB per entry)
-  if (this->kfdb_entries_.size() % 20 == 0)
-  {
-    this->saveKeyframeDatabase();
-    this->saveCorrectedKeyframeDatabase();
   }
 }
 
