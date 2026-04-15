@@ -857,11 +857,53 @@ void dlio::LioSamMapOptimizationNode::updateISAM()
     catch (const gtsam::IndeterminantLinearSystemException &e)
     {
         RCLCPP_WARN(this->get_logger(),
-                    "[lio_sam_opt] Indeterminant linear system detected, skipping update: %s",
-                    e.what());
+                    "[lio_sam_opt] Indeterminant linear system — rebuilding iSAM2 from last good state");
         this->gtsam_graph_.resize(0);
         this->initial_estimate_.clear();
         this->a_loop_is_closed_ = false;
+
+        // Rebuild iSAM2 from keyframe odometry factors only (drop problematic factors)
+        try
+        {
+            gtsam::NonlinearFactorGraph clean_graph;
+            gtsam::Values clean_values;
+            int num_kf = static_cast<int>(this->keyframes_.size());
+
+            for (int i = 0; i < num_kf; ++i)
+            {
+                gtsam::Pose3 pose_i = this->isometryToGtsamPose(this->keyframes_[i].pose);
+                clean_values.insert(X(i), pose_i);
+
+                if (i == 0)
+                {
+                    auto prior_noise = gtsam::noiseModel::Diagonal::Variances(
+                        (gtsam::Vector(6) << 1e-2, 1e-2, M_PI * M_PI, 1e8, 1e8, 1e8).finished());
+                    clean_graph.add(gtsam::PriorFactor<gtsam::Pose3>(X(0), pose_i, prior_noise));
+                }
+                else
+                {
+                    gtsam::Pose3 pose_prev = this->isometryToGtsamPose(this->keyframes_[i - 1].pose);
+                    gtsam::Pose3 relative = pose_prev.between(pose_i);
+                    auto odom_noise = gtsam::noiseModel::Diagonal::Variances(
+                        (gtsam::Vector(6) << this->odom_noise_rot_, this->odom_noise_rot_, this->odom_noise_rot_,
+                         this->odom_noise_trans_, this->odom_noise_trans_, this->odom_noise_trans_).finished());
+                    clean_graph.add(gtsam::BetweenFactor<gtsam::Pose3>(X(i - 1), X(i), relative, odom_noise));
+                }
+            }
+
+            gtsam::ISAM2Params isam_params;
+            isam_params.relinearizeThreshold = this->isam_relinearize_threshold_;
+            isam_params.relinearizeSkip = this->isam_relinearize_skip_;
+            delete this->isam_;
+            this->isam_ = new gtsam::ISAM2(isam_params);
+            this->isam_->update(clean_graph, clean_values);
+            this->isam_current_estimate_ = this->isam_->calculateEstimate();
+            RCLCPP_INFO(this->get_logger(), "[lio_sam_opt] iSAM2 rebuilt with %d clean keyframes", num_kf);
+        }
+        catch (const std::exception &rebuild_e)
+        {
+            RCLCPP_ERROR(this->get_logger(), "[lio_sam_opt] iSAM2 rebuild failed: %s", rebuild_e.what());
+        }
     }
     catch (const std::exception &e)
     {
