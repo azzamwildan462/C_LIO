@@ -5,7 +5,6 @@
 
 /**:
   ros__parameters:
-
     # --- Geometric Observer gains ---
     odom/geo/Kp: 4.5
     odom/geo/Kv: 11.25
@@ -37,7 +36,7 @@
     odom/fusion/ekf/fitness_weight: 10.0
     odom/fusion/ekf/space_weight: 0.5
     odom/fusion/ekf/degeneracy_weight: 5.0
-    odom/fusion/ekf/gate_threshold: 22.46   # chi2(6,0.999) Mahalanobis gate
+    odom/fusion/ekf/gate_threshold: 22.46 # chi2(6,0.999) Mahalanobis gate
     odom/fusion/ekf/max_fitness: 5.0
     odom/fusion/ekf/max_consecutive_rejects: 5
 
@@ -45,19 +44,19 @@
     # Pattern: Registration -> Gate -> State Update / Keyframe / Submap
     # When rejected: use IMU pose, still update keyframe/submap (keeps map fresh)
     odom/fusion/gate/enabled: false
-    odom/fusion/gate/fitness_threshold: 1.0         # max GICP fitness score
-    odom/fusion/gate/min_spaciousness: 7.0          # min structure complexity
-    odom/fusion/gate/max_translation: 5.0           # max position jump (m)
-    odom/fusion/gate/max_rotation_deg: 45.0         # max rotation jump (deg)
+    odom/fusion/gate/fitness_threshold: 1.0 # max GICP fitness score
+    odom/fusion/gate/min_spaciousness: 7.0 # min structure complexity
+    odom/fusion/gate/max_translation: 5.0 # max position jump (m)
+    odom/fusion/gate/max_rotation_deg: 45.0 # max rotation jump (deg)
     odom/fusion/gate/max_consecutive_rejects: 10
 
     # --- Motion model ---
     # "none", "ackermann", "diff_drive", "holonomic"
     # Constrains IMU propagation and final pose to physically plausible motion
-    motion_model/type: "ackermann"
+    motion_model/type: "none"
 
     # Ackermann (car-like)
-    motion_model/ackermann/max_forward_vel: 50.0    # m/s
+    motion_model/ackermann/max_forward_vel: 50.0 # m/s
     motion_model/ackermann/max_reverse_vel: 5.0
     motion_model/ackermann/max_lateral_vel: 0.5
     motion_model/ackermann/max_vertical_vel: 1.0

@@ -23,6 +23,7 @@ using gtsam::symbol_shorthand::X; // Pose3 variables
 dlio::LioSamMapOptimizationNode::LioSamMapOptimizationNode(const rclcpp::NodeOptions &options)
     : Node("dlio_lio_sam_map_opt_node", options)
 {
+    pcl::console::setVerbosityLevel(pcl::console::L_ERROR);
     this->getParams();
 
     // --- GTSAM iSAM2 ---
@@ -58,7 +59,7 @@ dlio::LioSamMapOptimizationNode::LioSamMapOptimizationNode(const rclcpp::NodeOpt
         auto gps_sub_opt = rclcpp::SubscriptionOptions();
         gps_sub_opt.callback_group = this->gps_cb_group_;
         this->gps_sub_ = this->create_subscription<sensor_msgs::msg::NavSatFix>(
-            this->gps_topic_, 100,
+            this->gps_topic_, rclcpp::SensorDataQoS(),
             std::bind(&dlio::LioSamMapOptimizationNode::callbackGPS, this, std::placeholders::_1),
             gps_sub_opt);
         RCLCPP_INFO(this->get_logger(), "[lio_sam_opt] GPS enabled on topic: %s", this->gps_topic_.c_str());
@@ -69,6 +70,18 @@ dlio::LioSamMapOptimizationNode::LioSamMapOptimizationNode(const rclcpp::NodeOpt
     this->corrected_map_pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("corrected_map", 1);
     this->corrected_kf_pose_pub_ = this->create_publisher<geometry_msgs::msg::PoseArray>("corrected_kf_poses", 10);
     this->loop_closure_pub_ = this->create_publisher<visualization_msgs::msg::MarkerArray>("loop_closures", 1);
+    this->corrected_fusion_path_pub_ = this->create_publisher<nav_msgs::msg::Path>("corrected_fusion_path", 1);
+    this->corrected_fusion_odom_pub_ = this->create_publisher<nav_msgs::msg::Odometry>("corrected_fusion_odom", 1);
+    this->corrected_fusion_path_.header.frame_id = this->map_frame_;
+
+    // --- Odom subscriber (for corrected fusion pose at odom rate) ---
+    this->odom_cb_group_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+    auto odom_sub_opt = rclcpp::SubscriptionOptions();
+    odom_sub_opt.callback_group = this->odom_cb_group_;
+    this->odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
+        "odom", rclcpp::SensorDataQoS(),
+        std::bind(&dlio::LioSamMapOptimizationNode::callbackOdom, this, std::placeholders::_1),
+        odom_sub_opt);
 
     // --- TF broadcaster ---
     if (this->tf_map_odom_source_ == "lio_sam_opt")
@@ -129,6 +142,7 @@ dlio::LioSamMapOptimizationNode::~LioSamMapOptimizationNode()
 void dlio::LioSamMapOptimizationNode::getParams()
 {
     dlio::declare_param(this, "debug/lio_sam_map_opt", this->debug_, false);
+    dlio::declare_param(this, "debug/print_lio_sam_opt", this->debug_print_, false);
     dlio::declare_param(this, "frames/odom", this->odom_frame_, std::string("odom"));
     dlio::declare_param(this, "frames/map", this->map_frame_, std::string("map"));
 
@@ -186,10 +200,42 @@ void dlio::LioSamMapOptimizationNode::getParams()
     double gps_ma = 5.0;
     dlio::declare_param(this, "gps/min_accuracy", gps_ma, 5.0);
     this->gps_min_accuracy_ = static_cast<float>(gps_ma);
+    double gps_mnf = 0.1;
+    dlio::declare_param(this, "gps/min_noise_floor", gps_mnf, 0.1);
+    this->gps_min_noise_floor_ = static_cast<float>(gps_mnf);
+    std::vector<double> gps_t_default = {0.0, 0.0, 0.0};
+    std::vector<double> gps_t_vec;
+    dlio::declare_param(this, "extrinsics/baselink2gps/t", gps_t_vec, gps_t_default);
+    this->gps_extrinsic_t_ = Eigen::Vector3f(gps_t_vec[0], gps_t_vec[1], gps_t_vec[2]);
+    std::vector<double> gps_rpy_default = {0.0, 0.0, 0.0};
+    std::vector<double> gps_rpy_vec;
+    dlio::declare_param(this, "extrinsics/baselink2gps/rpy", gps_rpy_vec, gps_rpy_default);
+    {
+        float r = static_cast<float>(gps_rpy_vec[0]) * M_PI / 180.f;
+        float p = static_cast<float>(gps_rpy_vec[1]) * M_PI / 180.f;
+        float yy = static_cast<float>(gps_rpy_vec[2]) * M_PI / 180.f;
+        this->gps_extrinsic_R_ = Eigen::AngleAxisf(yy, Eigen::Vector3f::UnitZ())
+                                * Eigen::AngleAxisf(p, Eigen::Vector3f::UnitY())
+                                * Eigen::AngleAxisf(r, Eigen::Vector3f::UnitX());
+    }
+    // GPS extrinsic info moved to debugPrint()
     dlio::declare_param(this, "gps/gating_mode", this->gps_gating_mode_, std::string("covariance"));
     double gps_lc_r = 20.0;
     dlio::declare_param(this, "gps/lc_search_radius", gps_lc_r, 20.0);
     this->gps_lc_search_radius_ = static_cast<float>(gps_lc_r);
+    double fused_dr = 0.5;
+    dlio::declare_param(this, "gps/fused_drift_rate", fused_dr, 0.5);
+    this->fused_drift_rate_ = static_cast<float>(fused_dr);
+    double gps_bm = 10.0;
+    dlio::declare_param(this, "gps/buffer_margin", gps_bm, 10.0);
+    this->gps_buffer_margin_ = static_cast<float>(gps_bm);
+
+    // Fusion KF
+    double fon = 0.01, fcn = 1.0;
+    dlio::declare_param(this, "fusion/odom_noise", fon, 0.01);
+    dlio::declare_param(this, "fusion/correction_noise", fcn, 1.0);
+    this->fusion_odom_noise_ = static_cast<float>(fon);
+    this->fusion_gps_noise_ = static_cast<float>(fcn);
 
     // iSAM2
     dlio::declare_param(this, "isam/relinearize_threshold", this->isam_relinearize_threshold_, 0.1);
@@ -277,6 +323,18 @@ Eigen::Isometry3d dlio::LioSamMapOptimizationNode::gtsamPoseToIsometry(const gts
 void dlio::LioSamMapOptimizationNode::callbackKeyframe(
     const direct_lidar_inertial_odometry::msg::KeyframeStamped::SharedPtr msg)
 {
+    // Update KF timing prediction for adaptive GPS buffer
+    {
+        double kf_stamp = rclcpp::Time(msg->header.stamp).seconds();
+        if (this->last_kf_stamp_ > 0.0)
+        {
+            double dt = kf_stamp - this->last_kf_stamp_;
+            if (dt > 0.0 && dt < 10.0) // sanity check
+                this->avg_kf_dt_ = 0.9 * this->avg_kf_dt_ + 0.1 * dt;
+        }
+        this->last_kf_stamp_ = kf_stamp;
+    }
+
     Keyframe kf;
     kf.id = msg->id;
     kf.timestamp = msg->header.stamp;
@@ -375,6 +433,77 @@ void dlio::LioSamMapOptimizationNode::callbackKeyframe(
         }
     }
 
+    // Auto-calibrate ENU→odom yaw from movement direction
+    if (!this->enu_yaw_calibrated_ && kf.gps_valid)
+    {
+        if (this->enu_calib_kf_idx_ < 0)
+        {
+            // Store first GPS point + odom position
+            this->first_gps_enu_ = Eigen::Vector3f(kf.gps_x, kf.gps_y, kf.gps_z);
+            this->first_odom_pos_ = kf.pose.translation().cast<float>();
+            this->enu_calib_kf_idx_ = static_cast<int>(this->keyframes_.size());
+        }
+        else
+        {
+            Eigen::Vector3f gps_now(kf.gps_x, kf.gps_y, kf.gps_z);
+            Eigen::Vector3f odom_now = kf.pose.translation().cast<float>();
+            Eigen::Vector3f gps_delta = gps_now - this->first_gps_enu_;
+            Eigen::Vector3f odom_delta = odom_now - this->first_odom_pos_;
+            float gps_dist = gps_delta.head<2>().norm();
+            float odom_dist = odom_delta.head<2>().norm();
+
+            if (gps_dist > 5.0f && odom_dist > 5.0f)
+            {
+                // Compute yaw offset: angle from ENU direction to odom direction
+                float gps_yaw = std::atan2(gps_delta[1], gps_delta[0]);
+                float odom_yaw = std::atan2(odom_delta[1], odom_delta[0]);
+                float yaw_offset = odom_yaw - gps_yaw;
+
+                this->R_enu_to_odom_ = Eigen::AngleAxisf(yaw_offset, Eigen::Vector3f::UnitZ()).toRotationMatrix();
+                this->enu_yaw_calibrated_ = true;
+
+                // Re-convert stored GPS coordinates with new rotation
+                // (first_gps_enu_ was converted before calibration, but gpsToLocal now uses R_enu_to_odom_)
+                RCLCPP_INFO(this->get_logger(),
+                            "[lio_sam_opt] ENU->odom yaw calibrated: %.1f deg (gps_dist=%.1fm, odom_dist=%.1fm)",
+                            yaw_offset * 180.0f / M_PI, gps_dist, odom_dist);
+            }
+        }
+    }
+
+    // Fused pose computation (GPS direct XY+Z, odom orientation, dead-reckon when GPS lost)
+    {
+        int idx = static_cast<int>(this->keyframes_.size()); // pre-lock peek for idx
+        if (kf.gps_valid)
+        {
+            kf.fused_pose = kf.pose; // copy orientation from odom
+            kf.fused_pose.translation().x() = static_cast<double>(kf.gps_x);
+            kf.fused_pose.translation().y() = static_cast<double>(kf.gps_y);
+            if (this->use_gps_elevation_)
+                kf.fused_pose.translation().z() = static_cast<double>(kf.gps_z);
+
+            kf.fused_covariance = kf.gps_horizontal_accuracy * kf.gps_horizontal_accuracy;
+            kf.fused_valid = true;
+
+            this->last_gps_kf_idx_ = idx;
+            this->last_gps_fused_pose_ = kf.fused_pose;
+            this->last_gps_odom_pose_ = kf.pose;
+            this->last_gps_accuracy_ = kf.gps_horizontal_accuracy;
+        }
+        else if (this->last_gps_kf_idx_ >= 0)
+        {
+            // GPS lost: differential from last GPS anchor (XY + Z all smooth)
+            Eigen::Isometry3d odom_delta = this->last_gps_odom_pose_.inverse() * kf.pose;
+            kf.fused_pose = this->last_gps_fused_pose_ * odom_delta;
+
+            double dt = rclcpp::Time(msg->header.stamp).seconds() -
+                        rclcpp::Time(this->keyframes_[this->last_gps_kf_idx_].timestamp).seconds();
+            kf.fused_covariance = this->last_gps_accuracy_ * this->last_gps_accuracy_
+                                + this->fused_drift_rate_ * static_cast<float>(std::abs(dt));
+            kf.fused_valid = true;
+        }
+    }
+
     // Brief lock: add keyframe + factors, then release immediately
     {
         std::lock_guard<std::mutex> lock(this->keyframes_mtx_);
@@ -430,6 +559,8 @@ void dlio::LioSamMapOptimizationNode::callbackKeyframe(
                     kf.pose.translation().x(), kf.pose.translation().y(), kf.pose.translation().z(),
                     kf.cloud_world->points.size());
     }
+
+    this->debugPrint();
 }
 
 void dlio::LioSamMapOptimizationNode::callbackDeskewed(const sensor_msgs::msg::PointCloud2::SharedPtr msg)
@@ -463,13 +594,97 @@ void dlio::LioSamMapOptimizationNode::callbackGPS(const sensor_msgs::msg::NavSat
                     msg->latitude, msg->longitude, msg->altitude);
     }
 
-    double ts = this->now().seconds();
+    double ts = rclcpp::Time(msg->header.stamp).seconds();
     {
         std::lock_guard<std::mutex> lock(this->gps_buffer_mtx_);
         if (this->gps_buffer_.size() >= GPS_BUFFER_MAX)
             this->gps_buffer_.pop_front();
         this->gps_buffer_.push_back({msg->latitude, msg->longitude, msg->altitude, ts, h_acc});
     }
+}
+
+void dlio::LioSamMapOptimizationNode::callbackOdom(const nav_msgs::msg::Odometry::SharedPtr msg)
+{
+    // Extract current odom pose
+    Eigen::Quaterniond q(msg->pose.pose.orientation.w, msg->pose.pose.orientation.x,
+                         msg->pose.pose.orientation.y, msg->pose.pose.orientation.z);
+    Eigen::Vector3d t(msg->pose.pose.position.x, msg->pose.pose.position.y, msg->pose.pose.position.z);
+    Eigen::Isometry3d odom_pose = Eigen::Isometry3d::Identity();
+    odom_pose.linear() = q.toRotationMatrix();
+    odom_pose.translation() = t;
+
+    // ===== KF PREDICT: apply differential odom =====
+    if (this->prev_odom_valid_)
+    {
+        // Differential: delta = prev⁻¹ × current
+        Eigen::Isometry3d delta = this->prev_odom_pose_.inverse() * odom_pose;
+        Eigen::Vector3d dt_vec = delta.translation();
+        double dist = dt_vec.norm();
+
+        // Predict: apply delta to fusion state
+        this->fusion_pos_ += this->fusion_q_.toRotationMatrix() * dt_vec;
+        Eigen::Quaterniond dq(delta.rotation());
+        this->fusion_q_ = (this->fusion_q_ * dq).normalized();
+
+        // Process noise: covariance grows with distance traveled
+        this->fusion_P_ += Eigen::Vector3d::Constant(this->fusion_odom_noise_ * dist);
+    }
+    else
+    {
+        // Initialize fusion state from first odom
+        this->fusion_pos_ = t;
+        this->fusion_q_ = q;
+    }
+    this->prev_odom_pose_ = odom_pose;
+    this->prev_odom_valid_ = true;
+
+    // ===== KF UPDATE: correct from PGO when available =====
+    // try_lock: never block odom callback — skip if keyframe processing holds the lock
+    if (this->correction_mtx_.try_lock())
+    {
+        if (this->corrected_pose_updated_)
+        {
+            // Kalman gain per axis: K = P / (P + R)
+            Eigen::Vector3d R = Eigen::Vector3d::Constant(this->fusion_gps_noise_);
+            Eigen::Vector3d K = this->fusion_P_.cwiseQuotient(this->fusion_P_ + R);
+
+            // Position update: x = x + K * (measurement - x)
+            Eigen::Vector3d innovation = this->corrected_pos_ - this->fusion_pos_;
+            this->fusion_pos_ += K.cwiseProduct(innovation);
+
+            // Covariance update: P = (1-K) * P
+            this->fusion_P_ = (Eigen::Vector3d::Ones() - K).cwiseProduct(this->fusion_P_);
+
+            // Orientation: slerp toward corrected
+            double q_alpha = K.mean();
+            this->fusion_q_ = this->fusion_q_.slerp(q_alpha, this->corrected_q_).normalized();
+
+            this->corrected_pose_updated_ = false;
+        }
+        this->correction_mtx_.unlock();
+    }
+
+    // ===== PUBLISH =====
+    nav_msgs::msg::Odometry fused_odom;
+    fused_odom.header = msg->header;
+    fused_odom.header.frame_id = this->map_frame_;
+    fused_odom.child_frame_id = "base_link";
+    fused_odom.pose.pose.position.x = this->fusion_pos_.x();
+    fused_odom.pose.pose.position.y = this->fusion_pos_.y();
+    fused_odom.pose.pose.position.z = this->fusion_pos_.z();
+    fused_odom.pose.pose.orientation.w = this->fusion_q_.w();
+    fused_odom.pose.pose.orientation.x = this->fusion_q_.x();
+    fused_odom.pose.pose.orientation.y = this->fusion_q_.y();
+    fused_odom.pose.pose.orientation.z = this->fusion_q_.z();
+    this->corrected_fusion_odom_pub_->publish(fused_odom);
+
+    // Append to path
+    geometry_msgs::msg::PoseStamped ps;
+    ps.header = fused_odom.header;
+    ps.pose = fused_odom.pose.pose;
+    this->corrected_fusion_path_.header.stamp = msg->header.stamp;
+    this->corrected_fusion_path_.poses.push_back(ps);
+    this->corrected_fusion_path_pub_->publish(this->corrected_fusion_path_);
 }
 
 // ============================================================
@@ -493,8 +708,11 @@ bool dlio::LioSamMapOptimizationNode::getGPSAtTime(double timestamp, GPSMeasurem
             best_idx = i;
         }
     }
-    if (best_idx < 0 || best_dt > 1.0)
+
+    double margin = static_cast<double>(this->gps_buffer_margin_);
+    if (best_idx < 0 || best_dt > margin)
         return false;
+
     out = this->gps_buffer_[best_idx];
     return true;
 }
@@ -506,9 +724,12 @@ bool dlio::LioSamMapOptimizationNode::gpsToLocal(double lat, double lon, double 
         return false;
     double dx, dy, dz;
     this->gps_converter_->Forward(lat, lon, alt, dx, dy, dz);
-    x = static_cast<float>(dx);
-    y = static_cast<float>(dy);
-    z = static_cast<float>(dz);
+    // Rotate ENU → odom frame (yaw alignment, auto-calibrated or from config)
+    Eigen::Vector3f gps_enu(static_cast<float>(dx), static_cast<float>(dy), static_cast<float>(dz));
+    Eigen::Vector3f rotated = this->R_enu_to_odom_ * gps_enu;
+    x = rotated[0];
+    y = rotated[1];
+    z = rotated[2];
     return true;
 }
 
@@ -563,10 +784,12 @@ void dlio::LioSamMapOptimizationNode::addGPSFactor(int idx, const Keyframe &kf)
     // Noise: use actual GPS horizontal accuracy (sigma) with 1.0m floor
     // horizontal_accuracy is sigma (std dev) from sqrt(position_covariance[0])
     // GTSAM Diagonal::Variances expects variance = sigma^2
-    float h_sigma = std::max(kf.gps_horizontal_accuracy, 1.0f);
+    float h_sigma = std::max(kf.gps_horizontal_accuracy, this->gps_min_noise_floor_);
     float noise_x = h_sigma * h_sigma;
     float noise_y = h_sigma * h_sigma;
-    float noise_z = this->use_gps_elevation_ ? (h_sigma * h_sigma) : 0.01f;
+    // When use_gps_elevation=false, set Z noise very large so GPS doesn't constrain Z
+    // (let LiDAR/IMU handle Z — they're much better at vertical constraint)
+    float noise_z = this->use_gps_elevation_ ? (h_sigma * h_sigma) : 1000.0f;
 
     gtsam::Vector3 gps_noise_vec;
     gps_noise_vec << noise_x, noise_y, noise_z;
@@ -574,6 +797,7 @@ void dlio::LioSamMapOptimizationNode::addGPSFactor(int idx, const Keyframe &kf)
 
     gtsam::GPSFactor gps_factor(X(idx), gtsam::Point3(gps_x, gps_y, gps_z), gps_noise);
     this->gtsam_graph_.add(gps_factor);
+    this->gps_factor_count_++;
 
     this->a_loop_is_closed_ = true;
 
@@ -730,8 +954,7 @@ void dlio::LioSamMapOptimizationNode::correctPoses()
         }
 
         this->a_loop_is_closed_ = false;
-
-        RCLCPP_INFO(this->get_logger(), "[lio_sam_opt] Poses corrected (%d keyframes)", num_poses);
+        this->poses_corrected_count_++;
     }
 
     // Cache T_map_odom for the 20 Hz TF timer (avoids race on keyframes_/optimized_poses_)
@@ -741,6 +964,12 @@ void dlio::LioSamMapOptimizationNode::correctPoses()
         Eigen::Isometry3d optimized_pose = this->gtsamPoseToIsometry(this->optimized_poses_[latest_idx]);
         Eigen::Isometry3d raw_odom_pose = this->keyframes_[latest_idx].pose;
         Eigen::Isometry3d T_map_odom = optimized_pose * raw_odom_pose.inverse();
+        {
+            std::lock_guard<std::mutex> lock(this->correction_mtx_);
+            this->corrected_pos_ = optimized_pose.translation();
+            this->corrected_q_ = Eigen::Quaterniond(optimized_pose.rotation());
+            this->corrected_pose_updated_ = true;
+        }
         {
             std::lock_guard<std::mutex> lock(this->tf_map_odom_mtx_);
             this->T_map_odom_cached_ = T_map_odom;
@@ -857,20 +1086,22 @@ bool dlio::LioSamMapOptimizationNode::detectLoopClosureGPS(int &loop_cur, int &l
     loop_pre = -1;
     const auto &cur_kf = this->keyframes_[loop_cur];
 
-    if (!cur_kf.gps_valid)
+    // Use fused pose (works even when GPS is lost — dead-reckoned)
+    if (!cur_kf.fused_valid)
         return false;
 
     // Check duplicate
     if (this->loop_index_container_.count(loop_cur))
         return false;
 
-    float search_r = this->gps_lc_search_radius_ + cur_kf.gps_horizontal_accuracy;
+    // Search radius adapts to fused covariance (larger when GPS lost longer)
+    float search_r = this->gps_lc_search_radius_ + std::sqrt(cur_kf.fused_covariance);
     float best_dist = std::numeric_limits<float>::max();
 
     for (int i = 0; i < loop_cur - this->min_keyframe_gap_; ++i)
     {
         const auto &cand_kf = this->keyframes_[i];
-        if (!cand_kf.gps_valid)
+        if (!cand_kf.fused_valid)
             continue;
 
         // Temporal constraint
@@ -880,17 +1111,17 @@ bool dlio::LioSamMapOptimizationNode::detectLoopClosureGPS(int &loop_cur, int &l
         if (dt < this->history_keyframe_search_time_diff_)
             continue;
 
-        // GPS distance (2D — elevation GPS is less reliable)
-        float dx = cur_kf.gps_x - cand_kf.gps_x;
-        float dy = cur_kf.gps_y - cand_kf.gps_y;
-        float gps_dist = std::sqrt(dx * dx + dy * dy);
+        // Fused pose distance (2D)
+        float dx = static_cast<float>(cur_kf.fused_pose.translation().x() - cand_kf.fused_pose.translation().x());
+        float dy = static_cast<float>(cur_kf.fused_pose.translation().y() - cand_kf.fused_pose.translation().y());
+        float fused_dist = std::sqrt(dx * dx + dy * dy);
 
         // Effective radius = base + uncertainty of both keyframes
-        float effective_r = search_r + cand_kf.gps_horizontal_accuracy;
+        float effective_r = search_r + std::sqrt(cand_kf.fused_covariance);
 
-        if (gps_dist < effective_r && gps_dist < best_dist)
+        if (fused_dist < effective_r && fused_dist < best_dist)
         {
-            best_dist = gps_dist;
+            best_dist = fused_dist;
             loop_pre = i;
         }
     }
@@ -898,8 +1129,8 @@ bool dlio::LioSamMapOptimizationNode::detectLoopClosureGPS(int &loop_cur, int &l
     if (loop_pre >= 0 && this->debug_)
     {
         RCLCPP_INFO(this->get_logger(),
-                    "[lio_sam_opt] GPS loop candidate: %d <-> %d (gps_dist=%.2fm)",
-                    loop_cur, loop_pre, best_dist);
+                    "[lio_sam_opt] GPS-fused loop candidate: %d <-> %d (fused_dist=%.2fm, search_r=%.1fm)",
+                    loop_cur, loop_pre, best_dist, search_r + std::sqrt(this->keyframes_[loop_pre].fused_covariance));
     }
 
     return (loop_pre >= 0);
@@ -921,23 +1152,40 @@ void dlio::LioSamMapOptimizationNode::performLoopClosure()
         if (this->keyframes_.empty())
             return;
 
-        found_distance = this->detectLoopClosureDistance(loop_cur, loop_pre);
-        if (!found_distance)
-            found_sc = this->detectLoopClosureSC(loop_cur, loop_pre, sc_shift);
-        if (!found_distance && !found_sc)
+        // Detection order: GPS-fused first (primary), then distance, then SC++
+        if (this->gps_enabled_)
             found_gps = this->detectLoopClosureGPS(loop_cur, loop_pre);
+        if (!found_gps)
+            found_distance = this->detectLoopClosureDistance(loop_cur, loop_pre);
+        if (!found_gps && !found_distance)
+            found_sc = this->detectLoopClosureSC(loop_cur, loop_pre, sc_shift);
 
-        if (!found_distance && !found_sc && !found_gps)
+        if (!found_gps && !found_distance && !found_sc)
             return;
 
-        // Snapshot poses
+        // Snapshot poses + build clouds
         int num_opt = static_cast<int>(this->optimized_poses_.size());
-        cur_pose_snap = (loop_cur < num_opt)
-                            ? this->gtsamPoseToIsometry(this->optimized_poses_[loop_cur])
-                            : this->keyframes_[loop_cur].pose;
-        pre_pose_snap = (loop_pre < num_opt)
-                            ? this->gtsamPoseToIsometry(this->optimized_poses_[loop_pre])
-                            : this->keyframes_[loop_pre].pose;
+
+        if (found_gps)
+        {
+            // GPS-fused LC: use fused poses for cloud building (not drifted odom)
+            cur_pose_snap = this->keyframes_[loop_cur].fused_valid
+                                ? this->keyframes_[loop_cur].fused_pose
+                                : this->keyframes_[loop_cur].pose;
+            pre_pose_snap = this->keyframes_[loop_pre].fused_valid
+                                ? this->keyframes_[loop_pre].fused_pose
+                                : this->keyframes_[loop_pre].pose;
+        }
+        else
+        {
+            // Distance/SC++ LC: use optimized or odom poses (existing behavior)
+            cur_pose_snap = (loop_cur < num_opt)
+                                ? this->gtsamPoseToIsometry(this->optimized_poses_[loop_cur])
+                                : this->keyframes_[loop_cur].pose;
+            pre_pose_snap = (loop_pre < num_opt)
+                                ? this->gtsamPoseToIsometry(this->optimized_poses_[loop_pre])
+                                : this->keyframes_[loop_pre].pose;
+        }
 
         // Build current keyframe cloud
         pcl::transformPointCloud(*this->keyframes_[loop_cur].cloud_local,
@@ -950,9 +1198,13 @@ void dlio::LioSamMapOptimizationNode::performLoopClosure()
             int key_near = loop_pre + i;
             if (key_near < 0 || key_near >= cloud_size)
                 continue;
-            Eigen::Isometry3d pose = (key_near < num_opt)
-                                         ? this->gtsamPoseToIsometry(this->optimized_poses_[key_near])
-                                         : this->keyframes_[key_near].pose;
+            Eigen::Isometry3d pose;
+            if (found_gps && this->keyframes_[key_near].fused_valid)
+                pose = this->keyframes_[key_near].fused_pose;
+            else if (key_near < num_opt)
+                pose = this->gtsamPoseToIsometry(this->optimized_poses_[key_near]);
+            else
+                pose = this->keyframes_[key_near].pose;
             pcl::PointCloud<PointType> tmp;
             pcl::transformPointCloud(*this->keyframes_[key_near].cloud_local, tmp, pose.matrix().cast<float>());
             *prev_keyframe_cloud += tmp;
@@ -963,7 +1215,8 @@ void dlio::LioSamMapOptimizationNode::performLoopClosure()
     if (this->debug_)
     {
         RCLCPP_INFO(this->get_logger(), "[lio_sam_opt] Loop candidate: kf%d <-> kf%d (%s)",
-                    loop_cur, loop_pre, found_distance ? "distance" : "SC++");
+                    loop_cur, loop_pre,
+                    found_gps ? "GPS-fused" : (found_distance ? "distance" : "SC++"));
     }
 
     if (cur_keyframe_cloud->size() < 300 || prev_keyframe_cloud->size() < 1000)
@@ -1025,6 +1278,7 @@ void dlio::LioSamMapOptimizationNode::performLoopClosure()
 
     if (!converged || fitness_score > this->history_keyframe_fitness_score_)
     {
+        this->lc_rejected_count_++;
         if (this->debug_)
         {
             RCLCPP_INFO(this->get_logger(), "[lio_sam_opt] Loop REJECTED: %d<->%d fitness=%.4f (thresh=%.2f)",
@@ -1069,6 +1323,7 @@ void dlio::LioSamMapOptimizationNode::performLoopClosure()
         std::lock_guard<std::mutex> lk(this->loop_queue_mtx_);
         this->loop_queue_.push_back({loop_cur, loop_pre, pose_between, constraint_noise});
     }
+    this->lc_found_count_++;
 
     {
         std::lock_guard<std::mutex> lk2(this->keyframes_mtx_);
@@ -1335,6 +1590,98 @@ void dlio::LioSamMapOptimizationNode::autoSave()
     if (save_dir.empty())
         save_dir = ".";
     this->saveGraphMaps(save_dir, static_cast<float>(this->map_voxel_size_));
+}
+
+void dlio::LioSamMapOptimizationNode::debugPrint()
+{
+    if (!this->debug_print_)
+        return;
+    if (this->debug_print_counter_++ < 2)
+        return;
+    this->debug_print_counter_ = 0;
+
+    std::lock_guard<std::mutex> lock(this->keyframes_mtx_);
+    if (this->keyframes_.empty())
+        return;
+
+    int num_kf = static_cast<int>(this->keyframes_.size());
+    int num_opt = static_cast<int>(this->optimized_poses_.size());
+    const auto &kf = this->keyframes_.back();
+    auto pos = kf.pose.translation();
+
+    printf("\033[2J\033[1;1H");
+    printf("+-------------------------------------------------------------------+\n");
+    printf("|             DLIO LIO-SAM Map Optimization Debug                   |\n");
+    printf("+-------------------------------------------------------------------+\n");
+    printf("| GRAPH                                                             |\n");
+    printf("|   Keyframes:   %-6d    Optimized: %-6d                        |\n", num_kf, num_opt);
+    printf("|   GPS factors: %-6d    LC found:  %-6d  rejected: %-6d      |\n",
+           this->gps_factor_count_, this->lc_found_count_, this->lc_rejected_count_);
+    printf("|   LC edges:    %-6d    Poses corrected: %-6d                  |\n",
+           static_cast<int>(this->loop_index_container_.size()), this->poses_corrected_count_);
+    printf("+-------------------------------------------------------------------+\n");
+    printf("| LATEST KEYFRAME (#%u, idx=%d)                                     |\n", kf.id, num_kf - 1);
+    printf("|   Odom Pos:  [%10.3f, %10.3f, %10.3f]                   |\n",
+           pos.x(), pos.y(), pos.z());
+    if (kf.fused_valid)
+    {
+        auto fp = kf.fused_pose.translation();
+        printf("|   Fused Pos: [%10.3f, %10.3f, %10.3f]  cov=%.1f m^2    |\n",
+               fp.x(), fp.y(), fp.z(), kf.fused_covariance);
+    }
+    if (kf.gps_valid)
+    {
+        printf("|   GPS:       [%10.3f, %10.3f, %10.3f]  acc=%.2fm       |\n",
+               static_cast<double>(kf.gps_x), static_cast<double>(kf.gps_y),
+               static_cast<double>(kf.gps_z), kf.gps_horizontal_accuracy);
+    }
+    else
+    {
+        printf("|   GPS:       INVALID                                              |\n");
+    }
+    printf("+-------------------------------------------------------------------+\n");
+    printf("| GPS STATE                                                         |\n");
+    printf("|   Last GPS KF: %-6d  GPS origin: %-3s                           |\n",
+           this->last_gps_kf_idx_, this->gps_origin_set_ ? "SET" : "NO");
+    {
+        std::lock_guard<std::mutex> gps_lock(this->gps_buffer_mtx_);
+        int buf_sz = static_cast<int>(this->gps_buffer_.size());
+        printf("|   GPS buf: %-6d  margin=%.1fs                                  |\n",
+               buf_sz, this->gps_buffer_margin_);
+        if (!this->gps_buffer_.empty())
+        {
+            const auto &oldest = this->gps_buffer_.front();
+            const auto &newest = this->gps_buffer_.back();
+            double kf_s = rclcpp::Time(kf.timestamp).seconds();
+            printf("|   Buf range: [%.1f .. %.1f]  span=%.1fs                  |\n",
+                   oldest.timestamp, newest.timestamp, newest.timestamp - oldest.timestamp);
+            printf("|   KF stamp:  %.3f  nearest_dt=%.3fs                      |\n",
+                   kf_s, std::abs(newest.timestamp - kf_s));
+        }
+    }
+    printf("+-------------------------------------------------------------------+\n");
+    printf("| POSE COVARIANCE (diagonal)                                        |\n");
+    printf("|   Rot:   [%10.4f, %10.4f, %10.4f]                      |\n",
+           this->pose_covariance_(0, 0), this->pose_covariance_(1, 1), this->pose_covariance_(2, 2));
+    printf("|   Trans: [%10.4f, %10.4f, %10.4f]                      |\n",
+           this->pose_covariance_(3, 3), this->pose_covariance_(4, 4), this->pose_covariance_(5, 5));
+    if (kf.fused_valid)
+    {
+        auto drift = pos - kf.fused_pose.translation();
+        printf("+-------------------------------------------------------------------+\n");
+        printf("| ODOM-FUSED DRIFT                                                  |\n");
+        printf("|   Delta: [%10.3f, %10.3f, %10.3f]  norm=%.3fm          |\n",
+               drift.x(), drift.y(), drift.z(), drift.norm());
+    }
+    if (this->batch_optimization_)
+    {
+        int next_batch = ((num_kf / this->batch_optimization_interval_) + 1) * this->batch_optimization_interval_;
+        printf("+-------------------------------------------------------------------+\n");
+        printf("| BATCH: every %d KF  (next at KF #%d)                              |\n",
+               this->batch_optimization_interval_, next_batch);
+    }
+    printf("+-------------------------------------------------------------------+\n");
+    fflush(stdout);
 }
 
 void dlio::LioSamMapOptimizationNode::saveOnShutdown()

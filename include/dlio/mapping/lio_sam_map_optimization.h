@@ -18,6 +18,7 @@
 
 // ROS
 #include "rclcpp/rclcpp.hpp"
+#include <nav_msgs/msg/odometry.hpp>
 #include <nav_msgs/msg/path.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/pose_array.hpp>
@@ -29,6 +30,7 @@
 
 // PCL
 #include <pcl/common/centroid.h>
+#include <pcl/console/print.h>
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/io/pcd_io.h>
 #include <pcl/kdtree/kdtree_flann.h>
@@ -76,6 +78,7 @@ public:
   ~LioSamMapOptimizationNode();
 
   void saveOnShutdown();
+  void debugPrint();
 
 private:
   // --- Keyframe storage ---
@@ -91,6 +94,10 @@ private:
     float gps_x = 0.f, gps_y = 0.f, gps_z = 0.f;
     float gps_horizontal_accuracy = 0.f;
     bool gps_valid = false;
+    // Fused pose (GPS + odom dead-reckoning, Eagleye-style)
+    Eigen::Isometry3d fused_pose = Eigen::Isometry3d::Identity();
+    float fused_covariance = 1000.0f;
+    bool fused_valid = false;
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
   };
 
@@ -110,6 +117,7 @@ private:
   void callbackKeyframe(const direct_lidar_inertial_odometry::msg::KeyframeStamped::SharedPtr msg);
   void callbackDeskewed(const sensor_msgs::msg::PointCloud2::SharedPtr msg);
   void callbackGPS(const sensor_msgs::msg::NavSatFix::SharedPtr msg);
+  void callbackOdom(const nav_msgs::msg::Odometry::SharedPtr msg);
 
   // --- GPS helpers ---
   struct GPSMeasurement
@@ -180,11 +188,16 @@ private:
   rclcpp::Subscription<sensor_msgs::msg::NavSatFix>::SharedPtr gps_sub_;
   rclcpp::CallbackGroup::SharedPtr gps_cb_group_;
 
+  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
+  rclcpp::CallbackGroup::SharedPtr odom_cb_group_;
+
   // Publishers
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr corrected_path_pub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr corrected_map_pub_;
   rclcpp::Publisher<geometry_msgs::msg::PoseArray>::SharedPtr corrected_kf_pose_pub_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr loop_closure_pub_;
+  rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr corrected_fusion_path_pub_;
+  rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr corrected_fusion_odom_pub_;
 
   // Service
   rclcpp::Service<direct_lidar_inertial_odometry::srv::SavePCD>::SharedPtr save_pcd_srv_;
@@ -214,6 +227,21 @@ private:
   // Optimized poses (updated after iSAM2)
   std::vector<gtsam::Pose3> optimized_poses_;
 
+  // Corrected fusion pose (KF fusion: odom differential + PGO correction)
+  Eigen::Vector3d fusion_pos_ = Eigen::Vector3d::Zero();
+  Eigen::Quaterniond fusion_q_ = Eigen::Quaterniond::Identity();
+  Eigen::Vector3d fusion_P_ = Eigen::Vector3d(1e4, 1e4, 1e4); // position covariance diagonal
+  Eigen::Isometry3d prev_odom_pose_;
+  bool prev_odom_valid_ = false;
+  // Latest corrected pose from PGO (measurement for KF update)
+  Eigen::Vector3d corrected_pos_ = Eigen::Vector3d::Zero();
+  Eigen::Quaterniond corrected_q_ = Eigen::Quaterniond::Identity();
+  bool corrected_pose_updated_ = false;
+  std::mutex correction_mtx_;
+  nav_msgs::msg::Path corrected_fusion_path_;
+  float fusion_odom_noise_; // process noise per meter of odom movement
+  float fusion_gps_noise_;  // measurement noise from corrected pose
+
   // Loop closure queues
   std::vector<LoopConstraint> loop_queue_;
   std::mutex loop_queue_mtx_;
@@ -236,12 +264,21 @@ private:
   // GPS buffer
   std::deque<GPSMeasurement> gps_buffer_;
   std::mutex gps_buffer_mtx_;
-  static constexpr size_t GPS_BUFFER_MAX = 200;
+  static constexpr size_t GPS_BUFFER_MAX = 50000;
   std::unique_ptr<GeographicLib::LocalCartesian> gps_converter_;
   bool gps_origin_set_ = false;
+  double last_kf_stamp_ = 0.0;
+  double avg_kf_dt_ = 0.1;
+  float gps_buffer_margin_;
 
   // ==================== Parameters ====================
   bool debug_;
+  bool debug_print_;
+  int debug_print_counter_ = 0;
+  int gps_factor_count_ = 0;
+  int lc_found_count_ = 0;
+  int lc_rejected_count_ = 0;
+  int poses_corrected_count_ = 0;
   std::string odom_frame_;
   std::string map_frame_;
 
@@ -289,8 +326,25 @@ private:
   double pose_cov_threshold_;
   bool use_gps_elevation_;
   float gps_min_accuracy_;
+  float gps_min_noise_floor_;
+  Eigen::Vector3f gps_extrinsic_t_; // baselink2gps translation
+  Eigen::Matrix3f gps_extrinsic_R_; // baselink2gps rotation
+  // (reserved for future GPS Z offset tracking)
+  // ENU→odom yaw alignment (auto-estimated)
+  bool enu_yaw_calibrated_ = false;
+  Eigen::Matrix3f R_enu_to_odom_ = Eigen::Matrix3f::Identity();
+  Eigen::Vector3f first_gps_enu_ = Eigen::Vector3f::Zero();
+  Eigen::Vector3f first_odom_pos_ = Eigen::Vector3f::Zero();
+  int enu_calib_kf_idx_ = -1;
   std::string gps_gating_mode_;
   float gps_lc_search_radius_;
+  float fused_drift_rate_;
+
+  // Fused pose state (Eagleye-style GPS+odom dead-reckoning)
+  int last_gps_kf_idx_ = -1;
+  Eigen::Isometry3d last_gps_fused_pose_ = Eigen::Isometry3d::Identity();
+  Eigen::Isometry3d last_gps_odom_pose_ = Eigen::Isometry3d::Identity();
+  float last_gps_accuracy_ = 5.0f;
 
   // iSAM2 / Batch
   double isam_relinearize_threshold_;

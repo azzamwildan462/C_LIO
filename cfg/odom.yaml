@@ -5,14 +5,13 @@
 
 /**:
   ros__parameters:
-
     # --- Preprocessing ---
     odom/preprocessing/cropBoxFilter/size: 1.0
     odom/preprocessing/voxelFilter/res: 1.0
-    odom/preprocessing/gpu: false           # GPU deskewing + voxel grid filter (requires CUDA)
+    odom/preprocessing/gpu: true # GPU deskewing + voxel grid filter (requires CUDA)
 
     # Prefilter (noise removal) — applied after deskewing
-    odom/prefilter/method: "none"           # "none", "sor", "sor_cuda", "ror", "dror"
+    odom/prefilter/method: "none" # "none", "sor", "sor_cuda", "ror", "dror"
     odom/prefilter/mean_k: 10
     odom/prefilter/stddev_mul: 1.0
     odom/prefilter/radius: 0.5
@@ -23,13 +22,13 @@
     odom/prefilter/dror_min_neighbors: 3
 
     # --- Registration ---
-    odom/registration_method: "gicp_cuda"   # "gicp", "gicp_cuda", "ndt", "ndt_cuda", "robust_icp", "robust_icp_cuda"
+    odom/registration_method: "gicp_cuda" # "gicp", "gicp_cuda", "ndt", "ndt_cuda", "robust_icp", "robust_icp_cuda"
     odom/localization/registration_method: "gicp"
 
     # GICP
-    odom/gicp/minNumPoints: 64
+    odom/gicp/minNumPoints: 100
     odom/gicp/kCorrespondences: 16
-    odom/gicp/maxCorrespondenceDistance: 4.0
+    odom/gicp/maxCorrespondenceDistance: 5.0
     odom/gicp/maxIterations: 64
     odom/gicp/transformationEpsilon: 0.001
     odom/gicp/rotationEpsilon: 0.001
@@ -38,18 +37,18 @@
     # NDT
     odom/ndt/resolution: 1.0
     odom/ndt/num_threads: 8
-    odom/ndt/search_method: "DIRECT7"       # KDTREE, DIRECT1, DIRECT7, DIRECT26
+    odom/ndt/search_method: "DIRECT7" # KDTREE, DIRECT1, DIRECT7, DIRECT26
     odom/ndt/step_size: 0.12
 
     # Robust ICP
-    odom/robust_icp/kernel_scale: 0.0       # GM kernel sigma (0 = auto)
+    odom/robust_icp/kernel_scale: 0.0 # GM kernel sigma (0 = auto)
 
     # --- Keyframes ---
-    odom/keyframe/threshD: 5.0              # meters
-    odom/keyframe/threshR: 10.0             # degrees
+    odom/keyframe/threshD: 5.0 # meters
+    odom/keyframe/threshR: 10.0 # degrees
 
     # --- Submap ---
-    odom/submap/method: "keyframe"          # "keyframe" or "voxel_hash_map"
+    odom/submap/method: "keyframe" # "keyframe" or "voxel_hash_map"
     odom/submap/keyframe/knn: 30
     odom/submap/keyframe/kcv: 30
     odom/submap/keyframe/kcc: 30
