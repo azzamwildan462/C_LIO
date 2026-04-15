@@ -351,54 +351,66 @@ void dlio::OdomNode::propagateState()
     return;
   }
 
-  Eigen::Quaternionf qhat = this->state.q, omega;
-
-  // --- Position propagation ---
-  if (this->ext_odom_enabled_ && this->ext_odom_received_.load())
+  // --- GTSAM preintegration: accumulate IMU measurement ---
+  if (this->imu_preintegration_)
   {
-    // External odom: use velocity directly (no accel integration, no gravity)
-    Eigen::Vector3f vel_body, vel_world;
+    // For external odom: override accel with ext odom velocity-derived accel
+    // For IMU: use raw accel (GTSAM handles gravity internally)
+    gtsam::Vector3 accel, gyro;
+
+    if (this->ext_odom_enabled_ && this->ext_odom_received_.load())
     {
-      std::lock_guard<std::mutex> odom_lock(this->ext_odom_mtx_);
-      vel_body = this->ext_odom_vel_body_;
+      // External odom provides velocity directly — compute pseudo-accel
+      // v = ext_odom_vel, so a = (v_new - v_old) / dt ≈ 0 for constant speed
+      // But we still need gyro from IMU for rotation
+      Eigen::Vector3f vel_body;
+      {
+        std::lock_guard<std::mutex> odom_lock(this->ext_odom_mtx_);
+        vel_body = this->ext_odom_vel_body_;
+      }
+      // Set velocity directly instead of integrating accel
+      Eigen::Vector3f vel_world = this->state.q * vel_body;
+      this->state.v.lin.w = vel_world;
+      this->state.v.lin.b = vel_body;
+
+      // Still feed IMU accel to preintegration for orientation
+      accel = this->imu_meas.lin_accel.cast<double>();
+      gyro = this->imu_meas.ang_vel.cast<double>();
     }
-    vel_world = qhat * vel_body;
-    this->state.p += vel_world * dt;
-    this->state.v.lin.w = vel_world;
-    this->state.v.lin.b = vel_body;
+    else
+    {
+      accel = this->imu_meas.lin_accel.cast<double>();
+      gyro = this->imu_meas.ang_vel.cast<double>();
+    }
+
+    this->imu_preintegration_->integrateMeasurement(accel, gyro, dt);
+
+    // Predict state from preintegration
+    if (this->gtsam_imu_initialized_)
+    {
+      gtsam::NavState predicted = this->imu_preintegration_->predict(
+          this->gtsam_nav_state_, this->gtsam_bias_);
+
+      // Copy orientation from GTSAM (always)
+      gtsam::Quaternion gq = predicted.quaternion();
+      this->state.q = Eigen::Quaternionf(gq.w(), gq.x(), gq.y(), gq.z());
+      this->state.q.normalize();
+
+      if (this->ext_odom_enabled_ && this->ext_odom_received_.load())
+      {
+        // Position from ext odom velocity integration
+        Eigen::Vector3f vel_world = this->state.q * this->state.v.lin.b;
+        this->state.p += vel_world * static_cast<float>(dt);
+      }
+      else
+      {
+        // Position + velocity from GTSAM prediction
+        this->state.p = predicted.position().cast<float>();
+        this->state.v.lin.w = predicted.velocity().cast<float>();
+        this->state.v.lin.b = this->state.q.toRotationMatrix().inverse() * this->state.v.lin.w;
+      }
+    }
   }
-  else
-  {
-    // IMU accel integration (original)
-    Eigen::Vector3f world_accel = qhat._transformVector(this->imu_meas.lin_accel);
-
-    this->state.p[0] += this->state.v.lin.w[0] * dt + 0.5 * dt * dt * world_accel[0];
-    this->state.p[1] += this->state.v.lin.w[1] * dt + 0.5 * dt * dt * world_accel[1];
-    this->state.p[2] += this->state.v.lin.w[2] * dt + 0.5 * dt * dt * (world_accel[2] - this->gravity_);
-
-    this->state.v.lin.w[0] += world_accel[0] * dt;
-    this->state.v.lin.w[1] += world_accel[1] * dt;
-    this->state.v.lin.w[2] += (world_accel[2] - this->gravity_) * dt;
-    this->state.v.lin.b = this->state.q.toRotationMatrix().inverse() * this->state.v.lin.w;
-
-    // Debug: track pure IMU velocity
-    this->imu_only_vel_w_[0] += world_accel[0] * dt;
-    this->imu_only_vel_w_[1] += world_accel[1] * dt;
-    this->imu_only_vel_w_[2] += (world_accel[2] - this->gravity_) * dt;
-    this->imu_only_vel_b_ = this->state.q.toRotationMatrix().inverse() * this->imu_only_vel_w_;
-  }
-
-  // --- Gyro propagation (ALWAYS from IMU) ---
-  omega.w() = 0;
-  omega.vec() = this->imu_meas.ang_vel;
-  Eigen::Quaternionf tmp = qhat * omega;
-  this->state.q.w() += 0.5 * dt * tmp.w();
-  this->state.q.x() += 0.5 * dt * tmp.x();
-  this->state.q.y() += 0.5 * dt * tmp.y();
-  this->state.q.z() += 0.5 * dt * tmp.z();
-
-  // Ensure quaternion is properly normalized
-  this->state.q.normalize();
 
   this->state.v.ang.b = this->imu_meas.ang_vel;
   this->state.v.ang.w = this->state.q.toRotationMatrix() * this->state.v.ang.b;

@@ -762,6 +762,18 @@ void dlio::OdomNode::callbackPointCloud(const sensor_msgs::msg::PointCloud2::Sha
     this->updateState();
   }
 
+  // Reset GTSAM preintegration with corrected state (after LiDAR correction)
+  if (this->gtsam_imu_initialized_ && this->imu_preintegration_)
+  {
+    std::lock_guard<std::mutex> state_lock(this->state_mtx_);
+    this->gtsam_nav_state_ = gtsam::NavState(
+        gtsam::Pose3(gtsam::Rot3(this->state.q.cast<double>()), this->state.p.cast<double>()),
+        this->state.v.lin.w.cast<double>());
+    // Bias = zero because imu_meas is already bias-corrected in callbackImu()
+    this->gtsam_bias_ = gtsam::imuBias::ConstantBias();
+    this->imu_preintegration_->resetIntegrationAndSetBias(this->gtsam_bias_);
+  }
+
   if (this->deep_debug_)
     RCLCPP_INFO(this->get_logger(), "[DEEP] gate=%s, updateState done",
                 gate_ok ? "PASS" : "REJECT(IMU)");
@@ -1042,6 +1054,19 @@ void dlio::OdomNode::callbackImu(const sensor_msgs::msg::Imu::SharedPtr imu_raw)
 
       this->prev_imu_stamp = imu_stamp_secs;
       this->imu_calibrated = true;
+
+      // Initialize GTSAM nav state after calibration
+      {
+        gtsam::Rot3 R0(this->state.q.cast<double>());
+        gtsam::Point3 p0(this->state.p.cast<double>());
+        gtsam::Velocity3 v0 = gtsam::Velocity3::Zero();
+        this->gtsam_nav_state_ = gtsam::NavState(gtsam::Pose3(R0, p0), v0);
+        // Bias = zero because imu_meas is already bias-corrected in callbackImu()
+        this->gtsam_bias_ = gtsam::imuBias::ConstantBias();
+        this->imu_preintegration_->resetIntegrationAndSetBias(this->gtsam_bias_);
+        this->gtsam_imu_initialized_ = true;
+        RCLCPP_INFO(this->get_logger(), "[odom] GTSAM nav state initialized after IMU calibration");
+      }
     }
   }
   else

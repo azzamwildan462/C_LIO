@@ -29,6 +29,13 @@ namespace dlio {
   MotionModelType parseMotionModelType(const std::string& s);
 }
 
+// GTSAM
+#include <gtsam/navigation/PreintegratedRotation.h>
+#include <gtsam/navigation/ImuFactor.h>
+#include <gtsam/navigation/ImuBias.h>
+#include <gtsam/navigation/NavState.h>
+#include <gtsam/geometry/Pose3.h>
+
 // g2o
 #include "g2o/core/sparse_optimizer.h"
 #include "g2o/core/optimization_algorithm_levenberg.h"
@@ -624,6 +631,13 @@ private:
   // Error-State EKF
   dlio::ErrorStateEkf ekf_;
   dlio::EkfParams ekf_params_;
+
+  // GTSAM IMU preintegration
+  boost::shared_ptr<gtsam::PreintegrationParams> gtsam_imu_params_;
+  boost::shared_ptr<gtsam::PreintegratedImuMeasurements> imu_preintegration_;
+  gtsam::imuBias::ConstantBias gtsam_bias_;
+  gtsam::NavState gtsam_nav_state_;
+  bool gtsam_imu_initialized_ = false;
 
   // Motion model constraint
   dlio::MotionModelType motion_model_type_ = dlio::MotionModelType::NONE;

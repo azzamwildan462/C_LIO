@@ -268,6 +268,29 @@ dlio::OdomNode::OdomNode(const rclcpp::NodeOptions &options)
     RCLCPP_INFO(this->get_logger(), "[odom] Error-State EKF initialized (15-state)");
   }
 
+  // Initialize GTSAM IMU preintegration
+  {
+    // Always use full gravity for GTSAM — if IMU is gravity-removed,
+    // callbackImu() already adds +g back, so GTSAM needs to subtract it
+    double gravity_for_gtsam = this->gravity_;
+    this->gtsam_imu_params_ = gtsam::PreintegrationParams::MakeSharedU(gravity_for_gtsam);
+
+    // Use KF/EKF sigma params for noise (or geo defaults)
+    double sa = (this->fusion_method_ == dlio::FusionMethod::KF) ? this->kf_sigma_accel_ : 0.1;
+    double sg = (this->fusion_method_ == dlio::FusionMethod::KF) ? this->kf_sigma_gyro_ : 0.01;
+    this->gtsam_imu_params_->accelerometerCovariance = sa * sa * gtsam::I_3x3;
+    this->gtsam_imu_params_->gyroscopeCovariance = sg * sg * gtsam::I_3x3;
+    this->gtsam_imu_params_->integrationCovariance = 1e-8 * gtsam::I_3x3;
+
+    this->gtsam_bias_ = gtsam::imuBias::ConstantBias();
+    this->imu_preintegration_ = boost::make_shared<gtsam::PreintegratedImuMeasurements>(
+        this->gtsam_imu_params_, this->gtsam_bias_);
+    this->gtsam_nav_state_ = gtsam::NavState();
+    this->gtsam_imu_initialized_ = false;
+
+    RCLCPP_INFO(this->get_logger(), "[odom] GTSAM IMU preintegration initialized (gravity=%.2f for GTSAM)", gravity_for_gtsam);
+  }
+
   pcl::console::setVerbosityLevel(pcl::console::L_ERROR);
 
   this->crop.setNegative(true);

@@ -190,6 +190,7 @@ if(DLIO_HAS_CUDA)
   target_link_libraries(dlio_odom_component
     ${PCL_LIBRARIES} ${OpenMP_LIBS} Threads::Threads nano_gicp dlio_cuda ${cpp_typesupport_target}
     g2o::core g2o::types_slam3d g2o::solver_eigen
+    gtsam
     ${GeographicLib_LIBRARIES}
     ${ndt_cuda_ros2_LIBRARIES}
   )
@@ -200,6 +201,7 @@ else()
   target_link_libraries(dlio_odom_component
     ${PCL_LIBRARIES} ${OpenMP_LIBS} Threads::Threads nano_gicp ${cpp_typesupport_target}
     g2o::core g2o::types_slam3d g2o::solver_eigen
+    gtsam
     ${GeographicLib_LIBRARIES}
   )
   ament_target_dependencies(dlio_odom_component
