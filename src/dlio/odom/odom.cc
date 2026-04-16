@@ -693,6 +693,7 @@ void dlio::OdomNode::getParams()
   dlio::declare_param(this, "odom/imu/calibration/gyro", this->calibrate_gyro_, true);
   dlio::declare_param(this, "odom/imu/calibration/time", this->imu_calib_time_, 3.0);
   dlio::declare_param(this, "odom/imu/bufferSize", this->imu_buffer_size_, 2000);
+  dlio::declare_param(this, "odom/imu/differential_orientation", this->imu_differential_orientation_, false);
 
   std::vector<double> accel_default{0., 0., 0.};
   std::vector<double> prior_accel_bias;

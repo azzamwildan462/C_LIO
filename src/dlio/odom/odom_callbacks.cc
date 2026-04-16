@@ -929,6 +929,38 @@ void dlio::OdomNode::callbackImu(const sensor_msgs::msg::Imu::SharedPtr imu_raw)
     imu_raw->linear_acceleration.z += this->gravity_;
   }
 
+  // Differential orientation mode: derive angular velocity from orientation quaternion delta
+  if (this->imu_differential_orientation_)
+  {
+    Eigen::Quaternionf q_curr(
+        static_cast<float>(imu_raw->orientation.w),
+        static_cast<float>(imu_raw->orientation.x),
+        static_cast<float>(imu_raw->orientation.y),
+        static_cast<float>(imu_raw->orientation.z));
+
+    if (q_curr.squaredNorm() > 0.1f)
+    {
+      double stamp = rclcpp::Time(imu_raw->header.stamp).seconds();
+      if (this->imu_prev_orientation_valid_)
+      {
+        float dt = static_cast<float>(stamp - this->imu_prev_orientation_stamp_);
+        if (dt > 0.f && dt < 1.0f)
+        {
+          Eigen::Quaternionf dq = this->imu_prev_orientation_.conjugate() * q_curr;
+          dq.normalize();
+          if (dq.w() < 0.f) dq.coeffs() = -dq.coeffs(); // shortest path
+          Eigen::Vector3f omega = 2.0f * dq.vec() / dt;
+          imu_raw->angular_velocity.x = omega.x();
+          imu_raw->angular_velocity.y = omega.y();
+          imu_raw->angular_velocity.z = omega.z();
+        }
+      }
+      this->imu_prev_orientation_ = q_curr;
+      this->imu_prev_orientation_stamp_ = stamp;
+      this->imu_prev_orientation_valid_ = true;
+    }
+  }
+
   sensor_msgs::msg::Imu::SharedPtr imu = this->transformImu(imu_raw);
   this->imu_stamp = imu->header.stamp;
   double imu_stamp_secs = rclcpp::Time(imu->header.stamp).seconds();

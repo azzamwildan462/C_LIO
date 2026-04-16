@@ -669,6 +669,12 @@ private:
   bool deep_debug_ = false;
   bool use_2d_imu_ = false;
   bool use_imu_ = true;
+
+  // IMU differential orientation mode
+  bool imu_differential_orientation_ = false;
+  Eigen::Quaternionf imu_prev_orientation_ = Eigen::Quaternionf::Identity();
+  double imu_prev_orientation_stamp_ = 0.0;
+  bool imu_prev_orientation_valid_ = false;
   Eigen::Matrix4f T_prev_ = Eigen::Matrix4f::Identity();
 
   // Map load/save
