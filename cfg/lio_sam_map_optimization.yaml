@@ -54,6 +54,10 @@
     # ---- Noise model ----
     odom_noise/rotation: 0.2 # odometry rotation variance (higher = trust odom less)
     odom_noise/translation: 9.0 # odometry translation variance
+    odom_prior_noise/rotation: 1.0 # weak absolute prior for no-GPS poses (rad² variance)
+    odom_prior_noise/translation: 100.0 # weak absolute prior for no-GPS poses (m² variance, sigma~10m)
+    correction_gate/max_jump: 5.0 # meters — reject T_map_odom correction if position jumps more than this
+    correction_gate/max_rotation_deg: 30.0 # degrees — reject if rotation jumps more than this
     loop_noise/multiplier: 0.01 # loop closure noise = fitness * this (lower = trust LC more)
 
     # ---- Corrected fusion pose (KF fusion: odom delta + PGO correction) ----

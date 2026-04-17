@@ -214,9 +214,7 @@ void dlio::LioSamMapOptimizationNode::getParams()
         float r = static_cast<float>(gps_rpy_vec[0]) * M_PI / 180.f;
         float p = static_cast<float>(gps_rpy_vec[1]) * M_PI / 180.f;
         float yy = static_cast<float>(gps_rpy_vec[2]) * M_PI / 180.f;
-        this->gps_extrinsic_R_ = Eigen::AngleAxisf(yy, Eigen::Vector3f::UnitZ())
-                                * Eigen::AngleAxisf(p, Eigen::Vector3f::UnitY())
-                                * Eigen::AngleAxisf(r, Eigen::Vector3f::UnitX());
+        this->gps_extrinsic_R_ = Eigen::AngleAxisf(yy, Eigen::Vector3f::UnitZ()) * Eigen::AngleAxisf(p, Eigen::Vector3f::UnitY()) * Eigen::AngleAxisf(r, Eigen::Vector3f::UnitX());
     }
     // GPS extrinsic info moved to debugPrint()
     dlio::declare_param(this, "gps/gating_mode", this->gps_gating_mode_, std::string("covariance"));
@@ -246,6 +244,8 @@ void dlio::LioSamMapOptimizationNode::getParams()
     // Noise model
     dlio::declare_param(this, "odom_noise/rotation", this->odom_noise_rot_, 0.1);
     dlio::declare_param(this, "odom_noise/translation", this->odom_noise_trans_, 0.5);
+    dlio::declare_param(this, "odom_prior_noise/rotation", this->odom_prior_noise_rot_, 1.0);
+    dlio::declare_param(this, "odom_prior_noise/translation", this->odom_prior_noise_trans_, 100.0);
     dlio::declare_param(this, "loop_noise/multiplier", this->loop_noise_multiplier_, 0.001);
 
     // Map save
@@ -498,8 +498,7 @@ void dlio::LioSamMapOptimizationNode::callbackKeyframe(
 
             double dt = rclcpp::Time(msg->header.stamp).seconds() -
                         rclcpp::Time(this->keyframes_[this->last_gps_kf_idx_].timestamp).seconds();
-            kf.fused_covariance = this->last_gps_accuracy_ * this->last_gps_accuracy_
-                                + this->fused_drift_rate_ * static_cast<float>(std::abs(dt));
+            kf.fused_covariance = this->last_gps_accuracy_ * this->last_gps_accuracy_ + this->fused_drift_rate_ * static_cast<float>(std::abs(dt));
             kf.fused_valid = true;
         }
     }
@@ -536,9 +535,10 @@ void dlio::LioSamMapOptimizationNode::callbackKeyframe(
             this->addGPSFactor(idx, kf);
             this->addLoopFactors();
         }
-        this->updateISAM();
+        // Push keyframe BEFORE updateISAM so that if it fails and rebuilds,
+        // the rebuild loop includes this keyframe (prevents infinite rebuild loop)
         this->keyframes_.push_back(kf);
-        this->batchOptimize();
+        bool isam_ok = this->updateISAM();
 
         pcl::PointXYZ pose_pt;
         pose_pt.x = static_cast<float>(kf.pose.translation().x());
@@ -546,8 +546,12 @@ void dlio::LioSamMapOptimizationNode::callbackKeyframe(
         pose_pt.z = static_cast<float>(kf.pose.translation().z());
         this->keyframe_poses_3d_->push_back(pose_pt);
 
-        this->correctPoses();
-        this->publishMapToOdomTF();
+        if (isam_ok)
+        {
+            this->batchOptimize();
+            this->correctPoses();
+            this->publishMapToOdomTF();
+        }
     }
     // Lock released — heavy work above is unavoidable but iSAM2 incremental
     // updates are fast (O(affected nodes), not O(all nodes))
@@ -781,14 +785,32 @@ void dlio::LioSamMapOptimizationNode::addGPSFactor(int idx, const Keyframe &kf)
         return;
     last_gps_pt = cur_gps_pt;
 
-    // Noise: use actual GPS horizontal accuracy (sigma) with 1.0m floor
-    // horizontal_accuracy is sigma (std dev) from sqrt(position_covariance[0])
-    // GTSAM Diagonal::Variances expects variance = sigma^2
+    // GPS reacquisition: if GPS is far from current estimate (e.g., after tunnel),
+    // inflate noise proportionally so optimizer corrects gradually, not in one jump.
+    Eigen::Isometry3d corrected_pose;
+    {
+        std::lock_guard<std::mutex> lock(this->tf_map_odom_mtx_);
+        corrected_pose = this->T_map_odom_cached_ * kf.pose;
+    }
+    double gps_vs_odom_dist = std::sqrt(
+        std::pow(gps_x - corrected_pose.translation().x(), 2) +
+        std::pow(gps_y - corrected_pose.translation().y(), 2));
+
+    // Base noise from GPS hardware accuracy
     float h_sigma = std::max(kf.gps_horizontal_accuracy, this->gps_min_noise_floor_);
+
+    // If GPS is far from corrected pose, inflate noise for gradual correction.
+    // Use sqrt(dist) so convergence is reasonable even at large gaps:
+    //   5m gap  → sigma = max(h_acc, sqrt(5))  = ~2.2m   (normal)
+    //   50m gap → sigma = max(h_acc, sqrt(50)) = ~7m     (gentle pull)
+    //   200m gap→ sigma = max(h_acc, sqrt(200))= ~14m    (still pulls, ~15 KFs to converge)
+    if (gps_vs_odom_dist > 5.0)
+    {
+        h_sigma = std::max(h_sigma, static_cast<float>(std::sqrt(gps_vs_odom_dist)));
+    }
+
     float noise_x = h_sigma * h_sigma;
     float noise_y = h_sigma * h_sigma;
-    // When use_gps_elevation=false, set Z noise very large so GPS doesn't constrain Z
-    // (let LiDAR/IMU handle Z — they're much better at vertical constraint)
     float noise_z = this->use_gps_elevation_ ? (h_sigma * h_sigma) : 1000.0f;
 
     gtsam::Vector3 gps_noise_vec;
@@ -825,7 +847,7 @@ void dlio::LioSamMapOptimizationNode::addLoopFactors()
     this->a_loop_is_closed_ = true;
 }
 
-void dlio::LioSamMapOptimizationNode::updateISAM()
+bool dlio::LioSamMapOptimizationNode::updateISAM()
 {
     try
     {
@@ -848,11 +870,12 @@ void dlio::LioSamMapOptimizationNode::updateISAM()
         // Extract latest estimate and covariance
         this->isam_current_estimate_ = this->isam_->calculateEstimate();
 
-        int latest_idx = static_cast<int>(this->isam_current_estimate_.size()) - 1;
-        if (latest_idx >= 0)
+        int latest_idx = static_cast<int>(this->keyframes_.size()) - 1;
+        if (latest_idx >= 0 && this->isam_current_estimate_.exists(X(latest_idx)))
         {
             this->pose_covariance_ = this->isam_->marginalCovariance(X(latest_idx));
         }
+        return true;
     }
     catch (const gtsam::IndeterminantLinearSystemException &e)
     {
@@ -886,7 +909,8 @@ void dlio::LioSamMapOptimizationNode::updateISAM()
                     gtsam::Pose3 relative = pose_prev.between(pose_i);
                     auto odom_noise = gtsam::noiseModel::Diagonal::Variances(
                         (gtsam::Vector(6) << this->odom_noise_rot_, this->odom_noise_rot_, this->odom_noise_rot_,
-                         this->odom_noise_trans_, this->odom_noise_trans_, this->odom_noise_trans_).finished());
+                         this->odom_noise_trans_, this->odom_noise_trans_, this->odom_noise_trans_)
+                            .finished());
                     clean_graph.add(gtsam::BetweenFactor<gtsam::Pose3>(X(i - 1), X(i), relative, odom_noise));
                 }
             }
@@ -904,14 +928,60 @@ void dlio::LioSamMapOptimizationNode::updateISAM()
         {
             RCLCPP_ERROR(this->get_logger(), "[lio_sam_opt] iSAM2 rebuild failed: %s", rebuild_e.what());
         }
+        return false;
     }
     catch (const std::exception &e)
     {
         RCLCPP_ERROR(this->get_logger(),
-                     "[lio_sam_opt] GTSAM exception: %s", e.what());
+                     "[lio_sam_opt] GTSAM exception: %s — rebuilding iSAM2", e.what());
         this->gtsam_graph_.resize(0);
         this->initial_estimate_.clear();
         this->a_loop_is_closed_ = false;
+
+        // Rebuild iSAM2 from scratch (same as IndeterminantLinearSystem handler)
+        try
+        {
+            gtsam::NonlinearFactorGraph clean_graph;
+            gtsam::Values clean_values;
+            int num_kf = static_cast<int>(this->keyframes_.size());
+
+            for (int i = 0; i < num_kf; ++i)
+            {
+                gtsam::Pose3 pose_i = this->isometryToGtsamPose(this->keyframes_[i].pose);
+                clean_values.insert(X(i), pose_i);
+
+                if (i == 0)
+                {
+                    auto prior_noise = gtsam::noiseModel::Diagonal::Variances(
+                        (gtsam::Vector(6) << 1e-2, 1e-2, M_PI * M_PI, 1e8, 1e8, 1e8).finished());
+                    clean_graph.add(gtsam::PriorFactor<gtsam::Pose3>(X(0), pose_i, prior_noise));
+                }
+                else
+                {
+                    gtsam::Pose3 pose_prev = this->isometryToGtsamPose(this->keyframes_[i - 1].pose);
+                    gtsam::Pose3 relative = pose_prev.between(pose_i);
+                    auto odom_noise = gtsam::noiseModel::Diagonal::Variances(
+                        (gtsam::Vector(6) << this->odom_noise_rot_, this->odom_noise_rot_, this->odom_noise_rot_,
+                         this->odom_noise_trans_, this->odom_noise_trans_, this->odom_noise_trans_)
+                            .finished());
+                    clean_graph.add(gtsam::BetweenFactor<gtsam::Pose3>(X(i - 1), X(i), relative, odom_noise));
+                }
+            }
+
+            gtsam::ISAM2Params isam_params;
+            isam_params.relinearizeThreshold = this->isam_relinearize_threshold_;
+            isam_params.relinearizeSkip = this->isam_relinearize_skip_;
+            delete this->isam_;
+            this->isam_ = new gtsam::ISAM2(isam_params);
+            this->isam_->update(clean_graph, clean_values);
+            this->isam_current_estimate_ = this->isam_->calculateEstimate();
+            RCLCPP_INFO(this->get_logger(), "[lio_sam_opt] iSAM2 rebuilt after exception with %d keyframes", num_kf);
+        }
+        catch (const std::exception &rebuild_e)
+        {
+            RCLCPP_ERROR(this->get_logger(), "[lio_sam_opt] iSAM2 rebuild failed: %s", rebuild_e.what());
+        }
+        return false;
     }
 }
 
@@ -930,28 +1000,55 @@ void dlio::LioSamMapOptimizationNode::batchOptimize()
 
     try
     {
-        // Extract full accumulated graph from iSAM2
+        // Use iSAM2's accumulated graph (has loop closure factors) but with safe values
         gtsam::NonlinearFactorGraph full_graph = this->isam_->getFactorsUnsafe();
-        gtsam::Values current_values = this->isam_->calculateEstimate();
+        gtsam::Values current_values;
+
+        // Build values from keyframes — guarantees every X(i) exists
+        for (int i = 0; i < num_kf; ++i)
+        {
+            gtsam::Pose3 pose_i = this->isometryToGtsamPose(this->keyframes_[i].pose);
+            if (i < static_cast<int>(this->optimized_poses_.size()))
+                pose_i = this->optimized_poses_[i];
+            current_values.insert(X(i), pose_i);
+        }
+
+        // Filter out factors that reference keys not in our values
+        gtsam::NonlinearFactorGraph safe_graph;
+        for (size_t f = 0; f < full_graph.size(); ++f)
+        {
+            if (!full_graph[f])
+                continue;
+            bool all_keys_exist = true;
+            for (gtsam::Key key : full_graph[f]->keys())
+            {
+                if (!current_values.exists(key))
+                {
+                    all_keys_exist = false;
+                    break;
+                }
+            }
+            if (all_keys_exist)
+                safe_graph.add(full_graph[f]);
+        }
 
         // Run Levenberg-Marquardt batch optimization on the full graph
         gtsam::LevenbergMarquardtParams lm_params;
         lm_params.maxIterations = 100;
         lm_params.verbosityLM = gtsam::LevenbergMarquardtParams::SILENT;
 
-        gtsam::LevenbergMarquardtOptimizer lm(full_graph, current_values, lm_params);
+        gtsam::LevenbergMarquardtOptimizer lm(safe_graph, current_values, lm_params);
         double initial_error = lm.error();
         gtsam::Values result = lm.optimize();
         double final_error = lm.error();
 
         // Reinitialize iSAM2 with the batch-optimized result
-        // so future incremental updates start from the corrected state
         gtsam::ISAM2Params isam_params;
         isam_params.relinearizeThreshold = this->isam_relinearize_threshold_;
         isam_params.relinearizeSkip = this->isam_relinearize_skip_;
         delete this->isam_;
         this->isam_ = new gtsam::ISAM2(isam_params);
-        this->isam_->update(full_graph, result);
+        this->isam_->update(safe_graph, result);
         this->isam_->update(); // extra iteration for convergence
 
         this->isam_current_estimate_ = this->isam_->calculateEstimate();
@@ -959,7 +1056,7 @@ void dlio::LioSamMapOptimizationNode::batchOptimize()
 
         RCLCPP_INFO(this->get_logger(),
                     "[lio_sam_opt] Batch LM optimization done (%d poses, %zu factors, %d iters, error %.4f -> %.4f)",
-                    num_kf, full_graph.size(), lm.iterations(),
+                    num_kf, safe_graph.size(), lm.iterations(),
                     initial_error, final_error);
     }
     catch (const std::exception &e)
@@ -974,19 +1071,27 @@ void dlio::LioSamMapOptimizationNode::correctPoses()
     if (this->keyframes_.empty())
         return;
 
-    int num_poses = static_cast<int>(this->isam_current_estimate_.size());
-    this->optimized_poses_.resize(num_poses);
+    int num_kf = static_cast<int>(this->keyframes_.size());
+    this->optimized_poses_.resize(num_kf);
 
-    for (int i = 0; i < num_poses; ++i)
+    for (int i = 0; i < num_kf; ++i)
     {
-        this->optimized_poses_[i] = this->isam_current_estimate_.at<gtsam::Pose3>(X(i));
+        if (this->isam_current_estimate_.exists(X(i)))
+        {
+            this->optimized_poses_[i] = this->isam_current_estimate_.at<gtsam::Pose3>(X(i));
+        }
+        else
+        {
+            // Key missing (e.g., after iSAM2 rebuild) — use odometry pose as fallback
+            this->optimized_poses_[i] = this->isometryToGtsamPose(this->keyframes_[i].pose);
+        }
     }
 
     if (this->a_loop_is_closed_)
     {
         // Update KD-tree with corrected poses
         this->keyframe_poses_3d_->clear();
-        for (int i = 0; i < num_poses; ++i)
+        for (int i = 0; i < num_kf; ++i)
         {
             pcl::PointXYZ pt;
             pt.x = static_cast<float>(this->optimized_poses_[i].translation().x());
@@ -1000,12 +1105,13 @@ void dlio::LioSamMapOptimizationNode::correctPoses()
     }
 
     // Cache T_map_odom for the 20 Hz TF timer (avoids race on keyframes_/optimized_poses_)
-    int latest_idx = num_poses - 1;
+    int latest_idx = num_kf - 1;
     if (latest_idx >= 0 && latest_idx < static_cast<int>(this->keyframes_.size()))
     {
         Eigen::Isometry3d optimized_pose = this->gtsamPoseToIsometry(this->optimized_poses_[latest_idx]);
         Eigen::Isometry3d raw_odom_pose = this->keyframes_[latest_idx].pose;
         Eigen::Isometry3d T_map_odom = optimized_pose * raw_odom_pose.inverse();
+
         {
             std::lock_guard<std::mutex> lock(this->correction_mtx_);
             this->corrected_pos_ = optimized_pose.translation();

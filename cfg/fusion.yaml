@@ -11,20 +11,55 @@
     odom/geo/Kq: 4.0
     odom/geo/Kab: 2.25
     odom/geo/Kgb: 1.0
-    odom/geo/abias_max: 1.0
+    odom/geo/abias_max: 2.0
     odom/geo/gbias_max: 0.5
 
     # --- Fusion strategy ---
     # "geo" (geometric observer), "kf" (Kalman filter), "ekf" (error-state EKF)
     odom/fusion/method: "kf"
 
-    # --- KF noise parameters ---
-    odom/fusion/kf/sigma_accel: 0.5
-    odom/fusion/kf/sigma_gyro: 0.01
-    odom/fusion/kf/sigma_accel_bias: 0.001
-    odom/fusion/kf/sigma_gyro_bias: 0.0001
-    odom/fusion/kf/sigma_pos_meas: 0.1
-    odom/fusion/kf/sigma_rot_meas: 0.02
+    # --- KF noise parameters (15-state: pos, vel, rot, accel_bias, gyro_bias) ---
+    #
+    # Tuning principle: ratio process_noise / measurement_noise = who dominates
+    #   process_noise HIGH  → state grows uncertain fast → KF trusts GICP more
+    #   process_noise LOW   → state stays confident     → KF trusts IMU more
+    #   meas_noise HIGH     → GICP considered noisy     → KF trusts IMU more
+    #   meas_noise LOW      → GICP considered accurate  → KF trusts GICP more
+    #
+    # --- Process noise (IMU side) ---
+    odom/fusion/kf/sigma_accel:
+      2.0 # accelerometer noise std dev (m/s^2)
+      # higher → less trust IMU accel → GICP dominates position
+      # lower  → more trust IMU accel → smoother but may drift
+      # Y/Z drift? try 1.0-2.0
+    odom/fusion/kf/sigma_gyro:
+      0.005 # gyroscope noise std dev (rad/s)
+      # higher → less trust IMU gyro → GICP dominates rotation
+      # lower  → more trust IMU gyro → smooth rotation
+      # rotation jitter? try 0.005
+    odom/fusion/kf/sigma_accel_bias:
+      0.001 # accel bias random walk (m/s^3)
+      # higher → bias adapts faster (responsive but noisy)
+      # lower  → bias changes slowly (stable but slow convergence)
+    odom/fusion/kf/sigma_gyro_bias:
+      0.0001 # gyro bias random walk (rad/s^2)
+      # same principle as accel bias
+    #
+    # --- Measurement noise (GICP scan matching side) ---
+    odom/fusion/kf/sigma_pos_meas:
+      0.05 # GICP position measurement noise (m)
+      # lower → trust GICP position more → snaps to scan match
+      # higher → trust GICP less → IMU dominates position
+      # Y/Z drift? try 0.05
+    odom/fusion/kf/sigma_rot_meas:
+      0.02 # GICP rotation measurement noise (rad)
+      # lower → trust GICP rotation more
+      # higher → trust GICP rotation less → IMU gyro dominates
+    #
+    # Preset hints:
+    #   Good IMU (Applanix INS): sigma_accel=2.0, sigma_gyro=0.005, sigma_pos_meas=0.05
+    #   MEMS IMU (consumer):     sigma_accel=0.5, sigma_gyro=0.01,  sigma_pos_meas=0.1
+    #   Tunnel/degenerate:       sigma_accel=0.3, sigma_gyro=0.005  (trust IMU more when GICP fails)
 
     # --- EKF noise parameters ---
     odom/fusion/ekf/sigma_accel: 0.1
@@ -41,22 +76,22 @@
     odom/fusion/ekf/max_consecutive_rejects: 5
 
     # --- Pose safety gate ---
-    # Pattern: Registration -> Gate -> State Update / Keyframe / Submap
-    # When rejected: use IMU pose, still update keyframe/submap (keeps map fresh)
+    # Rejects GICP result if it looks physically implausible
+    # When rejected: use IMU-only pose, still update keyframe/submap
     odom/fusion/gate/enabled: false
-    odom/fusion/gate/fitness_threshold: 1.0 # max GICP fitness score
-    odom/fusion/gate/min_spaciousness: 7.0 # min structure complexity
-    odom/fusion/gate/max_translation: 5.0 # max position jump (m)
-    odom/fusion/gate/max_rotation_deg: 45.0 # max rotation jump (deg)
+    odom/fusion/gate/fitness_threshold: 1.0 # max GICP fitness score (lower = stricter)
+    odom/fusion/gate/min_spaciousness: 7.0 # min structure complexity (rejects featureless areas)
+    odom/fusion/gate/max_translation: 5.0 # max position jump per scan (m)
+    odom/fusion/gate/max_rotation_deg: 45.0 # max rotation jump per scan (deg)
     odom/fusion/gate/max_consecutive_rejects: 10
 
     # --- Motion model ---
+    # Constrains IMU propagation to physically plausible motion
     # "none", "ackermann", "diff_drive", "holonomic"
-    # Constrains IMU propagation and final pose to physically plausible motion
     motion_model/type: "none"
 
     # Ackermann (car-like)
-    motion_model/ackermann/max_forward_vel: 50.0 # m/s
+    motion_model/ackermann/max_forward_vel: 50.0
     motion_model/ackermann/max_reverse_vel: 5.0
     motion_model/ackermann/max_lateral_vel: 0.5
     motion_model/ackermann/max_vertical_vel: 1.0

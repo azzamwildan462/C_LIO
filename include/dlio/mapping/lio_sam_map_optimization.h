@@ -133,7 +133,7 @@ private:
   void addOdomFactor(int idx, const gtsam::Pose3 &pose_from, const gtsam::Pose3 &pose_to);
   void addGPSFactor(int idx, const Keyframe &kf);
   void addLoopFactors();
-  void updateISAM();
+  bool updateISAM();
   void batchOptimize();
   void correctPoses();
 
@@ -317,6 +317,8 @@ private:
   // Noise model
   double odom_noise_rot_;
   double odom_noise_trans_;
+  double odom_prior_noise_rot_;
+  double odom_prior_noise_trans_;
   double loop_noise_multiplier_;
 
   // GPS

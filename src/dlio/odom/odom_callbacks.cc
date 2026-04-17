@@ -763,7 +763,7 @@ void dlio::OdomNode::callbackPointCloud(const sensor_msgs::msg::PointCloud2::Sha
   }
 
   // Reset GTSAM preintegration with corrected state (after LiDAR correction)
-  if (this->gtsam_imu_initialized_ && this->imu_preintegration_)
+  if (this->imu_preintegration_mode_ == "gtsam" && this->gtsam_imu_initialized_ && this->imu_preintegration_)
   {
     std::lock_guard<std::mutex> state_lock(this->state_mtx_);
     this->gtsam_nav_state_ = gtsam::NavState(
@@ -948,7 +948,8 @@ void dlio::OdomNode::callbackImu(const sensor_msgs::msg::Imu::SharedPtr imu_raw)
         {
           Eigen::Quaternionf dq = this->imu_prev_orientation_.conjugate() * q_curr;
           dq.normalize();
-          if (dq.w() < 0.f) dq.coeffs() = -dq.coeffs(); // shortest path
+          if (dq.w() < 0.f)
+            dq.coeffs() = -dq.coeffs(); // shortest path
           Eigen::Vector3f omega = 2.0f * dq.vec() / dt;
           imu_raw->angular_velocity.x = omega.x();
           imu_raw->angular_velocity.y = omega.y();
@@ -1088,6 +1089,7 @@ void dlio::OdomNode::callbackImu(const sensor_msgs::msg::Imu::SharedPtr imu_raw)
       this->imu_calibrated = true;
 
       // Initialize GTSAM nav state after calibration
+      if (this->imu_preintegration_mode_ == "gtsam")
       {
         gtsam::Rot3 R0(this->state.q.cast<double>());
         gtsam::Point3 p0(this->state.p.cast<double>());

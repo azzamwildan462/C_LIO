@@ -18,6 +18,8 @@
     odom/imu/calibration/accel: true
     odom/imu/calibration/time: 6.0
     odom/imu/bufferSize: 5000
+    odom/imu/differential_orientation: false # true = derive angular_velocity from orientation delta (for INS with fused orientation), jangan true belum saya uji
+    odom/imu/preintegration: "gtsam" # "simple" = manual dead reckoning, "gtsam" = GTSAM PreintegratedImuMeasurements
     imu/calibration: true
     imu/intrinsics/accel/bias: [0.0, 0.0, 0.0]
     imu/intrinsics/accel/sm: [1., 0., 0., 0., 1., 0., 0., 0., 1.]
@@ -28,8 +30,10 @@
     pointcloud/voxelize: true
 
     # --- Extrinsics (all RPY in degrees) ---
-    extrinsics/baselink2imu/t: [0.990, -0.035, 1.230]
-    extrinsics/baselink2imu/rpy: [0.415, -0.414, 1.369]
+    # extrinsics/baselink2imu/t: [0.990, -0.035, 1.230]
+    # extrinsics/baselink2imu/rpy: [0.415, -0.414, 1.369]
+    extrinsics/baselink2imu/t: [0.0, 0.0, 0.0]
+    extrinsics/baselink2imu/rpy: [0.0, 0.0, 0.0]
 
     extrinsics/baselink2lidar/t: [0.990, -0.035, 1.376]
     extrinsics/baselink2lidar/rpy: [0.0, 0.0, -178.167]

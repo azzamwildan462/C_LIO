@@ -21,12 +21,24 @@
 #include "dlio/engines/prefilter_engine.h"
 // registration_helper.h removed — using registration_engine.h
 
-namespace dlio {
-  enum class FusionMethod { GEO, KF, EKF };
-  FusionMethod parseFusionMethod(const std::string& s);
+namespace dlio
+{
+  enum class FusionMethod
+  {
+    GEO,
+    KF,
+    EKF
+  };
+  FusionMethod parseFusionMethod(const std::string &s);
 
-  enum class MotionModelType { NONE, ACKERMANN, DIFF_DRIVE, HOLONOMIC };
-  MotionModelType parseMotionModelType(const std::string& s);
+  enum class MotionModelType
+  {
+    NONE,
+    ACKERMANN,
+    DIFF_DRIVE,
+    HOLONOMIC
+  };
+  MotionModelType parseMotionModelType(const std::string &s);
 }
 
 // GTSAM
@@ -395,7 +407,7 @@ private:
   dlio::RegistrationEngine engine_;
   dlio::RegistrationEngine engine_temp_; // for async submap building
   dlio::PrefilterEngine prefilter_;
-  dlio::AppearanceEngine appearance_;    // loop closure descriptor (SC++, STD, etc.)
+  dlio::AppearanceEngine appearance_;           // loop closure descriptor (SC++, STD, etc.)
   dlio::RegistrationEngine loc_registration_;   // continuous/submap localization
   dlio::RegistrationEngine reloc_registration_; // SC relocalization (wider params)
 
@@ -569,7 +581,7 @@ private:
 
   bool vf_use_;
   double vf_res_;
-  bool gpu_preprocess_;  // GPU deskewing + voxel filter
+  bool gpu_preprocess_; // GPU deskewing + voxel filter
 
   bool imu_calibrate_;
   bool calibrate_gyro_;
@@ -613,10 +625,10 @@ private:
   int gate_max_consecutive_rejects_ = 10;
   int consecutive_gate_rejects_ = 0;
   bool last_gate_passed_ = true;
-  float last_good_forward_speed_ = 0.0f; // last known forward speed when GICP was good
+  float last_good_forward_speed_ = 0.0f;                   // last known forward speed when GICP was good
   Eigen::Vector3f prev_state_p_ = Eigen::Vector3f::Zero(); // previous state position for motion model pose filter
-  Pose prev_lidarPose_;  // previous scan matching result for gate comparison
-  LidarPoseTracker lidar_tracker_;  // ABG prediction-based gate
+  Pose prev_lidarPose_;                                    // previous scan matching result for gate comparison
+  LidarPoseTracker lidar_tracker_;                         // ABG prediction-based gate
 
   // KF state (15x15 covariance)
   Eigen::Matrix<float, 15, 15> kf_P_;
@@ -672,6 +684,7 @@ private:
 
   // IMU differential orientation mode
   bool imu_differential_orientation_ = false;
+  std::string imu_preintegration_mode_ = "simple";
   Eigen::Quaternionf imu_prev_orientation_ = Eigen::Quaternionf::Identity();
   double imu_prev_orientation_stamp_ = 0.0;
   bool imu_prev_orientation_valid_ = false;
@@ -776,6 +789,13 @@ private:
   std::deque<GPSMeasurement> gps_buffer_;
   std::mutex gps_buffer_mtx_;
   static constexpr size_t GPS_BUFFER_MAX = 200;
+
+  // GPS yaw calibration (align odom heading to GPS heading)
+  bool gps_yaw_calibrated_ = false;
+  bool gps_yaw_first_fix_stored_ = false;
+  Eigen::Vector3f gps_yaw_first_pos_ = Eigen::Vector3f::Zero();  // ENU position
+  Eigen::Vector3f gps_yaw_first_odom_ = Eigen::Vector3f::Zero(); // odom position at that time
+  double gps_yaw_min_dist_ = 10.0;                               // min travel distance for reliable heading
 
   // GPS coordinate converter
   std::unique_ptr<GeographicLib::LocalCartesian> gps_converter_;

@@ -268,23 +268,25 @@ dlio::OdomNode::OdomNode(const rclcpp::NodeOptions &options)
     RCLCPP_INFO(this->get_logger(), "[odom] Error-State EKF initialized (15-state)");
   }
 
-  // Initialize GTSAM IMU preintegration
+  // Initialize GTSAM IMU preintegration (only when gtsam mode)
+  if (this->imu_preintegration_mode_ == "gtsam")
   {
     // Always use full gravity for GTSAM — if IMU is gravity-removed,
     // callbackImu() already adds +g back, so GTSAM needs to subtract it
     double gravity_for_gtsam = this->gravity_;
-    this->gtsam_imu_params_ = gtsam::PreintegrationParams::MakeSharedU(gravity_for_gtsam);
+    auto params = boost::make_shared<gtsam::PreintegrationParams>(gtsam::Vector3(0, 0, -gravity_for_gtsam));
+    this->gtsam_imu_params_ = params;
 
     // Use KF/EKF sigma params for noise (or geo defaults)
     double sa = (this->fusion_method_ == dlio::FusionMethod::KF) ? this->kf_sigma_accel_ : 0.1;
     double sg = (this->fusion_method_ == dlio::FusionMethod::KF) ? this->kf_sigma_gyro_ : 0.01;
-    this->gtsam_imu_params_->accelerometerCovariance = sa * sa * gtsam::I_3x3;
-    this->gtsam_imu_params_->gyroscopeCovariance = sg * sg * gtsam::I_3x3;
-    this->gtsam_imu_params_->integrationCovariance = 1e-8 * gtsam::I_3x3;
+    params->accelerometerCovariance = sa * sa * gtsam::I_3x3;
+    params->gyroscopeCovariance = sg * sg * gtsam::I_3x3;
+    params->integrationCovariance = 1e-8 * gtsam::I_3x3;
 
     this->gtsam_bias_ = gtsam::imuBias::ConstantBias();
     this->imu_preintegration_ = boost::make_shared<gtsam::PreintegratedImuMeasurements>(
-        this->gtsam_imu_params_, this->gtsam_bias_);
+        params, this->gtsam_bias_);
     this->gtsam_nav_state_ = gtsam::NavState();
     this->gtsam_imu_initialized_ = false;
 
@@ -593,7 +595,8 @@ void dlio::OdomNode::getParams()
   // GPU preprocessing (deskewing + voxel filter)
   dlio::declare_param(this, "odom/preprocessing/gpu", this->gpu_preprocess_, false);
 #if !DLIO_HAS_CUDA
-  if (this->gpu_preprocess_) {
+  if (this->gpu_preprocess_)
+  {
     RCLCPP_WARN(this->get_logger(), "GPU preprocessing requested but CUDA not available, falling back to CPU");
     this->gpu_preprocess_ = false;
   }
@@ -694,6 +697,7 @@ void dlio::OdomNode::getParams()
   dlio::declare_param(this, "odom/imu/calibration/time", this->imu_calib_time_, 3.0);
   dlio::declare_param(this, "odom/imu/bufferSize", this->imu_buffer_size_, 2000);
   dlio::declare_param(this, "odom/imu/differential_orientation", this->imu_differential_orientation_, false);
+  dlio::declare_param(this, "odom/imu/preintegration", this->imu_preintegration_mode_, std::string("simple"));
 
   std::vector<double> accel_default{0., 0., 0.};
   std::vector<double> prior_accel_bias;
@@ -851,34 +855,130 @@ void dlio::OdomNode::getParams()
     auto &m = this->mm_params_;
 
     // Ackermann
-    { double v; dlio::declare_param(this, "motion_model/ackermann/max_forward_vel", v, 30.0); m.ack_max_fwd_vel = v; }
-    { double v; dlio::declare_param(this, "motion_model/ackermann/max_reverse_vel", v, 5.0); m.ack_max_rev_vel = v; }
-    { double v; dlio::declare_param(this, "motion_model/ackermann/max_lateral_vel", v, 0.5); m.ack_max_lat_vel = v; }
-    { double v; dlio::declare_param(this, "motion_model/ackermann/max_vertical_vel", v, 1.0); m.ack_max_vert_vel = v; }
-    { double v; dlio::declare_param(this, "motion_model/ackermann/max_forward_accel", v, 8.0); m.ack_max_fwd_accel = v; }
-    { double v; dlio::declare_param(this, "motion_model/ackermann/max_lateral_accel", v, 3.0); m.ack_max_lat_accel = v; }
-    { double v; dlio::declare_param(this, "motion_model/ackermann/max_yaw_rate", v, 1.5); m.ack_max_yaw_rate = v; }
-    { double v; dlio::declare_param(this, "motion_model/ackermann/max_roll_rate", v, 0.3); m.ack_max_roll_rate = v; }
-    { double v; dlio::declare_param(this, "motion_model/ackermann/max_pitch_rate", v, 0.3); m.ack_max_pitch_rate = v; }
+    {
+      double v;
+      dlio::declare_param(this, "motion_model/ackermann/max_forward_vel", v, 30.0);
+      m.ack_max_fwd_vel = v;
+    }
+    {
+      double v;
+      dlio::declare_param(this, "motion_model/ackermann/max_reverse_vel", v, 5.0);
+      m.ack_max_rev_vel = v;
+    }
+    {
+      double v;
+      dlio::declare_param(this, "motion_model/ackermann/max_lateral_vel", v, 0.5);
+      m.ack_max_lat_vel = v;
+    }
+    {
+      double v;
+      dlio::declare_param(this, "motion_model/ackermann/max_vertical_vel", v, 1.0);
+      m.ack_max_vert_vel = v;
+    }
+    {
+      double v;
+      dlio::declare_param(this, "motion_model/ackermann/max_forward_accel", v, 8.0);
+      m.ack_max_fwd_accel = v;
+    }
+    {
+      double v;
+      dlio::declare_param(this, "motion_model/ackermann/max_lateral_accel", v, 3.0);
+      m.ack_max_lat_accel = v;
+    }
+    {
+      double v;
+      dlio::declare_param(this, "motion_model/ackermann/max_yaw_rate", v, 1.5);
+      m.ack_max_yaw_rate = v;
+    }
+    {
+      double v;
+      dlio::declare_param(this, "motion_model/ackermann/max_roll_rate", v, 0.3);
+      m.ack_max_roll_rate = v;
+    }
+    {
+      double v;
+      dlio::declare_param(this, "motion_model/ackermann/max_pitch_rate", v, 0.3);
+      m.ack_max_pitch_rate = v;
+    }
 
     // Diff drive
-    { double v; dlio::declare_param(this, "motion_model/diff_drive/max_forward_vel", v, 5.0); m.dd_max_fwd_vel = v; }
-    { double v; dlio::declare_param(this, "motion_model/diff_drive/max_reverse_vel", v, 2.0); m.dd_max_rev_vel = v; }
-    { double v; dlio::declare_param(this, "motion_model/diff_drive/max_lateral_vel", v, 0.1); m.dd_max_lat_vel = v; }
-    { double v; dlio::declare_param(this, "motion_model/diff_drive/max_vertical_vel", v, 0.5); m.dd_max_vert_vel = v; }
-    { double v; dlio::declare_param(this, "motion_model/diff_drive/max_forward_accel", v, 5.0); m.dd_max_fwd_accel = v; }
-    { double v; dlio::declare_param(this, "motion_model/diff_drive/max_lateral_accel", v, 1.0); m.dd_max_lat_accel = v; }
-    { double v; dlio::declare_param(this, "motion_model/diff_drive/max_yaw_rate", v, 3.0); m.dd_max_yaw_rate = v; }
-    { double v; dlio::declare_param(this, "motion_model/diff_drive/max_roll_rate", v, 0.2); m.dd_max_roll_rate = v; }
-    { double v; dlio::declare_param(this, "motion_model/diff_drive/max_pitch_rate", v, 0.2); m.dd_max_pitch_rate = v; }
+    {
+      double v;
+      dlio::declare_param(this, "motion_model/diff_drive/max_forward_vel", v, 5.0);
+      m.dd_max_fwd_vel = v;
+    }
+    {
+      double v;
+      dlio::declare_param(this, "motion_model/diff_drive/max_reverse_vel", v, 2.0);
+      m.dd_max_rev_vel = v;
+    }
+    {
+      double v;
+      dlio::declare_param(this, "motion_model/diff_drive/max_lateral_vel", v, 0.1);
+      m.dd_max_lat_vel = v;
+    }
+    {
+      double v;
+      dlio::declare_param(this, "motion_model/diff_drive/max_vertical_vel", v, 0.5);
+      m.dd_max_vert_vel = v;
+    }
+    {
+      double v;
+      dlio::declare_param(this, "motion_model/diff_drive/max_forward_accel", v, 5.0);
+      m.dd_max_fwd_accel = v;
+    }
+    {
+      double v;
+      dlio::declare_param(this, "motion_model/diff_drive/max_lateral_accel", v, 1.0);
+      m.dd_max_lat_accel = v;
+    }
+    {
+      double v;
+      dlio::declare_param(this, "motion_model/diff_drive/max_yaw_rate", v, 3.0);
+      m.dd_max_yaw_rate = v;
+    }
+    {
+      double v;
+      dlio::declare_param(this, "motion_model/diff_drive/max_roll_rate", v, 0.2);
+      m.dd_max_roll_rate = v;
+    }
+    {
+      double v;
+      dlio::declare_param(this, "motion_model/diff_drive/max_pitch_rate", v, 0.2);
+      m.dd_max_pitch_rate = v;
+    }
 
     // Holonomic
-    { double v; dlio::declare_param(this, "motion_model/holonomic/max_horizontal_vel", v, 5.0); m.holo_max_horiz_vel = v; }
-    { double v; dlio::declare_param(this, "motion_model/holonomic/max_vertical_vel", v, 0.5); m.holo_max_vert_vel = v; }
-    { double v; dlio::declare_param(this, "motion_model/holonomic/max_horizontal_accel", v, 5.0); m.holo_max_horiz_accel = v; }
-    { double v; dlio::declare_param(this, "motion_model/holonomic/max_yaw_rate", v, 3.0); m.holo_max_yaw_rate = v; }
-    { double v; dlio::declare_param(this, "motion_model/holonomic/max_roll_rate", v, 0.2); m.holo_max_roll_rate = v; }
-    { double v; dlio::declare_param(this, "motion_model/holonomic/max_pitch_rate", v, 0.2); m.holo_max_pitch_rate = v; }
+    {
+      double v;
+      dlio::declare_param(this, "motion_model/holonomic/max_horizontal_vel", v, 5.0);
+      m.holo_max_horiz_vel = v;
+    }
+    {
+      double v;
+      dlio::declare_param(this, "motion_model/holonomic/max_vertical_vel", v, 0.5);
+      m.holo_max_vert_vel = v;
+    }
+    {
+      double v;
+      dlio::declare_param(this, "motion_model/holonomic/max_horizontal_accel", v, 5.0);
+      m.holo_max_horiz_accel = v;
+    }
+    {
+      double v;
+      dlio::declare_param(this, "motion_model/holonomic/max_yaw_rate", v, 3.0);
+      m.holo_max_yaw_rate = v;
+    }
+    {
+      double v;
+      dlio::declare_param(this, "motion_model/holonomic/max_roll_rate", v, 0.2);
+      m.holo_max_roll_rate = v;
+    }
+    {
+      double v;
+      dlio::declare_param(this, "motion_model/holonomic/max_pitch_rate", v, 0.2);
+      m.holo_max_pitch_rate = v;
+    }
 
     if (this->motion_model_type_ != dlio::MotionModelType::NONE)
     {
@@ -1026,9 +1126,9 @@ void dlio::OdomNode::getParams()
       float p = odom_rpy[1] * M_PI / 180.0f;
       float y = odom_rpy[2] * M_PI / 180.0f;
       this->ext_baselink2odom_.R = (Eigen::AngleAxisf(y, Eigen::Vector3f::UnitZ()) *
-                                     Eigen::AngleAxisf(p, Eigen::Vector3f::UnitY()) *
-                                     Eigen::AngleAxisf(r, Eigen::Vector3f::UnitX()))
-                                        .toRotationMatrix();
+                                    Eigen::AngleAxisf(p, Eigen::Vector3f::UnitY()) *
+                                    Eigen::AngleAxisf(r, Eigen::Vector3f::UnitX()))
+                                       .toRotationMatrix();
     }
   }
   if (this->ext_odom_enabled_)
@@ -1128,6 +1228,9 @@ void dlio::OdomNode::callbackGPS(const sensor_msgs::msg::NavSatFix::SharedPtr ms
     this->gps_buffer_.push_back({msg->latitude, msg->longitude, msg->altitude,
                                  ts, h_acc, static_cast<uint8_t>(msg->status.status)});
   }
+
+  // GPS yaw alignment is handled by lio_sam_opt via GPS factors + ENU->odom yaw calibration.
+  // Runtime yaw correction in odom is not feasible without rotating all keyframes/submaps.
 }
 
 bool dlio::OdomNode::getGPSAtTime(double timestamp, GPSMeasurement &out)

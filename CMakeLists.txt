@@ -277,8 +277,14 @@ add_executable(imu_integrator_node src/dlio/tools/imu_integrator_node.cc)
 target_include_directories(imu_integrator_node PRIVATE ${EIGEN3_INCLUDE_DIR})
 ament_target_dependencies(imu_integrator_node rclcpp sensor_msgs nav_msgs geometry_msgs)
 
+# ---- IMU-LiDAR Extrinsic Calibration Tool (pure GICP, no DLIO dependency) ----
+add_executable(imu_lidar_calib_node src/dlio/tools/imu_lidar_calib_node.cc)
+target_include_directories(imu_lidar_calib_node PRIVATE ${EIGEN3_INCLUDE_DIR})
+target_link_libraries(imu_lidar_calib_node ${PCL_LIBRARIES})
+ament_target_dependencies(imu_lidar_calib_node rclcpp sensor_msgs nav_msgs geometry_msgs pcl_conversions)
+
 install(TARGETS
-  dlio_odom_node dlio_lio_sam_map_opt_node imu_integrator_node
+  dlio_odom_node dlio_lio_sam_map_opt_node imu_integrator_node imu_lidar_calib_node
   DESTINATION lib/${PROJECT_NAME}
 )
 
