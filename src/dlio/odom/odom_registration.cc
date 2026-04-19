@@ -36,7 +36,10 @@ void dlio::OdomNode::getNextPose()
   if (this->new_submap_is_ready && this->submap_hasChanged)
   {
     this->engine_.registerInputTarget(this->submap_cloud);
-    if (this->engine_.needsKdTree())
+    // Only propagate the externally-built KdTree if it actually exists.
+    // For robust_icp (CPU), passing nullptr here would wipe out the
+    // internal tree that registerInputTarget() just built.
+    if (this->engine_.needsKdTree() && this->submap_kdtree)
       this->engine_.setTargetKdTree(this->submap_kdtree);
     if (this->engine_.needsCovariances())
       this->engine_.setTargetCovariances(this->submap_normals);

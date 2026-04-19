@@ -335,6 +335,7 @@ std::shared_ptr<const nano_gicp::CovarianceList> RegistrationEngine::getSourceCo
 
 std::shared_ptr<const nanoflann::KdTreeFLANN<PointType>> RegistrationEngine::getTargetKdTree() {
   if (isGicp()) return gicp_.target_kdtree_;
+  if (effective_method_ == RegistrationMethod::ROBUST_ICP) return robust_icp_.target_kdtree_;
   return nullptr;
 }
 

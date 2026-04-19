@@ -244,6 +244,32 @@ dlio::OdomNode::OdomNode(const rclcpp::NodeOptions &options)
                 dlio::registrationMethodToString(method).c_str());
   }
 
+  // Voxel hash map submap allocation (must follow engine_.init() so the
+  // compat check sees the real engine, not default-constructed GICP).
+  if (this->submap_method_ == "voxel_hash_map")
+  {
+    double vm_voxel_size = 1.0, vm_max_dist = 100.0;
+    int vm_max_pts = 20;
+    dlio::declare_param(this, "odom/submap/voxel_hash_map/voxel_size", vm_voxel_size, 1.0);
+    dlio::declare_param(this, "odom/submap/voxel_hash_map/max_distance", vm_max_dist, 100.0);
+    dlio::declare_param(this, "odom/submap/voxel_hash_map/max_points_per_voxel", vm_max_pts, 20);
+
+    if (this->engine_.needsCovariances())
+    {
+      RCLCPP_WARN(this->get_logger(),
+                  "[odom] %s incompatible with voxel_hash_map (no covariances), falling back to keyframe submap",
+                  this->registration_method_.c_str());
+      this->submap_method_ = "keyframe";
+    }
+    else
+    {
+      this->voxel_map_ = std::make_unique<dlio::VoxelHashMap>(vm_voxel_size, vm_max_dist, vm_max_pts);
+      RCLCPP_INFO(this->get_logger(),
+                  "[odom] Using voxel hash map submap (voxel=%.2fm, max_dist=%.0fm, max_pts=%d)",
+                  vm_voxel_size, vm_max_dist, vm_max_pts);
+    }
+  }
+
   this->geo.first_opt_done = false;
   this->geo.prev_vel = Eigen::Vector3f(0., 0., 0.);
 
@@ -555,29 +581,9 @@ void dlio::OdomNode::getParams()
   dlio::declare_param(this, "odom/submap/keyframe/kcv", this->submap_kcv_, 10);
   dlio::declare_param(this, "odom/submap/keyframe/kcc", this->submap_kcc_, 10);
 
-  if (this->submap_method_ == "voxel_hash_map")
-  {
-    double vm_voxel_size = 1.0, vm_max_dist = 100.0;
-    int vm_max_pts = 20;
-    dlio::declare_param(this, "odom/submap/voxel_hash_map/voxel_size", vm_voxel_size, 1.0);
-    dlio::declare_param(this, "odom/submap/voxel_hash_map/max_distance", vm_max_dist, 100.0);
-    dlio::declare_param(this, "odom/submap/voxel_hash_map/max_points_per_voxel", vm_max_pts, 20);
-
-    if (this->engine_.needsCovariances())
-    {
-      RCLCPP_WARN(this->get_logger(),
-                  "[odom] %s incompatible with voxel_hash_map (no covariances), falling back to keyframe submap",
-                  this->registration_method_.c_str());
-      this->submap_method_ = "keyframe";
-    }
-    else
-    {
-      this->voxel_map_ = std::make_unique<dlio::VoxelHashMap>(vm_voxel_size, vm_max_dist, vm_max_pts);
-      RCLCPP_INFO(this->get_logger(),
-                  "[odom] Using voxel hash map submap (voxel=%.2fm, max_dist=%.0fm, max_pts=%d)",
-                  vm_voxel_size, vm_max_dist, vm_max_pts);
-    }
-  }
+  // NOTE: voxel_hash_map allocation + engine compat check is done in the
+  // constructor AFTER engine_.init() (see OdomNode::OdomNode), so that the
+  // check evaluates the real engine state instead of the default (GICP).
 
   // Dense map resolution
   dlio::declare_param(this, "map/dense/filtered", this->densemap_filtered_, true);
