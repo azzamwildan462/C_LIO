@@ -93,6 +93,7 @@ private:
     // GPS local coords
     float gps_x = 0.f, gps_y = 0.f, gps_z = 0.f;
     float gps_horizontal_accuracy = 0.f;
+    int8_t gps_status = -1;
     bool gps_valid = false;
     // Fused pose (GPS + odom dead-reckoning, Eagleye-style)
     Eigen::Isometry3d fused_pose = Eigen::Isometry3d::Identity();
@@ -124,6 +125,7 @@ private:
   {
     double latitude, longitude, altitude, timestamp;
     float horizontal_accuracy;
+    int8_t status = -1; // sensor_msgs::msg::NavSatStatus::status (-1=NO_FIX, 0=FIX, 1=SBAS, 2=GBAS)
   };
   bool getGPSAtTime(double timestamp, GPSMeasurement &out);
   bool gpsToLocal(double lat, double lon, double alt, float &x, float &y, float &z);

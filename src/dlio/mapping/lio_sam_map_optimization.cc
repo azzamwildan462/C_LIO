@@ -12,6 +12,7 @@
 #include "dlio/mapping/lio_sam_map_optimization.h"
 #include "dlio/odom/utils.h"
 
+#include <cstdio>
 #include <filesystem>
 
 using gtsam::symbol_shorthand::X; // Pose3 variables
@@ -430,6 +431,7 @@ void dlio::LioSamMapOptimizationNode::callbackKeyframe(
             kf.gps_valid = this->gpsToLocal(gps.latitude, gps.longitude, gps.altitude,
                                             kf.gps_x, kf.gps_y, kf.gps_z);
             kf.gps_horizontal_accuracy = gps.horizontal_accuracy;
+            kf.gps_status = gps.status;
         }
     }
 
@@ -603,7 +605,8 @@ void dlio::LioSamMapOptimizationNode::callbackGPS(const sensor_msgs::msg::NavSat
         std::lock_guard<std::mutex> lock(this->gps_buffer_mtx_);
         if (this->gps_buffer_.size() >= GPS_BUFFER_MAX)
             this->gps_buffer_.pop_front();
-        this->gps_buffer_.push_back({msg->latitude, msg->longitude, msg->altitude, ts, h_acc});
+        this->gps_buffer_.push_back({msg->latitude, msg->longitude, msg->altitude, ts, h_acc,
+                                     static_cast<int8_t>(msg->status.status)});
     }
 }
 
@@ -1729,6 +1732,30 @@ void dlio::LioSamMapOptimizationNode::saveGraphMaps(const std::string &save_dir,
     {
         RCLCPP_ERROR(this->get_logger(), "[lio_sam_opt] FAILED to save: %s", corr_file.c_str());
     }
+
+    // Dump per-keyframe body-frame scans for offline map re-assembly.
+    // Parallel to _corrected.kfdb (written by OdomNode): same <stem>, sibling directory.
+    std::string scans_dir = save_dir + "/" + stem + "_kfscans";
+    std::filesystem::create_directories(scans_dir);
+    int dumped = 0;
+    int failed = 0;
+    for (int i = 0; i < num_kf; ++i)
+    {
+        if (!kf_snap[i].cloud_local || kf_snap[i].cloud_local->empty())
+        {
+            failed++;
+            continue;
+        }
+        char fname[32];
+        std::snprintf(fname, sizeof(fname), "kf_%06d.pcd", i);
+        std::string scan_path = scans_dir + "/" + fname;
+        if (pcl::io::savePCDFileBinary(scan_path, *kf_snap[i].cloud_local) == 0)
+            dumped++;
+        else
+            failed++;
+    }
+    RCLCPP_INFO(this->get_logger(), "[lio_sam_opt] Dumped %d/%d keyframe scans to %s (failed=%d)",
+                dumped, num_kf, scans_dir.c_str(), failed);
 }
 
 void dlio::LioSamMapOptimizationNode::autoSave()

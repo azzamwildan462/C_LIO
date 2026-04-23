@@ -573,6 +573,10 @@ void dlio::OdomNode::computeAndStoreKeyframeSC()
   entry.position = this->lidarPose.p;
   entry.orientation = this->lidarPose.q;
 
+  // v5: attach body-frame scan (voxel-filtered above, NOT gravity-aligned).
+  // Used downstream by offline map assembly and the pose editor.
+  entry.scan = raw_scan;
+
   // Attach GPS data to keyframe entry
   GPSMeasurement gps_at_kf;
   if (this->gps_enabled_ && this->getGPSAtTime(this->scan_header_stamp.seconds(), gps_at_kf))
@@ -581,10 +585,14 @@ void dlio::OdomNode::computeAndStoreKeyframeSC()
     entry.gps_longitude = gps_at_kf.longitude;
     entry.gps_altitude = gps_at_kf.altitude;
     entry.gps_valid = true;
+    entry.gps_horizontal_accuracy = gps_at_kf.horizontal_accuracy;
+    entry.gps_status = static_cast<int8_t>(gps_at_kf.status);
   }
   else
   {
     entry.gps_valid = false;
+    entry.gps_horizontal_accuracy = 0.f;
+    entry.gps_status = -1;
   }
 
   // 5. Store entry (disk save deferred to shutdown / mode switch)

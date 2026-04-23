@@ -20,6 +20,60 @@
 namespace dlio::kfdb
 {
 
+  namespace
+  {
+    // v5: serialize a single body-frame scan as:
+    //   uint32 num_points
+    //   float32 xyzi[4 * num_points]   (x, y, z, intensity)
+    void writeEntryScan(std::ofstream &ofs, const pcl::PointCloud<PointType>::Ptr &scan)
+    {
+      uint32_t n = 0;
+      if (scan && !scan->empty())
+        n = static_cast<uint32_t>(scan->size());
+      ofs.write(reinterpret_cast<const char *>(&n), sizeof(uint32_t));
+      if (n == 0)
+        return;
+      // Repack into an xyzi array — PointType may have padding or extra fields.
+      std::vector<float> buf(4 * static_cast<size_t>(n));
+      for (uint32_t i = 0; i < n; ++i)
+      {
+        const auto &pt = (*scan)[i];
+        buf[4 * i + 0] = pt.x;
+        buf[4 * i + 1] = pt.y;
+        buf[4 * i + 2] = pt.z;
+        buf[4 * i + 3] = pt.intensity;
+      }
+      ofs.write(reinterpret_cast<const char *>(buf.data()), buf.size() * sizeof(float));
+    }
+
+    void readEntryScan(std::ifstream &ifs, pcl::PointCloud<PointType>::Ptr &scan)
+    {
+      uint32_t n = 0;
+      ifs.read(reinterpret_cast<char *>(&n), sizeof(uint32_t));
+      if (n == 0)
+      {
+        scan.reset();
+        return;
+      }
+      std::vector<float> buf(4 * static_cast<size_t>(n));
+      ifs.read(reinterpret_cast<char *>(buf.data()), buf.size() * sizeof(float));
+      scan = std::make_shared<pcl::PointCloud<PointType>>();
+      scan->reserve(n);
+      for (uint32_t i = 0; i < n; ++i)
+      {
+        PointType pt;
+        pt.x = buf[4 * i + 0];
+        pt.y = buf[4 * i + 1];
+        pt.z = buf[4 * i + 2];
+        pt.intensity = buf[4 * i + 3];
+        scan->push_back(pt);
+      }
+      scan->width = n;
+      scan->height = 1;
+      scan->is_dense = false;
+    }
+  } // namespace
+
   std::string getKfdbPath(const std::string &map_path, bool use_corrected)
   {
     if (map_path.empty())
@@ -56,9 +110,9 @@ namespace dlio::kfdb
     if (!ofs.is_open())
       return false;
 
-    // Header (v3: includes gravity quaternion + GPS per entry)
+    // Header (v4: v3 fields + per-entry gps_horizontal_accuracy + gps_status)
     uint32_t magic = 0x4B464442; // "KFDB"
-    uint32_t version = 3;
+    uint32_t version = 5;
     uint32_t sc_nr = dlio::sc::SC_NR;
     uint32_t sc_ns = dlio::sc::SC_NS;
     uint32_t num_entries = static_cast<uint32_t>(entries.size());
@@ -91,6 +145,13 @@ namespace dlio::kfdb
       ofs.write(reinterpret_cast<const char *>(&entry.gps_altitude), sizeof(double));
       uint8_t gv = entry.gps_valid ? 1 : 0;
       ofs.write(reinterpret_cast<const char *>(&gv), sizeof(uint8_t));
+
+      // v4: GPS horizontal accuracy + status
+      ofs.write(reinterpret_cast<const char *>(&entry.gps_horizontal_accuracy), sizeof(float));
+      ofs.write(reinterpret_cast<const char *>(&entry.gps_status), sizeof(int8_t));
+
+      // v5: embedded body-frame scan (xyzi)
+      writeEntryScan(ofs, entry.scan);
     }
 
     ofs.close();
@@ -128,7 +189,7 @@ namespace dlio::kfdb
       return false;
 
     uint32_t magic = 0x4B464442;
-    uint32_t version = 3;
+    uint32_t version = 5;
     uint32_t sc_nr = dlio::sc::SC_NR;
     uint32_t sc_ns = dlio::sc::SC_NS;
 
@@ -168,6 +229,14 @@ namespace dlio::kfdb
       ofs.write(reinterpret_cast<const char *>(&entry.gps_altitude), sizeof(double));
       uint8_t gv = entry.gps_valid ? 1 : 0;
       ofs.write(reinterpret_cast<const char *>(&gv), sizeof(uint8_t));
+
+      // v4: GPS horizontal accuracy + status
+      ofs.write(reinterpret_cast<const char *>(&entry.gps_horizontal_accuracy), sizeof(float));
+      ofs.write(reinterpret_cast<const char *>(&entry.gps_status), sizeof(int8_t));
+
+      // v5: embedded body-frame scan (xyzi). Corrected-save reuses OdomNode's
+      // original (pre-correction) scan — only the pose is replaced.
+      writeEntryScan(ofs, entry.scan);
     }
 
     ofs.close();
@@ -194,7 +263,7 @@ namespace dlio::kfdb
       return false;
 
     ifs.read(reinterpret_cast<char *>(&version), sizeof(version));
-    if (version != 1 && version != 2 && version != 3)
+    if (version != 1 && version != 2 && version != 3 && version != 4 && version != 5)
       return false;
 
     ifs.read(reinterpret_cast<char *>(&sc_nr), sizeof(sc_nr));
@@ -252,6 +321,24 @@ namespace dlio::kfdb
       {
         entry.gps_valid = false;
       }
+
+      // v4: GPS horizontal accuracy + status
+      if (version >= 4)
+      {
+        ifs.read(reinterpret_cast<char *>(&entry.gps_horizontal_accuracy), sizeof(float));
+        ifs.read(reinterpret_cast<char *>(&entry.gps_status), sizeof(int8_t));
+      }
+      else
+      {
+        entry.gps_horizontal_accuracy = 0.f;
+        entry.gps_status = entry.gps_valid ? static_cast<int8_t>(0) : static_cast<int8_t>(-1);
+      }
+
+      // v5: embedded body-frame scan
+      if (version >= 5)
+        readEntryScan(ifs, entry.scan);
+      else
+        entry.scan.reset();
 
       database.push_back(std::move(entry));
     }
