@@ -57,19 +57,29 @@ else()
 endif()
 
 # ---- CUDA (optional) ----
+# DLIO_HAS_CUDA      → DLIO-native CUDA kernels (transforms.cu, gicp_gpu_wrapper.cu,
+#                      preprocess_cuda.cu, robust_icp_cuda.cu, nn_search.cu, linearize.cu).
+#                      Only requires CUDAToolkit.
+# DLIO_HAS_NDT_CUDA  → Optional NDT_CUDA registration method via external ndt_cuda_ros2
+#                      package. Decoupled so a broken ndt_cuda_ros2 build does not
+#                      disable DLIO's own CUDA acceleration.
 find_package(CUDAToolkit QUIET)
 
-if(CUDAToolkit_FOUND AND ndt_cuda_ros2_FOUND)
+if(CUDAToolkit_FOUND)
   set(DLIO_HAS_CUDA ON)
-  message(STATUS "CUDA + ndt_cuda_ros2 found — GPU acceleration enabled")
   link_directories(${CUDAToolkit_LIBRARY_DIR})
+  if(ndt_cuda_ros2_FOUND)
+    set(DLIO_HAS_NDT_CUDA ON)
+    add_compile_definitions(DLIO_HAS_NDT_CUDA=1)
+    message(STATUS "DLIO CUDA: ON (native + NDT_CUDA method)")
+  else()
+    set(DLIO_HAS_NDT_CUDA OFF)
+    message(STATUS "DLIO CUDA: ON (native only — ndt_cuda_ros2 missing; NDT_CUDA method unavailable)")
+  endif()
 else()
   set(DLIO_HAS_CUDA OFF)
-  if(NOT CUDAToolkit_FOUND)
-    message(STATUS "CUDAToolkit not found — building CPU-only")
-  elseif(NOT ndt_cuda_ros2_FOUND)
-    message(STATUS "ndt_cuda_ros2 not found — building CPU-only")
-  endif()
+  set(DLIO_HAS_NDT_CUDA OFF)
+  message(STATUS "CUDAToolkit not found — building CPU-only")
 endif()
 
 # Not all machines have <cpuid.h> available
@@ -187,16 +197,21 @@ add_library(dlio_odom_component SHARED
 target_compile_options(dlio_odom_component PRIVATE ${OpenMP_FLAGS})
 target_compile_definitions(dlio_odom_component PRIVATE ${_DLIO_CUDA_DEF})
 if(DLIO_HAS_CUDA)
-  target_link_libraries(dlio_odom_component
+  set(_odom_link_libs
     ${PCL_LIBRARIES} ${OpenMP_LIBS} Threads::Threads nano_gicp dlio_cuda ${cpp_typesupport_target}
     g2o::core g2o::types_slam3d g2o::solver_eigen
     gtsam
     ${GeographicLib_LIBRARIES}
-    ${ndt_cuda_ros2_LIBRARIES}
   )
-  ament_target_dependencies(dlio_odom_component
-    rclcpp rclcpp_components tf2_ros pcl_ros nav_msgs pcl_conversions sensor_msgs geometry_msgs visualization_msgs ndt_omp_ros2 ndt_cuda_ros2
+  set(_odom_ament_deps
+    rclcpp rclcpp_components tf2_ros pcl_ros nav_msgs pcl_conversions sensor_msgs geometry_msgs visualization_msgs ndt_omp_ros2
   )
+  if(DLIO_HAS_NDT_CUDA)
+    list(APPEND _odom_link_libs ${ndt_cuda_ros2_LIBRARIES})
+    list(APPEND _odom_ament_deps ndt_cuda_ros2)
+  endif()
+  target_link_libraries(dlio_odom_component ${_odom_link_libs})
+  ament_target_dependencies(dlio_odom_component ${_odom_ament_deps})
 else()
   target_link_libraries(dlio_odom_component
     ${PCL_LIBRARIES} ${OpenMP_LIBS} Threads::Threads nano_gicp ${cpp_typesupport_target}
@@ -220,15 +235,20 @@ add_library(dlio_lio_sam_map_opt_component SHARED
 target_compile_options(dlio_lio_sam_map_opt_component PRIVATE ${OpenMP_FLAGS})
 target_compile_definitions(dlio_lio_sam_map_opt_component PRIVATE ${_DLIO_CUDA_DEF})
 if(DLIO_HAS_CUDA)
-  target_link_libraries(dlio_lio_sam_map_opt_component
+  set(_mapopt_link_libs
     ${PCL_LIBRARIES} ${OpenMP_LIBS} Threads::Threads nano_gicp dlio_cuda ${cpp_typesupport_target}
     gtsam
     ${GeographicLib_LIBRARIES}
-    ${ndt_cuda_ros2_LIBRARIES}
   )
-  ament_target_dependencies(dlio_lio_sam_map_opt_component
-    rclcpp rclcpp_components pcl_ros pcl_conversions nav_msgs sensor_msgs geometry_msgs visualization_msgs ndt_omp_ros2 ndt_cuda_ros2 tf2_ros
+  set(_mapopt_ament_deps
+    rclcpp rclcpp_components pcl_ros pcl_conversions nav_msgs sensor_msgs geometry_msgs visualization_msgs ndt_omp_ros2 tf2_ros
   )
+  if(DLIO_HAS_NDT_CUDA)
+    list(APPEND _mapopt_link_libs ${ndt_cuda_ros2_LIBRARIES})
+    list(APPEND _mapopt_ament_deps ndt_cuda_ros2)
+  endif()
+  target_link_libraries(dlio_lio_sam_map_opt_component ${_mapopt_link_libs})
+  ament_target_dependencies(dlio_lio_sam_map_opt_component ${_mapopt_ament_deps})
 else()
   target_link_libraries(dlio_lio_sam_map_opt_component
     ${PCL_LIBRARIES} ${OpenMP_LIBS} Threads::Threads nano_gicp ${cpp_typesupport_target}

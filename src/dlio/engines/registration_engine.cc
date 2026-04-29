@@ -32,32 +32,34 @@ void RegistrationEngine::init(RegistrationMethod method, const RegistrationParam
   logger_ = logger;
   initialized_ = true;
 
-  // Determine effective method (CUDA fallback when not compiled in)
+  // Determine effective method (fallback when CUDA/NDT_CUDA not compiled in).
+  // DLIO_HAS_CUDA gates native CUDA methods (GICP_CUDA, ROBUST_ICP_CUDA).
+  // DLIO_HAS_NDT_CUDA gates only the external ndt_cuda_ros2 method.
   switch (method_) {
+    case RegistrationMethod::GICP_CUDA:
 #if DLIO_HAS_CUDA
-    case RegistrationMethod::GICP_CUDA:
       effective_method_ = RegistrationMethod::GICP_CUDA;
-      break;
-    case RegistrationMethod::NDT_CUDA:
-      effective_method_ = RegistrationMethod::NDT_CUDA;
-      break;
-    case RegistrationMethod::ROBUST_ICP_CUDA:
-      effective_method_ = RegistrationMethod::ROBUST_ICP_CUDA;
-      break;
 #else
-    case RegistrationMethod::GICP_CUDA:
       RCLCPP_WARN(logger_, "GICP_CUDA requested but CUDA not available, falling back to GICP");
       effective_method_ = RegistrationMethod::GICP;
-      break;
-    case RegistrationMethod::NDT_CUDA:
-      RCLCPP_WARN(logger_, "NDT_CUDA requested but CUDA not available, falling back to NDT");
-      effective_method_ = RegistrationMethod::NDT;
+#endif
       break;
     case RegistrationMethod::ROBUST_ICP_CUDA:
+#if DLIO_HAS_CUDA
+      effective_method_ = RegistrationMethod::ROBUST_ICP_CUDA;
+#else
       RCLCPP_WARN(logger_, "ROBUST_ICP_CUDA requested but CUDA not available, falling back to ROBUST_ICP");
       effective_method_ = RegistrationMethod::ROBUST_ICP;
-      break;
 #endif
+      break;
+    case RegistrationMethod::NDT_CUDA:
+#if DLIO_HAS_NDT_CUDA
+      effective_method_ = RegistrationMethod::NDT_CUDA;
+#else
+      RCLCPP_WARN(logger_, "NDT_CUDA requested but ndt_cuda_ros2 not available, falling back to NDT");
+      effective_method_ = RegistrationMethod::NDT;
+#endif
+      break;
     default:
       effective_method_ = method_;
       break;
@@ -95,7 +97,7 @@ void RegistrationEngine::init(RegistrationMethod method, const RegistrationParam
       ndt_.setTransformationEpsilon(p.gicp_transformation_ep);
       break;
     }
-#if DLIO_HAS_CUDA
+#if DLIO_HAS_NDT_CUDA
     case RegistrationMethod::NDT_CUDA: {
       ndt_cuda_.setResolution(p.ndt_resolution);
       ndt_cuda_.setStepSize(p.ndt_step_size);
@@ -136,7 +138,7 @@ void RegistrationEngine::setInputSource(pcl::PointCloud<PointType>::ConstPtr clo
     case RegistrationMethod::NDT:
       ndt_.setInputSource(cloud);
       break;
-#if DLIO_HAS_CUDA
+#if DLIO_HAS_NDT_CUDA
     case RegistrationMethod::NDT_CUDA:
       ndt_cuda_.setInputSource(cloud);
       break;
@@ -162,7 +164,7 @@ void RegistrationEngine::setInputTarget(pcl::PointCloud<PointType>::ConstPtr clo
     case RegistrationMethod::NDT:
       ndt_.setInputTarget(cloud);
       break;
-#if DLIO_HAS_CUDA
+#if DLIO_HAS_NDT_CUDA
     case RegistrationMethod::NDT_CUDA:
       ndt_cuda_.setInputTarget(cloud);
       break;
@@ -188,7 +190,7 @@ void RegistrationEngine::registerInputTarget(pcl::PointCloud<PointType>::ConstPt
     case RegistrationMethod::NDT:
       ndt_.setInputTarget(cloud);
       break;
-#if DLIO_HAS_CUDA
+#if DLIO_HAS_NDT_CUDA
     case RegistrationMethod::NDT_CUDA:
       ndt_cuda_.setInputTarget(cloud);
       break;
@@ -221,7 +223,7 @@ void RegistrationEngine::align(pcl::PointCloud<PointType>& output) {
       gicp_.align(output); break;
     case RegistrationMethod::NDT:
       ndt_.align(output); break;
-#if DLIO_HAS_CUDA
+#if DLIO_HAS_NDT_CUDA
     case RegistrationMethod::NDT_CUDA:
       ndt_cuda_.align(output); break;
 #endif
@@ -242,7 +244,7 @@ Eigen::Matrix4f RegistrationEngine::getFinalTransformation() {
       return gicp_.getFinalTransformation();
     case RegistrationMethod::NDT:
       return ndt_.getFinalTransformation();
-#if DLIO_HAS_CUDA
+#if DLIO_HAS_NDT_CUDA
     case RegistrationMethod::NDT_CUDA:
       return ndt_cuda_.getFinalTransformation();
 #endif
@@ -278,7 +280,7 @@ double RegistrationEngine::getFitnessScore(double max_range) {
     case RegistrationMethod::NDT:
       try { return ndt_.getFitnessScore(max_range); }
       catch (...) { return ndt_.hasConverged() ? 0.1 : 1.0; }
-#if DLIO_HAS_CUDA
+#if DLIO_HAS_NDT_CUDA
     case RegistrationMethod::NDT_CUDA:
       try { return ndt_cuda_.getFitnessScore(max_range); }
       catch (...) { return ndt_cuda_.hasConverged() ? 0.1 : 1.0; }
@@ -301,7 +303,7 @@ bool RegistrationEngine::hasConverged() {
       return gicp_.hasConverged();
     case RegistrationMethod::NDT:
       return ndt_.hasConverged();
-#if DLIO_HAS_CUDA
+#if DLIO_HAS_NDT_CUDA
     case RegistrationMethod::NDT_CUDA:
       return ndt_cuda_.hasConverged();
 #endif

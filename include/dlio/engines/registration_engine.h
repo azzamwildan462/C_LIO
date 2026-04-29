@@ -5,6 +5,8 @@
 #include "dlio/algorithms/robust_icp.h"
 #if DLIO_HAS_CUDA
 #include "dlio/cuda/robust_icp_cuda.h"
+#endif
+#if DLIO_HAS_NDT_CUDA
 #include <ndt_cuda/ndt_cuda.h>
 #endif
 #include <pclomp/voxel_grid_covariance_omp.h>
@@ -121,7 +123,7 @@ namespace dlio
 
     nano_gicp::NanoGICP<PointType, PointType> gicp_;
     pclomp::NormalDistributionsTransform<PointType, PointType> ndt_;
-#if DLIO_HAS_CUDA
+#if DLIO_HAS_NDT_CUDA
     ndt_cuda::NormalDistributionsTransformCUDA<PointType, PointType> ndt_cuda_;
 #endif
     dlio::RobustICP robust_icp_;
