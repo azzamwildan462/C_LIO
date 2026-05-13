@@ -580,6 +580,7 @@ void dlio::OdomNode::getParams()
   dlio::declare_param(this, "odom/submap/keyframe/knn", this->submap_knn_, 10);
   dlio::declare_param(this, "odom/submap/keyframe/kcv", this->submap_kcv_, 10);
   dlio::declare_param(this, "odom/submap/keyframe/kcc", this->submap_kcc_, 10);
+  dlio::declare_param(this, "odom/submap/recent/n", this->submap_recent_n_, 10);
 
   // NOTE: voxel_hash_map allocation + engine compat check is done in the
   // constructor AFTER engine_.init() (see OdomNode::OdomNode), so that the

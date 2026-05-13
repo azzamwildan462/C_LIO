@@ -572,6 +572,7 @@ private:
   int submap_knn_;
   int submap_kcv_;
   int submap_kcc_;
+  int submap_recent_n_;
   double submap_concave_alpha_;
 
   bool densemap_filtered_;

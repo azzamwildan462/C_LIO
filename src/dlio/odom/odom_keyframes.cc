@@ -281,48 +281,65 @@ void dlio::OdomNode::buildSubmap(State vehicle_state)
   // clear vector of keyframe indices to use for submap
   this->submap_kf_idx_curr.clear();
 
-  // calculate distance between current pose and poses in keyframe set
   std::unique_lock<decltype(this->keyframes_mutex)> lock(this->keyframes_mutex);
-  std::vector<float> ds;
-  std::vector<int> keyframe_nn;
-  for (int i = 0; i < this->num_processed_keyframes; i++)
+
+  if (this->submap_method_ == "recent_keyframes")
   {
-    float d = sqrt(pow(vehicle_state.p[0] - this->keyframes[i].first.first[0], 2) +
-                   pow(vehicle_state.p[1] - this->keyframes[i].first.first[1], 2) +
-                   pow(vehicle_state.p[2] - this->keyframes[i].first.first[2], 2));
-    ds.push_back(d);
-    keyframe_nn.push_back(i);
+    // Pakai hanya N keyframe terbaru — hindari keyframe lawas yg bisa narik
+    // registrasi ke alignment ter-drift. Cocok untuk odom forward-moving.
+    const int n_total = this->num_processed_keyframes;
+    lock.unlock();
+
+    const int n_take = std::min(this->submap_recent_n_, n_total);
+    for (int i = n_total - n_take; i < n_total; ++i)
+    {
+      this->submap_kf_idx_curr.push_back(i);
+    }
   }
-  lock.unlock();
-
-  // get indices for top K nearest neighbor keyframe poses
-  this->pushSubmapIndices(ds, this->submap_knn_, keyframe_nn);
-
-  // get convex hull indices
-  this->computeConvexHull();
-
-  // get distances for each keyframe on convex hull
-  std::vector<float> convex_ds;
-  for (const auto &c : this->keyframe_convex)
+  else
   {
-    convex_ds.push_back(ds[c]);
+    // calculate distance between current pose and poses in keyframe set
+    std::vector<float> ds;
+    std::vector<int> keyframe_nn;
+    for (int i = 0; i < this->num_processed_keyframes; i++)
+    {
+      float d = sqrt(pow(vehicle_state.p[0] - this->keyframes[i].first.first[0], 2) +
+                     pow(vehicle_state.p[1] - this->keyframes[i].first.first[1], 2) +
+                     pow(vehicle_state.p[2] - this->keyframes[i].first.first[2], 2));
+      ds.push_back(d);
+      keyframe_nn.push_back(i);
+    }
+    lock.unlock();
+
+    // get indices for top K nearest neighbor keyframe poses
+    this->pushSubmapIndices(ds, this->submap_knn_, keyframe_nn);
+
+    // get convex hull indices
+    this->computeConvexHull();
+
+    // get distances for each keyframe on convex hull
+    std::vector<float> convex_ds;
+    for (const auto &c : this->keyframe_convex)
+    {
+      convex_ds.push_back(ds[c]);
+    }
+
+    // get indices for top kNN for convex hull
+    this->pushSubmapIndices(convex_ds, this->submap_kcv_, this->keyframe_convex);
+
+    // get concave hull indices
+    this->computeConcaveHull();
+
+    // get distances for each keyframe on concave hull
+    std::vector<float> concave_ds;
+    for (const auto &c : this->keyframe_concave)
+    {
+      concave_ds.push_back(ds[c]);
+    }
+
+    // get indices for top kNN for concave hull
+    this->pushSubmapIndices(concave_ds, this->submap_kcc_, this->keyframe_concave);
   }
-
-  // get indices for top kNN for convex hull
-  this->pushSubmapIndices(convex_ds, this->submap_kcv_, this->keyframe_convex);
-
-  // get concave hull indices
-  this->computeConcaveHull();
-
-  // get distances for each keyframe on concave hull
-  std::vector<float> concave_ds;
-  for (const auto &c : this->keyframe_concave)
-  {
-    concave_ds.push_back(ds[c]);
-  }
-
-  // get indices for top kNN for concave hull
-  this->pushSubmapIndices(concave_ds, this->submap_kcc_, this->keyframe_concave);
 
   // sort current and previous submap kf list of indices
   std::sort(this->submap_kf_idx_curr.begin(), this->submap_kf_idx_curr.end());
