@@ -15,27 +15,42 @@ extern std::atomic<dlio::OdomNode *> g_odom_node;
 void dlio::OdomNode::publishPose()
 {
 
+  // Snapshot state under geo.mtx — convention codebase: SEMUA state writers
+  // (propagateState 200Hz dari callbackImu + updateState{Geo,KF,EKF} dari
+  // callbackPointCloud) pakai geo.mtx. state_mtx_ hanya serialize callback
+  // level, TIDAK block propagateState → torn read masih bisa terjadi.
+  // Fix: pakai geo.mtx untuk benar-benar exclude IMU propagation writes.
+  Eigen::Vector3f s_p, s_v_lin_w, s_v_ang_b;
+  Eigen::Quaternionf s_q;
+  {
+    std::lock_guard<std::mutex> lock(this->geo.mtx);
+    s_p = this->state.p;
+    s_q = this->state.q;
+    s_v_lin_w = this->state.v.lin.w;
+    s_v_ang_b = this->state.v.ang.b;
+  }
+
   // nav_msgs::msg::Odometry
   this->odom_ros.header.stamp = this->imu_stamp;
   this->odom_ros.header.frame_id = this->odom_frame;
   this->odom_ros.child_frame_id = this->baselink_frame;
 
-  this->odom_ros.pose.pose.position.x = this->state.p[0];
-  this->odom_ros.pose.pose.position.y = this->state.p[1];
-  this->odom_ros.pose.pose.position.z = this->state.p[2];
+  this->odom_ros.pose.pose.position.x = s_p[0];
+  this->odom_ros.pose.pose.position.y = s_p[1];
+  this->odom_ros.pose.pose.position.z = s_p[2];
 
-  this->odom_ros.pose.pose.orientation.w = this->state.q.w();
-  this->odom_ros.pose.pose.orientation.x = this->state.q.x();
-  this->odom_ros.pose.pose.orientation.y = this->state.q.y();
-  this->odom_ros.pose.pose.orientation.z = this->state.q.z();
+  this->odom_ros.pose.pose.orientation.w = s_q.w();
+  this->odom_ros.pose.pose.orientation.x = s_q.x();
+  this->odom_ros.pose.pose.orientation.y = s_q.y();
+  this->odom_ros.pose.pose.orientation.z = s_q.z();
 
-  this->odom_ros.twist.twist.linear.x = this->state.v.lin.w[0];
-  this->odom_ros.twist.twist.linear.y = this->state.v.lin.w[1];
-  this->odom_ros.twist.twist.linear.z = this->state.v.lin.w[2];
+  this->odom_ros.twist.twist.linear.x = s_v_lin_w[0];
+  this->odom_ros.twist.twist.linear.y = s_v_lin_w[1];
+  this->odom_ros.twist.twist.linear.z = s_v_lin_w[2];
 
-  this->odom_ros.twist.twist.angular.x = this->state.v.ang.b[0];
-  this->odom_ros.twist.twist.angular.y = this->state.v.ang.b[1];
-  this->odom_ros.twist.twist.angular.z = this->state.v.ang.b[2];
+  this->odom_ros.twist.twist.angular.x = s_v_ang_b[0];
+  this->odom_ros.twist.twist.angular.y = s_v_ang_b[1];
+  this->odom_ros.twist.twist.angular.z = s_v_ang_b[2];
 
   this->odom_pub->publish(this->odom_ros);
 
@@ -43,14 +58,14 @@ void dlio::OdomNode::publishPose()
   this->pose_ros.header.stamp = this->imu_stamp;
   this->pose_ros.header.frame_id = this->odom_frame;
 
-  this->pose_ros.pose.position.x = this->state.p[0];
-  this->pose_ros.pose.position.y = this->state.p[1];
-  this->pose_ros.pose.position.z = this->state.p[2];
+  this->pose_ros.pose.position.x = s_p[0];
+  this->pose_ros.pose.position.y = s_p[1];
+  this->pose_ros.pose.position.z = s_p[2];
 
-  this->pose_ros.pose.orientation.w = this->state.q.w();
-  this->pose_ros.pose.orientation.x = this->state.q.x();
-  this->pose_ros.pose.orientation.y = this->state.q.y();
-  this->pose_ros.pose.orientation.z = this->state.q.z();
+  this->pose_ros.pose.orientation.w = s_q.w();
+  this->pose_ros.pose.orientation.x = s_q.x();
+  this->pose_ros.pose.orientation.y = s_q.y();
+  this->pose_ros.pose.orientation.z = s_q.z();
 
   this->pose_pub->publish(this->pose_ros);
 
@@ -152,6 +167,17 @@ void dlio::OdomNode::publishToROS(pcl::PointCloud<PointType>::ConstPtr published
 {
   this->publishCloud(published_cloud, raw_deskewed_cloud, T_cloud);
 
+  // Snapshot lidarPose under geo.mtx — publishToROS dari detached thread,
+  // racing dgn writers di getNextPose/propagateGICP/updateState yg semua
+  // ujungnya pakai geo.mtx. state_mtx_ tidak cukup melindungi.
+  Eigen::Vector3f lp_p;
+  Eigen::Quaternionf lp_q;
+  {
+    std::lock_guard<std::mutex> lock(this->geo.mtx);
+    lp_p = this->lidarPose.p;
+    lp_q = this->lidarPose.q;
+  }
+
   // nav_msgs::msg::Path — use lidarPose directly (no smoothing)
   this->path_ros.header.stamp = this->imu_stamp;
   this->path_ros.header.frame_id = this->odom_frame;
@@ -159,13 +185,13 @@ void dlio::OdomNode::publishToROS(pcl::PointCloud<PointType>::ConstPtr published
   geometry_msgs::msg::PoseStamped p;
   p.header.stamp = this->imu_stamp;
   p.header.frame_id = this->odom_frame;
-  p.pose.position.x = this->lidarPose.p[0];
-  p.pose.position.y = this->lidarPose.p[1];
-  p.pose.position.z = this->lidarPose.p[2];
-  p.pose.orientation.w = this->lidarPose.q.w();
-  p.pose.orientation.x = this->lidarPose.q.x();
-  p.pose.orientation.y = this->lidarPose.q.y();
-  p.pose.orientation.z = this->lidarPose.q.z();
+  p.pose.position.x = lp_p[0];
+  p.pose.position.y = lp_p[1];
+  p.pose.position.z = lp_p[2];
+  p.pose.orientation.w = lp_q.w();
+  p.pose.orientation.x = lp_q.x();
+  p.pose.orientation.y = lp_q.y();
+  p.pose.orientation.z = lp_q.z();
 
   {
     std::lock_guard<std::mutex> lock(this->publish_mtx_);
@@ -180,14 +206,14 @@ void dlio::OdomNode::publishToROS(pcl::PointCloud<PointType>::ConstPtr published
   transformStamped.header.frame_id = this->odom_frame;
   transformStamped.child_frame_id = this->baselink_frame;
 
-  transformStamped.transform.translation.x = this->lidarPose.p[0];
-  transformStamped.transform.translation.y = this->lidarPose.p[1];
-  transformStamped.transform.translation.z = this->lidarPose.p[2];
+  transformStamped.transform.translation.x = lp_p[0];
+  transformStamped.transform.translation.y = lp_p[1];
+  transformStamped.transform.translation.z = lp_p[2];
 
-  transformStamped.transform.rotation.w = this->lidarPose.q.w();
-  transformStamped.transform.rotation.x = this->lidarPose.q.x();
-  transformStamped.transform.rotation.y = this->lidarPose.q.y();
-  transformStamped.transform.rotation.z = this->lidarPose.q.z();
+  transformStamped.transform.rotation.w = lp_q.w();
+  transformStamped.transform.rotation.x = lp_q.x();
+  transformStamped.transform.rotation.y = lp_q.y();
+  transformStamped.transform.rotation.z = lp_q.z();
 
   br->sendTransform(transformStamped);
 

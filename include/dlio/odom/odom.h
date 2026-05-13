@@ -559,6 +559,7 @@ private:
 
   bool time_offset_;
   bool imu_gravity_removed_; // true if IMU driver already removed gravity from accel
+  bool imu_accel_in_g_;      // true if IMU publishes linear_acceleration in g (will be scaled to m/s^2)
 
   bool adaptive_params_;
 

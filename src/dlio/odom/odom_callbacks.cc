@@ -920,6 +920,15 @@ void dlio::OdomNode::callbackImu(const sensor_msgs::msg::Imu::SharedPtr imu_raw)
 
   this->first_imu_received = true;
 
+  // If IMU publishes accel in g units, scale to m/s^2 first so downstream
+  // (gravity reconstruction, calibration, propagation) sees consistent SI units.
+  if (this->imu_accel_in_g_)
+  {
+    imu_raw->linear_acceleration.x *= this->gravity_;
+    imu_raw->linear_acceleration.y *= this->gravity_;
+    imu_raw->linear_acceleration.z *= this->gravity_;
+  }
+
   // If IMU driver already removed gravity from accel:
   // Simply add gravity back as [0, 0, +g] in sensor frame (assuming Z-up IMU).
   // propagateState() will subtract gravity in world frame, cancelling it out.

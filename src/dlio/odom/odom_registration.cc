@@ -892,13 +892,25 @@ void dlio::OdomNode::applyMotionModelConstraintImu(Eigen::Vector3f &v, const Eig
 void dlio::OdomNode::setAdaptiveParams()
 {
 
-  // Spaciousness + Density (lock to prevent race with detached computeMetrics thread)
-  float sp, den;
+  // Spaciousness + Density — guard empty vector & non-finite values.
+  // Race: setAdaptiveParams dipanggil di callbackPointCloud SEGERA setelah
+  // computeMetrics di-detach (odom_callbacks.cc:670-676). Kalau metrics
+  // belum di-populate (first scan, atau setelah clear), back() pada vector
+  // KOSONG = undefined behavior → garbage masuk ke GICP setMaxCorrespondenceDistance
+  // → korespondensi liar → T_corr besar → pose absurd ter-publish.
+  float sp = 1.0f;
+  float den = static_cast<float>(this->gicp_max_corr_dist_);
   {
     std::lock_guard<std::mutex> lock(this->metrics_mtx_);
-    sp = this->metrics.spaciousness.back();
-    den = this->metrics.density.back();
+    if (!this->metrics.spaciousness.empty())
+      sp = this->metrics.spaciousness.back();
+    if (!this->metrics.density.empty())
+      den = this->metrics.density.back();
   }
+  if (!std::isfinite(sp))
+    sp = 1.0f;
+  if (!std::isfinite(den))
+    den = static_cast<float>(this->gicp_max_corr_dist_);
 
   if (sp < 0.5)
   {

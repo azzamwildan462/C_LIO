@@ -571,6 +571,12 @@ void dlio::OdomNode::getParams()
   if (this->imu_gravity_removed_)
     RCLCPP_INFO(this->get_logger(), "[odom] IMU gravity-removed mode: will reconstruct raw accel from orientation");
 
+  // IMU accel in g units: set true if IMU publishes linear_acceleration in g (1g = 9.80665 m/s^2)
+  // instead of m/s^2. DLIO will scale accel by gravity_ before any further processing.
+  dlio::declare_param(this, "odom/imu/accelInG", this->imu_accel_in_g_, false);
+  if (this->imu_accel_in_g_)
+    RCLCPP_INFO(this->get_logger(), "[odom] IMU accel-in-g mode: will scale linear_acceleration from g to m/s^2");
+
   // Keyframe Threshold
   dlio::declare_param(this, "odom/keyframe/threshD", this->keyframe_thresh_dist_, 0.1);
   dlio::declare_param(this, "odom/keyframe/threshR", this->keyframe_thresh_rot_, 1.0);
@@ -786,6 +792,7 @@ void dlio::OdomNode::getParams()
     this->fusion_method_ = dlio::parseFusionMethod(fusion_method_str);
     RCLCPP_INFO(this->get_logger(), "[odom] Fusion method: %s", fusion_method_str.c_str());
   }
+
 
   // Pose safety gate
   dlio::declare_param(this, "odom/fusion/gate/enabled", this->gate_enabled_, false);
