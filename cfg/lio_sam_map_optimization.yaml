@@ -2,14 +2,14 @@
   ros__parameters:
     # ---- Map Correction (master switch for loop closure + GPS factors) ----
     map_correction: true # false = odometry-only graph (no LC, no GPS correction)
-    debug/print_lio_sam_opt: true # printf dashboard with GPS, fused pose, LC stats
+    debug/print_lio_sam_opt: false # printf dashboard with GPS, fused pose, LC stats
 
     # ---- Loop Closure Detection (LIO-SAM style: distance-based KD-tree) ----
     loop_detection_period_ms: 3000 # Hz = 1000/period_ms (higher = less CPU)
     loop_closure/search_radius: 15.0 # meters, spatial proximity for LC candidate
     loop_closure/search_time_diff: 10.0 # seconds, min temporal gap to avoid recent frames
     loop_closure/search_num: 25 # +/- keyframes to aggregate for history submap
-    loop_closure/fitness_score_threshold: 0.4
+    loop_closure/fitness_score_threshold: 0.3
     loop_closure/min_keyframe_gap: 25 # min index gap between LC pair
 
     # ---- Scan Context++ (secondary / fallback loop closure) ----
@@ -30,7 +30,7 @@
     ndt/resolution: 3.0
     ndt/num_threads: 4
 
-    voxel_leaf_size: 1.5
+    voxel_leaf_size: 0.3
 
     # ---- GPS ----
     gps/enabled: true
@@ -49,7 +49,7 @@
     isam/relinearize_threshold: 0.01
     isam/relinearize_skip: 1
     isam/batch_optimization: true # run LM batch optimization periodically (better for large corrections)
-    isam/batch_optimization_interval: 500 # run batch every N keyframes (lower = more accurate but slower)
+    isam/batch_optimization_interval: 50 # run batch every N keyframes (lower = more accurate but slower)
 
     # ---- Noise model ----
     odom_noise/rotation: 0.2 # odometry rotation variance (higher = trust odom less)
@@ -74,7 +74,7 @@
     # map/tf_source: "lio_sam_opt"
 
     # ---- Map save ----
-    map/voxel_size: 0.1
+    map/voxel_size: 0.01
     map/auto_save_interval: 30.0 # seconds (0 = disabled)
     map/publish_interval: 5.0 # seconds between corrected map publishes
     map/global_map_vis_radius: 1000.0 # meters

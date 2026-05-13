@@ -6,8 +6,8 @@
 /**:
   ros__parameters:
     # --- Preprocessing ---
-    odom/preprocessing/cropBoxFilter/size: 1.0
-    odom/preprocessing/voxelFilter/res: 1.5
+    odom/preprocessing/cropBoxFilter/size: 3.0
+    odom/preprocessing/voxelFilter/res: 1.0
     odom/preprocessing/gpu: true # GPU deskewing + voxel grid filter (requires CUDA)
 
     # Prefilter (noise removal) — applied after deskewing
@@ -44,14 +44,18 @@
     odom/robust_icp/kernel_scale: 0.0 # GM kernel sigma (0 = auto)
 
     # --- Keyframes ---
-    odom/keyframe/threshD: 5.0 # meters
-    odom/keyframe/threshR: 10.0 # degrees
+    odom/keyframe/threshD: 1.0 # meters
+    odom/keyframe/threshR: 1.0 # degrees
 
     # --- Submap ---
-    odom/submap/method: "keyframe" # "keyframe" or "voxel_hash_map"
-    odom/submap/keyframe/knn: 30
-    odom/submap/keyframe/kcv: 30
-    odom/submap/keyframe/kcc: 30
+    # method: "keyframe" (KNN + convex/concave hull) | "voxel_hash_map" | "recent_keyframes"
+    #   "recent_keyframes" pakai hanya N keyframe terbaru — robust untuk odom
+    #   forward-moving, hindari keyframe lawas narik registrasi.
+    odom/submap/method: "keyframe"
+    odom/submap/keyframe/knn: 15
+    odom/submap/keyframe/kcv: 15
+    odom/submap/keyframe/kcc: 15
+    odom/submap/recent/n: 30
     odom/submap/voxel_hash_map/voxel_size: 0.75
-    odom/submap/voxel_hash_map/max_distance: 150.0
+    odom/submap/voxel_hash_map/max_distance: 200.0
     odom/submap/voxel_hash_map/max_points_per_voxel: 40

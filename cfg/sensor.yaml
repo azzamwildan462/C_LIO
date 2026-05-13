@@ -9,7 +9,8 @@
     odom/gravity: 9.80665
     odom/use_imu: true
     odom/use_2d_imu: false
-    odom/imu/gravityRemoved: true # true if IMU driver already removed gravity from accel
+    odom/imu/gravityRemoved: false # true if IMU driver already removed gravity from accel
+    odom/imu/accelInG: true # true if IMU publishes linear_acceleration in g instead of m/s^2 (will be scaled by gravity)
     odom/computeTimeOffset: true
 
     # IMU calibration
@@ -33,12 +34,12 @@
     # extrinsics/baselink2imu/t: [0.990, -0.035, 1.230]
     # extrinsics/baselink2imu/rpy: [0.415, -0.414, 1.369]
     extrinsics/baselink2imu/t: [0.0, 0.0, 0.0]
-    extrinsics/baselink2imu/rpy: [0.0, 0.0, 0.0]
+    extrinsics/baselink2imu/rpy: [0.0, 0.0, 0.00]
 
-    extrinsics/baselink2lidar/t: [0.990, -0.035, 1.376]
-    extrinsics/baselink2lidar/rpy: [0.0, 0.0, -178.167]
+    extrinsics/baselink2lidar/t: [0.0, 0.0, 0.0]
+    extrinsics/baselink2lidar/rpy: [0.0, 0.0, 0.0]
 
-    extrinsics/baselink2gps/t: [0.990, -0.035, 1.230] # same as IMU (Applanix POS LVX)
+    extrinsics/baselink2gps/t: [0.00, 0.0, 0.00] # same as IMU (Applanix POS LVX)
     extrinsics/baselink2gps/rpy: [0.0, 0.0, 0.0] # ENU→odom yaw auto-calibrated at startup
 
     extrinsics/baselink2odom/t: [0.0, 0.0, 0.0]
