@@ -525,11 +525,32 @@ dlio::OdomNode::OdomNode(const rclcpp::NodeOptions &options)
   {
     g_odom_node.store(this);
     std::atexit(odomAtexitSave);
+
+    // Periodic KFDB auto-save: don't rely on a clean Ctrl+C. A hard kill now
+    // loses at most one interval of keyframes instead of the whole session.
+    if (this->kfdb_auto_save_interval_ > 0.)
+    {
+      this->kfdb_autosave_timer_ = this->create_wall_timer(
+          std::chrono::duration<double>(this->kfdb_auto_save_interval_),
+          [this]()
+          {
+            this->saveKeyframeDatabase();
+            this->saveCorrectedKeyframeDatabase();
+          });
+      RCLCPP_INFO(this->get_logger(), "[odom] KFDB auto-save enabled: every %.1fs",
+                  this->kfdb_auto_save_interval_);
+    }
   }
 }
 
 dlio::OdomNode::~OdomNode()
 {
+  // Stop periodic auto-save and detach from the atexit handler before we run
+  // the final save, so neither fires against a half-destroyed node.
+  if (this->kfdb_autosave_timer_)
+    this->kfdb_autosave_timer_->cancel();
+  g_odom_node.store(nullptr);
+
   if (this->map_mode_ == "mapping" && !this->map_path_.empty())
   {
     this->saveKeyframeDatabase();
@@ -1042,6 +1063,7 @@ void dlio::OdomNode::getParams()
     }
   }
   dlio::declare_param(this, "map/use_corrected", this->use_corrected_, true);
+  dlio::declare_param(this, "map/auto_save_interval", this->kfdb_auto_save_interval_, 30.0);
   dlio::declare_param(this, "map/voxel_size", this->map_voxel_size_, 0.25);
   dlio::declare_param(this, "map/chunk_size", this->map_chunk_size_, 20.0);
 

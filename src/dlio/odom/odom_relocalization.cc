@@ -573,10 +573,6 @@ void dlio::OdomNode::computeAndStoreKeyframeSC()
   entry.position = this->lidarPose.p;
   entry.orientation = this->lidarPose.q;
 
-  // v5: attach body-frame scan (voxel-filtered above, NOT gravity-aligned).
-  // Used downstream by offline map assembly and the pose editor.
-  entry.scan = raw_scan;
-
   // Attach GPS data to keyframe entry
   GPSMeasurement gps_at_kf;
   if (this->gps_enabled_ && this->getGPSAtTime(this->scan_header_stamp.seconds(), gps_at_kf))
@@ -616,7 +612,7 @@ bool dlio::OdomNode::saveKeyframeDatabase()
     std::lock_guard<std::mutex> lock(this->kfdb_mutex_);
     if (this->kfdb_entries_.empty())
     {
-      RCLCPP_INFO(this->get_logger(), "KFDB: no entries to save");
+      RCLCPP_DEBUG(this->get_logger(), "KFDB: no entries to save");
       return false;
     }
     entries_snap = this->kfdb_entries_;
@@ -624,7 +620,9 @@ bool dlio::OdomNode::saveKeyframeDatabase()
     gravity_q = this->kfdb_gravity_q_;
   }
 
-  // File I/O outside lock
+  // File I/O outside the entries lock, but serialized against other savers
+  // (periodic timer / service / shutdown) so temp files never collide.
+  std::lock_guard<std::mutex> file_lock(this->kfdb_file_mutex_);
   bool ok = dlio::kfdb::save(kfdb_path, entries_snap, max_range, gravity_q);
   if (ok)
     RCLCPP_INFO(this->get_logger(), "KFDB: saved %zu entries to %s",
@@ -644,17 +642,27 @@ bool dlio::OdomNode::saveCorrectedKeyframeDatabase()
 
   if (corrected_poses.empty())
   {
-    RCLCPP_INFO(this->get_logger(), "KFDB corrected: no corrected poses from lio_sam_opt, skipping");
+    RCLCPP_DEBUG(this->get_logger(), "KFDB corrected: no corrected poses from lio_sam_opt, skipping");
     return false;
   }
 
-  std::lock_guard<std::mutex> lock(this->kfdb_mutex_);
-  if (this->kfdb_entries_.empty())
-    return false;
+  // Brief lock: snapshot entries, then write outside the entries lock.
+  std::vector<dlio::AppearanceEntry> entries_snap;
+  float max_range;
+  Eigen::Quaternionf gravity_q;
+  {
+    std::lock_guard<std::mutex> lock(this->kfdb_mutex_);
+    if (this->kfdb_entries_.empty())
+      return false;
+    entries_snap = this->kfdb_entries_;
+    max_range = this->sc_max_range_;
+    gravity_q = this->kfdb_gravity_q_;
+  }
 
-  bool ok = dlio::kfdb::saveCorrected(this->map_path_, this->kfdb_entries_,
-                                      corrected_poses, this->sc_max_range_,
-                                      this->kfdb_gravity_q_);
+  std::lock_guard<std::mutex> file_lock(this->kfdb_file_mutex_);
+  bool ok = dlio::kfdb::saveCorrected(this->map_path_, entries_snap,
+                                      corrected_poses, max_range,
+                                      gravity_q);
   if (ok)
   {
     // Actual file is <map_stem>_corrected.kfdb (derived in kfdb::saveCorrected)

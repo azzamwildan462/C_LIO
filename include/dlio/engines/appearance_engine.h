@@ -63,9 +63,6 @@ namespace dlio
     bool gps_valid = false;
     float gps_horizontal_accuracy = 0.f;
     int8_t gps_status = -1; // sensor_msgs::msg::NavSatStatus::status: -1=NO_FIX, 0=FIX, 1=SBAS, 2=GBAS
-    // v5: body-frame scan attached to this keyframe (nullptr if unavailable).
-    // Populated by OdomNode at KF creation; serialized into .kfdb v5.
-    pcl::PointCloud<PointType>::Ptr scan;
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
   };
 

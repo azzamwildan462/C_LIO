@@ -725,6 +725,12 @@ private:
   std::mutex kfdb_mutex_;
   Eigen::Quaternionf kfdb_gravity_q_{1.f, 0.f, 0.f, 0.f}; // gravity quaternion for KFDB SC frame
 
+  // Periodic KFDB auto-save (mapping mode) — so the .kfdb survives a hard kill,
+  // not only a clean Ctrl+C shutdown. Writes are atomic (temp + rename).
+  rclcpp::TimerBase::SharedPtr kfdb_autosave_timer_;
+  double kfdb_auto_save_interval_ = 30.0; // seconds (0 = disabled)
+  std::mutex kfdb_file_mutex_;            // serializes KFDB disk writes (timer / service / shutdown)
+
   // Corrected keyframe poses from lio_sam_opt (for corrected KFDB)
   rclcpp::Subscription<geometry_msgs::msg::PoseArray>::SharedPtr corrected_kf_poses_sub_;
   std::vector<geometry_msgs::msg::Pose> corrected_kf_poses_;

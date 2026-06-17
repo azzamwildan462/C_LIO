@@ -14,65 +14,12 @@
 
 #include <fstream>
 #include <filesystem>
+#include <system_error>
 #include <cmath>
 #include <algorithm>
 
 namespace dlio::kfdb
 {
-
-  namespace
-  {
-    // v5: serialize a single body-frame scan as:
-    //   uint32 num_points
-    //   float32 xyzi[4 * num_points]   (x, y, z, intensity)
-    void writeEntryScan(std::ofstream &ofs, const pcl::PointCloud<PointType>::Ptr &scan)
-    {
-      uint32_t n = 0;
-      if (scan && !scan->empty())
-        n = static_cast<uint32_t>(scan->size());
-      ofs.write(reinterpret_cast<const char *>(&n), sizeof(uint32_t));
-      if (n == 0)
-        return;
-      // Repack into an xyzi array — PointType may have padding or extra fields.
-      std::vector<float> buf(4 * static_cast<size_t>(n));
-      for (uint32_t i = 0; i < n; ++i)
-      {
-        const auto &pt = (*scan)[i];
-        buf[4 * i + 0] = pt.x;
-        buf[4 * i + 1] = pt.y;
-        buf[4 * i + 2] = pt.z;
-        buf[4 * i + 3] = pt.intensity;
-      }
-      ofs.write(reinterpret_cast<const char *>(buf.data()), buf.size() * sizeof(float));
-    }
-
-    void readEntryScan(std::ifstream &ifs, pcl::PointCloud<PointType>::Ptr &scan)
-    {
-      uint32_t n = 0;
-      ifs.read(reinterpret_cast<char *>(&n), sizeof(uint32_t));
-      if (n == 0)
-      {
-        scan.reset();
-        return;
-      }
-      std::vector<float> buf(4 * static_cast<size_t>(n));
-      ifs.read(reinterpret_cast<char *>(buf.data()), buf.size() * sizeof(float));
-      scan = std::make_shared<pcl::PointCloud<PointType>>();
-      scan->reserve(n);
-      for (uint32_t i = 0; i < n; ++i)
-      {
-        PointType pt;
-        pt.x = buf[4 * i + 0];
-        pt.y = buf[4 * i + 1];
-        pt.z = buf[4 * i + 2];
-        pt.intensity = buf[4 * i + 3];
-        scan->push_back(pt);
-      }
-      scan->width = n;
-      scan->height = 1;
-      scan->is_dense = false;
-    }
-  } // namespace
 
   std::string getKfdbPath(const std::string &map_path, bool use_corrected)
   {
@@ -106,13 +53,17 @@ namespace dlio::kfdb
     if (filepath.has_parent_path())
       std::filesystem::create_directories(filepath.parent_path());
 
-    std::ofstream ofs(path, std::ios::binary);
+    // Atomic snapshot write: serialize to a temp file, then rename over the
+    // real path. A crash/kill mid-write leaves the previous valid file intact
+    // (rename is atomic on the same filesystem) — never a half-written .kfdb.
+    const std::string tmp_path = path + ".tmp";
+    std::ofstream ofs(tmp_path, std::ios::binary);
     if (!ofs.is_open())
       return false;
 
     // Header (v4: v3 fields + per-entry gps_horizontal_accuracy + gps_status)
     uint32_t magic = 0x4B464442; // "KFDB"
-    uint32_t version = 5;
+    uint32_t version = 4;
     uint32_t sc_nr = dlio::sc::SC_NR;
     uint32_t sc_ns = dlio::sc::SC_NS;
     uint32_t num_entries = static_cast<uint32_t>(entries.size());
@@ -149,12 +100,23 @@ namespace dlio::kfdb
       // v4: GPS horizontal accuracy + status
       ofs.write(reinterpret_cast<const char *>(&entry.gps_horizontal_accuracy), sizeof(float));
       ofs.write(reinterpret_cast<const char *>(&entry.gps_status), sizeof(int8_t));
-
-      // v5: embedded body-frame scan (xyzi)
-      writeEntryScan(ofs, entry.scan);
     }
 
     ofs.close();
+    if (!ofs) // write/flush error — discard temp, keep previous file
+    {
+      std::error_code ec;
+      std::filesystem::remove(tmp_path, ec);
+      return false;
+    }
+
+    std::error_code ec;
+    std::filesystem::rename(tmp_path, path, ec);
+    if (ec)
+    {
+      std::filesystem::remove(tmp_path, ec);
+      return false;
+    }
     return true;
   }
 
@@ -184,12 +146,14 @@ namespace dlio::kfdb
     if (filepath.has_parent_path())
       std::filesystem::create_directories(filepath.parent_path());
 
-    std::ofstream ofs(kfdb_path, std::ios::binary);
+    // Atomic snapshot write (temp + rename) — see save() above.
+    const std::string tmp_path = kfdb_path + ".tmp";
+    std::ofstream ofs(tmp_path, std::ios::binary);
     if (!ofs.is_open())
       return false;
 
     uint32_t magic = 0x4B464442;
-    uint32_t version = 5;
+    uint32_t version = 4;
     uint32_t sc_nr = dlio::sc::SC_NR;
     uint32_t sc_ns = dlio::sc::SC_NS;
 
@@ -233,13 +197,23 @@ namespace dlio::kfdb
       // v4: GPS horizontal accuracy + status
       ofs.write(reinterpret_cast<const char *>(&entry.gps_horizontal_accuracy), sizeof(float));
       ofs.write(reinterpret_cast<const char *>(&entry.gps_status), sizeof(int8_t));
-
-      // v5: embedded body-frame scan (xyzi). Corrected-save reuses OdomNode's
-      // original (pre-correction) scan — only the pose is replaced.
-      writeEntryScan(ofs, entry.scan);
     }
 
     ofs.close();
+    if (!ofs) // write/flush error — discard temp, keep previous file
+    {
+      std::error_code ec;
+      std::filesystem::remove(tmp_path, ec);
+      return false;
+    }
+
+    std::error_code ec;
+    std::filesystem::rename(tmp_path, kfdb_path, ec);
+    if (ec)
+    {
+      std::filesystem::remove(tmp_path, ec);
+      return false;
+    }
     return true;
   }
 
@@ -263,7 +237,7 @@ namespace dlio::kfdb
       return false;
 
     ifs.read(reinterpret_cast<char *>(&version), sizeof(version));
-    if (version != 1 && version != 2 && version != 3 && version != 4 && version != 5)
+    if (version != 1 && version != 2 && version != 3 && version != 4)
       return false;
 
     ifs.read(reinterpret_cast<char *>(&sc_nr), sizeof(sc_nr));
@@ -333,12 +307,6 @@ namespace dlio::kfdb
         entry.gps_horizontal_accuracy = 0.f;
         entry.gps_status = entry.gps_valid ? static_cast<int8_t>(0) : static_cast<int8_t>(-1);
       }
-
-      // v5: embedded body-frame scan
-      if (version >= 5)
-        readEntryScan(ifs, entry.scan);
-      else
-        entry.scan.reset();
 
       database.push_back(std::move(entry));
     }

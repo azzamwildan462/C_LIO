@@ -1732,30 +1732,6 @@ void dlio::LioSamMapOptimizationNode::saveGraphMaps(const std::string &save_dir,
     {
         RCLCPP_ERROR(this->get_logger(), "[lio_sam_opt] FAILED to save: %s", corr_file.c_str());
     }
-
-    // Dump per-keyframe body-frame scans for offline map re-assembly.
-    // Parallel to _corrected.kfdb (written by OdomNode): same <stem>, sibling directory.
-    std::string scans_dir = save_dir + "/" + stem + "_kfscans";
-    std::filesystem::create_directories(scans_dir);
-    int dumped = 0;
-    int failed = 0;
-    for (int i = 0; i < num_kf; ++i)
-    {
-        if (!kf_snap[i].cloud_local || kf_snap[i].cloud_local->empty())
-        {
-            failed++;
-            continue;
-        }
-        char fname[32];
-        std::snprintf(fname, sizeof(fname), "kf_%06d.pcd", i);
-        std::string scan_path = scans_dir + "/" + fname;
-        if (pcl::io::savePCDFileBinary(scan_path, *kf_snap[i].cloud_local) == 0)
-            dumped++;
-        else
-            failed++;
-    }
-    RCLCPP_INFO(this->get_logger(), "[lio_sam_opt] Dumped %d/%d keyframe scans to %s (failed=%d)",
-                dumped, num_kf, scans_dir.c_str(), failed);
 }
 
 void dlio::LioSamMapOptimizationNode::autoSave()
