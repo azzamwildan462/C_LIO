@@ -25,8 +25,10 @@
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <sensor_msgs/msg/nav_sat_fix.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
+#include <std_msgs/msg/string.hpp>
 #include <direct_lidar_inertial_odometry/msg/keyframe_stamped.hpp>
 #include <direct_lidar_inertial_odometry/srv/save_pcd.hpp>
+#include <atomic>
 
 // PCL
 #include <pcl/common/centroid.h>
@@ -192,6 +194,11 @@ private:
 
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
   rclcpp::CallbackGroup::SharedPtr odom_cb_group_;
+
+  // Runtime mode mirror (from OdomNode's latched dlio/mode). When false
+  // (localization) all graph growth / loop closure / saving is paused.
+  rclcpp::Subscription<std_msgs::msg::String>::SharedPtr mode_sub_;
+  std::atomic<bool> mapping_active_{true};
 
   // Publishers
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr corrected_path_pub_;

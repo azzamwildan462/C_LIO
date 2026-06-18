@@ -378,6 +378,87 @@ void dlio::OdomNode::publishKeyframe(std::pair<std::pair<Eigen::Vector3f, Eigen:
   }
 }
 
+void dlio::OdomNode::publishMode()
+{
+  if (!this->mode_pub_)
+    return;
+  std_msgs::msg::String m;
+  m.data = this->map_mode_;
+  this->mode_pub_->publish(m);
+}
+
+void dlio::OdomNode::publishPriorMap()
+{
+  // Publish the cached, coarsely-downsampled map (cheap). RViz subscribers can
+  // be few; skip work when nobody is listening.
+  if (!this->prior_map_pub_ || !this->prior_map_debug_cloud_ || this->prior_map_debug_cloud_->empty())
+    return;
+  if (this->prior_map_pub_->get_subscription_count() == 0)
+    return;
+  auto msg = std::make_unique<sensor_msgs::msg::PointCloud2>();
+  pcl::toROSMsg(*this->prior_map_debug_cloud_, *msg);
+  msg->header.frame_id = this->map_frame_; // prior map is stored in the map frame
+  msg->header.stamp = this->get_clock()->now();
+  this->prior_map_pub_->publish(std::move(msg));
+}
+
+void dlio::OdomNode::applyModeTransition(const std::string &new_mode)
+{
+  // Wait for any in-flight async submap build before swapping the target type.
+  if (this->submap_future.valid())
+    this->submap_future.wait();
+
+  if (new_mode == "localization")
+  {
+    // Keyframing stays ON (like the previous working localization) for robust
+    // tracking; only saving is disabled below. No disk writes in localization.
+    this->keyframing_enabled_ = true;
+    this->submap_method_ = this->submap_method_param_;
+    this->roi_initialized_ = false;
+    this->submap_hasChanged = true;
+
+    if (this->kfdb_autosave_timer_)
+    {
+      this->kfdb_autosave_timer_->cancel();
+      this->kfdb_autosave_timer_.reset();
+    }
+    g_odom_node.store(nullptr); // disable atexit save in localization
+
+    // SC++ automatic correction
+    if (this->continuous_localize_ && this->use_prior_map_)
+    {
+      if (!this->continuous_localize_timer_)
+        this->continuous_localize_timer_ = this->create_wall_timer(
+            std::chrono::duration<double>(this->continuous_localize_interval_),
+            std::bind(&dlio::OdomNode::continuousLocalize, this));
+      if (!this->confidence_pub_)
+        this->confidence_pub_ = this->create_publisher<std_msgs::msg::Float32>("localization_confidence", 10);
+    }
+    RCLCPP_INFO(this->get_logger(), "[mode] localization: keyframing OFF, target=prior_map ROI, saving OFF");
+  }
+  else // mapping
+  {
+    this->keyframing_enabled_ = true;
+    this->submap_method_ = this->submap_method_param_; // restore configured method
+    this->submap_hasChanged = true;
+
+    // Resume periodic KFDB auto-save (atomic snapshot writes)
+    if (!this->kfdb_autosave_timer_ && !this->map_path_.empty() && this->kfdb_auto_save_interval_ > 0.)
+    {
+      g_odom_node.store(this);
+      this->kfdb_autosave_timer_ = this->create_wall_timer(
+          std::chrono::duration<double>(this->kfdb_auto_save_interval_),
+          [this]()
+          {
+            this->saveKeyframeDatabase();
+            this->saveCorrectedKeyframeDatabase();
+          });
+    }
+    RCLCPP_INFO(this->get_logger(), "[mode] mapping: keyframing ON, target=%s, auto-save ON",
+                this->submap_method_.c_str());
+  }
+}
+
 void dlio::OdomNode::srvSetMode(
     std::shared_ptr<direct_lidar_inertial_odometry::srv::SetMode::Request> req,
     std::shared_ptr<direct_lidar_inertial_odometry::srv::SetMode::Response> res)
@@ -443,15 +524,9 @@ void dlio::OdomNode::srvSetMode(
 
   this->map_mode_ = req->mode;
 
-  // Update atexit handler for mapping mode
-  if (req->mode == "mapping" && !this->map_path_.empty())
-  {
-    g_odom_node.store(this);
-  }
-  else
-  {
-    g_odom_node.store(nullptr);
-  }
+  // Runtime toggles: keyframing, registration target, auto-save timer,
+  // continuous-localization timer, atexit handler. Idempotent both ways.
+  this->applyModeTransition(req->mode);
 
   // If switching to mapping: seed kfdb_entries_ from loaded sc_database_
   // so that saves include all prior entries + new ones
@@ -528,6 +603,9 @@ void dlio::OdomNode::srvSetMode(
                   this->continuous_localize_interval_);
     }
   }
+
+  // Broadcast new mode so lio_sam_opt mirrors it at runtime (latched).
+  this->publishMode();
 
   res->success = true;
   res->message = "Mode changed from '" + old_mode + "' to '" + req->mode + "'";
@@ -657,6 +735,59 @@ void dlio::OdomNode::srvRelocalize(
 
   RCLCPP_INFO(this->get_logger(), "[Relocalize] %s — pos=[%.1f,%.1f,%.1f] yaw=%.1f fitness=%.4f",
               res->message.c_str(), res->x, res->y, res->z, res->yaw_deg, res->fitness_score);
+}
+
+void dlio::OdomNode::callbackInitialPose(
+    const geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr msg)
+{
+  // RViz "2D Pose Estimate". The click is only a GUESS — we don't snap to it.
+  // Instead we seed it as the relocalization hypothesis and let the existing
+  // SC+GICP path register against the prior map and apply the refined pose
+  // (or reject if the click landed somewhere the scan can't match).
+  if (this->map_mode_ != "localization")
+  {
+    RCLCPP_WARN(this->get_logger(), "[/initialpose] ignored — not in localization mode (current: %s)",
+                this->map_mode_.c_str());
+    return;
+  }
+
+  this->reloadPriorMapForRelocalization();
+  if (!this->prior_map_cloud_ || this->prior_map_cloud_->empty())
+  {
+    RCLCPP_WARN(this->get_logger(), "[/initialpose] ignored — no prior map loaded");
+    return;
+  }
+
+  const auto &p = msg->pose.pose.position;
+  const auto &q = msg->pose.pose.orientation;
+  Eigen::Quaternionf guess_q(static_cast<float>(q.w), static_cast<float>(q.x),
+                             static_cast<float>(q.y), static_cast<float>(q.z));
+  if (guess_q.norm() < 1e-6f)
+    guess_q = Eigen::Quaternionf::Identity();
+  guess_q.normalize();
+
+  {
+    std::lock_guard<std::mutex> lock(this->state_mtx_);
+    // RViz 2D Pose Estimate is planar — keep last known altitude for z.
+    this->initial_position_ = Eigen::Vector3f(static_cast<float>(p.x),
+                                              static_cast<float>(p.y),
+                                              this->state.p[2]);
+    this->state.q = guess_q; // base orientation for the yaw-sweep hypotheses
+  }
+
+  // Request a FRESH relocalization: the odometry thread will drop live keyframes,
+  // zero velocity/observer/map->odom, then refine ONLY around the click
+  // (guess-only) so SC matches can't override it. Doing the reset on the odom
+  // thread avoids racing the live keyframe/submap state.
+  this->use_prior_map_ = true;
+  this->request_fresh_reloc_.store(true);
+
+  double yaw_deg = std::atan2(2.f * (guess_q.w() * guess_q.z() + guess_q.x() * guess_q.y()),
+                              1.f - 2.f * (guess_q.y() * guess_q.y() + guess_q.z() * guess_q.z())) *
+                   180.0 / M_PI;
+  RCLCPP_INFO(this->get_logger(),
+              "[/initialpose] guess=[%.1f, %.1f] yaw=%.1f deg → refining against prior map",
+              p.x, p.y, yaw_deg);
 }
 
 void dlio::OdomNode::srvSetPose(
@@ -2131,7 +2262,7 @@ void dlio::OdomNode::continuousLocalize()
 
   if (accepted)
   {
-    if (this->debug_)
+    if (this->debug_ || this->deep_debug_)
       RCLCPP_INFO(this->get_logger(),
                   "[bayes] >>> ACCEPTED %s correction (dist=%.3fm, angle=%.1f deg, fitness=%.4f, confidence=%.2f, P_loop=%.3f)",
                   is_reloc ? "RELOCALIZATION" : "map->odom",

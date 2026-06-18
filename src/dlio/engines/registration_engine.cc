@@ -345,14 +345,28 @@ RegistrationResult RegistrationEngine::align(
     pcl::PointCloud<PointType>::ConstPtr source,
     pcl::PointCloud<PointType>::ConstPtr target,
     const Eigen::Matrix4f& initial_guess) {
-  setInputSource(source);
+  // The backend align(output) overloads start from IDENTITY (they don't take a
+  // guess), so we MUST apply initial_guess ourselves — otherwise relocalization
+  // ignores the seed and always converges to the same attractor. Pre-transform
+  // the source into the guessed frame, align (a small local refinement from
+  // there), then fold the guess back into the result.
+  pcl::PointCloud<PointType>::Ptr source_guessed = std::make_shared<pcl::PointCloud<PointType>>();
+  if (initial_guess.isApprox(Eigen::Matrix4f::Identity()))
+    *source_guessed = *source;
+  else
+    pcl::transformPointCloud(*source, *source_guessed, initial_guess);
+
+  setInputSource(source_guessed);
   setInputTarget(target);
   pcl::PointCloud<PointType> aligned;
   align(aligned);
+
   RegistrationResult result;
   result.converged = hasConverged();
   result.fitness = getFitnessScore(1.0);
-  result.transformation = getFinalTransformation();
+  // getFinalTransformation() maps source_guessed → target; compose the guess
+  // back so transformation maps the ORIGINAL source → target.
+  result.transformation = getFinalTransformation() * initial_guess;
   return result;
 }
 

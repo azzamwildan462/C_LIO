@@ -425,6 +425,30 @@ dlio::OdomNode::OdomNode(const rclcpp::NodeOptions &options)
         this->corrected_kf_poses_ = msg->poses;
       });
 
+  // RViz "2D Pose Estimate" → relocalization guess (refined against prior map).
+  // Always subscribed; the handler ignores it outside localization mode.
+  // Dedicated callback group so heavy localization timers (continuous/submap
+  // localize, sharing the default group) can't starve it — otherwise only the
+  // first click gets serviced and later clicks are silently dropped.
+  this->initialpose_cb_group_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+  rclcpp::SubscriptionOptions initialpose_opt;
+  initialpose_opt.callback_group = this->initialpose_cb_group_;
+  this->initialpose_sub_ = this->create_subscription<geometry_msgs::msg::PoseWithCovarianceStamped>(
+      "/initialpose", 10,
+      std::bind(&dlio::OdomNode::callbackInitialPose, this, std::placeholders::_1),
+      initialpose_opt);
+
+  // Mode broadcast so lio_sam_opt mirrors mapping/localization at runtime.
+  // Must be volatile: this container uses intra-process comms (transient_local
+  // is rejected there). Initial mode is synced via the map/mode param on both
+  // nodes; this topic only carries runtime SetMode changes (both nodes already up).
+  this->mode_pub_ = this->create_publisher<std_msgs::msg::String>(
+      "dlio/mode", rclcpp::QoS(10));
+
+  // Debug publisher for the loaded frozen map (RViz visualization).
+  this->prior_map_pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(
+      "dlio/prior_map", rclcpp::QoS(1));
+
   // Map load
   this->prior_map_pose_set_ = false;
   this->num_prior_keyframes_ = 0;
@@ -435,19 +459,57 @@ dlio::OdomNode::OdomNode(const rclcpp::NodeOptions &options)
 
   if (!this->map_path_.empty())
   {
-    // Check if file exists
-    std::ifstream f(this->map_path_);
-    if (f.good())
+    // A usable map exists if the raw .pcd is present, OR (when use_corrected)
+    // the _corrected.pcd is present. loadPriorMap() resolves which one to load.
+    bool map_exists = std::ifstream(this->map_path_).good();
+    if (!map_exists && this->use_corrected_)
     {
-      f.close();
+      size_t dot = this->map_path_.rfind(".pcd");
+      std::string corrected = (dot != std::string::npos)
+                                  ? this->map_path_.substr(0, dot) + "_corrected.pcd"
+                                  : this->map_path_ + "_corrected.pcd";
+      map_exists = std::ifstream(corrected).good();
+    }
+
+    if (map_exists)
+    {
       this->use_prior_map_ = true;
       this->loadPriorMap();
     }
     else
     {
-      RCLCPP_INFO(this->get_logger(), "No existing map at '%s', starting fresh",
+      RCLCPP_INFO(this->get_logger(), "No existing map at '%s' (or _corrected), starting fresh",
                   this->map_path_.c_str());
     }
+  }
+
+  // Debug: periodically publish the loaded frozen map for RViz (2D Pose Estimate).
+  if (this->use_prior_map_ && this->prior_map_pub_interval_ms_ > 0 &&
+      this->prior_map_cloud_ && !this->prior_map_cloud_->empty())
+  {
+    // Downsample ONCE to a coarse cache so each publish (and RViz) stays light.
+    this->prior_map_debug_cloud_ = std::make_shared<pcl::PointCloud<PointType>>();
+    if (this->prior_map_pub_leaf_ > this->map_voxel_size_)
+    {
+      pcl::VoxelGrid<PointType> vg;
+      float lf = static_cast<float>(this->prior_map_pub_leaf_);
+      vg.setLeafSize(lf, lf, lf);
+      vg.setInputCloud(this->prior_map_cloud_);
+      vg.filter(*this->prior_map_debug_cloud_);
+    }
+    else
+    {
+      *this->prior_map_debug_cloud_ = *this->prior_map_cloud_;
+    }
+    RCLCPP_INFO(this->get_logger(),
+                "[odom] Prior-map debug cloud: %zu -> %zu pts (leaf=%.2fm), publishing on "
+                "'dlio/prior_map' every %d ms",
+                this->prior_map_cloud_->size(), this->prior_map_debug_cloud_->size(),
+                this->prior_map_pub_leaf_, this->prior_map_pub_interval_ms_);
+
+    this->prior_map_pub_timer_ = this->create_wall_timer(
+        std::chrono::milliseconds(this->prior_map_pub_interval_ms_),
+        std::bind(&dlio::OdomNode::publishPriorMap, this));
   }
 
   // Continuous localization init (Bayesian)
@@ -541,6 +603,9 @@ dlio::OdomNode::OdomNode(const rclcpp::NodeOptions &options)
                   this->kfdb_auto_save_interval_);
     }
   }
+
+  // Broadcast the startup mode (latched) so lio_sam_opt mirrors it.
+  this->publishMode();
 }
 
 dlio::OdomNode::~OdomNode()
@@ -608,6 +673,13 @@ void dlio::OdomNode::getParams()
   dlio::declare_param(this, "odom/submap/keyframe/kcv", this->submap_kcv_, 10);
   dlio::declare_param(this, "odom/submap/keyframe/kcc", this->submap_kcc_, 10);
   dlio::declare_param(this, "odom/submap/recent/n", this->submap_recent_n_, 10);
+  // Remember the configured method; in localization the effective method is
+  // forced to "prior_map" (scan→frozen-map ROI) and restored on switch back.
+  this->submap_method_param_ = this->submap_method_;
+
+  // Localization prior-map ROI submap parameters
+  dlio::declare_param(this, "odom/localization/roi_radius", this->loc_roi_radius_, 60.0);
+  dlio::declare_param(this, "odom/localization/roi_refresh_dist", this->loc_roi_refresh_dist_, 5.0);
 
   // NOTE: voxel_hash_map allocation + engine compat check is done in the
   // constructor AFTER engine_.init() (see OdomNode::OdomNode), so that the
@@ -1051,6 +1123,16 @@ void dlio::OdomNode::getParams()
 
   // Map load/save
   dlio::declare_param(this, "map/mode", this->map_mode_, std::string("localization"));
+
+  // Localization behaves like the previous working version: keyframing ON, so
+  // the robot builds its own local submap (smooth, robust odometry even when
+  // started far from the prior map) and SC++ continuous-localize snaps it onto
+  // the prior map. Disabling keyframing made random-start localization float
+  // (only sparse prior chunks → bad registration). Memory grows during long
+  // runs — see the "recent_keyframes" submap method for a bounded option.
+  this->keyframing_enabled_ = true;
+  this->submap_method_ = this->submap_method_param_;
+
   dlio::declare_param(this, "map/tf_source", this->tf_map_odom_source_, std::string("odom"));
   dlio::declare_param(this, "map/path", this->map_path_, std::string(""));
   if (this->map_path_.empty())
@@ -1066,6 +1148,11 @@ void dlio::OdomNode::getParams()
   dlio::declare_param(this, "map/auto_save_interval", this->kfdb_auto_save_interval_, 30.0);
   dlio::declare_param(this, "map/voxel_size", this->map_voxel_size_, 0.25);
   dlio::declare_param(this, "map/chunk_size", this->map_chunk_size_, 20.0);
+  // Debug publish of the loaded frozen map (ms). -1 = disabled. Lets RViz show
+  // the map so you can drop a "2D Pose Estimate" (/initialpose) on it.
+  dlio::declare_param(this, "map/publish_debug_interval_ms", this->prior_map_pub_interval_ms_, -1);
+  // Downsample resolution for the debug map publish (m). Coarser = lighter RViz.
+  dlio::declare_param(this, "map/publish_debug_leaf", this->prior_map_pub_leaf_, 1.0);
 
   double init_x = 0., init_y = 0., init_z = 0., init_yaw = 0.;
   dlio::declare_param(this, "map/initial_pose/x", init_x, 0.0);

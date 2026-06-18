@@ -11,6 +11,23 @@
 
 #include "rclcpp/qos.hpp"
 
+void dlio::OdomNode::resetGtsamNavState()
+{
+  // Re-seed the GTSAM preintegration nav state from the current state so the
+  // IMU thread predicts forward from the (relocalized/corrected) pose instead
+  // of a stale one. Without this, after relocalization the IMU dead-reckoning
+  // keeps integrating from the old pose and "flies" the robot away.
+  if (this->imu_preintegration_mode_ != "gtsam" || !this->gtsam_imu_initialized_ || !this->imu_preintegration_)
+    return;
+  std::lock_guard<std::mutex> state_lock(this->state_mtx_);
+  this->gtsam_nav_state_ = gtsam::NavState(
+      gtsam::Pose3(gtsam::Rot3(this->state.q.cast<double>()), this->state.p.cast<double>()),
+      this->state.v.lin.w.cast<double>());
+  // Bias = zero because imu_meas is already bias-corrected in callbackImu()
+  this->gtsam_bias_ = gtsam::imuBias::ConstantBias();
+  this->imu_preintegration_->resetIntegrationAndSetBias(this->gtsam_bias_);
+}
+
 void dlio::OdomNode::getScanFromROS(const sensor_msgs::msg::PointCloud2::SharedPtr &pc)
 {
 
@@ -529,6 +546,69 @@ void dlio::OdomNode::callbackPointCloud(const sensor_msgs::msg::PointCloud2::Sha
     return;
   }
 
+  // Fresh relocalization request (RViz 2D Pose Estimate). Wipe live odometry
+  // state so the post-reloc submap can't collide with stale float-keyframes,
+  // then arm a guess-only relocalization around the clicked pose. Done here on
+  // the odometry thread so we don't race the keyframe/submap structures.
+  if (this->request_fresh_reloc_.exchange(false))
+  {
+    size_t kf_before = 0, kf_after = 0;
+    {
+      std::unique_lock<decltype(this->keyframes_mutex)> lock(this->keyframes_mutex);
+      kf_before = this->keyframes.size();
+      int keep = this->num_prior_keyframes_; // keep only the virtual prior-map keyframes
+      if (static_cast<int>(this->keyframes.size()) > keep)
+      {
+        this->keyframes.resize(keep);
+        this->keyframe_timestamps.resize(keep);
+        this->keyframe_normals.resize(keep);
+        this->keyframe_transformations.resize(keep);
+      }
+      this->num_processed_keyframes = keep;
+      kf_after = this->keyframes.size();
+    }
+    if (this->deep_debug_)
+      RCLCPP_INFO(this->get_logger(),
+                  "  [RELOC] fresh-reset: keyframes %zu->%zu (prior=%d), initial_position_=[%.2f,%.2f,%.2f]",
+                  kf_before, kf_after, this->num_prior_keyframes_,
+                  this->initial_position_[0], this->initial_position_[1], this->initial_position_[2]);
+    this->submap_kf_idx_prev.clear();
+    this->submap_kf_idx_curr.clear();
+    this->voxel_map_last_kf_idx_ = 0;
+
+    // Zero velocity / observer so stale motion can't fling the pose.
+    this->state.v.lin.w.setZero();
+    this->state.v.lin.b.setZero();
+    this->state.v.ang.w.setZero();
+    this->state.v.ang.b.setZero();
+    {
+      std::lock_guard<std::mutex> lock(this->geo.mtx);
+      this->geo.prev_vel = Eigen::Vector3f(0., 0., 0.);
+    }
+    {
+      std::lock_guard<std::mutex> lock(this->continuous_localize_mtx_);
+      this->T_map_odom_ = Eigen::Matrix4f::Identity();
+      this->bayes_posterior_.clear();
+      this->bayes_consecutive_accepts_ = 0;
+    }
+    // Stop the IMU thread from dead-reckoning off a stale (flung) nav state
+    // while relocalization runs.
+    this->resetGtsamNavState();
+
+    // Arm guess-only relocalization around the clicked pose.
+    this->relocalize_ = true;
+    this->relocalized_ = false;
+    this->reloc_guess_only_ = true;
+    this->prior_map_pose_set_ = false;
+    this->sc_attempt_count_ = 0;
+    this->last_reloc_fitness_ = -1.0;
+
+    RCLCPP_INFO(this->get_logger(),
+                "[/initialpose] fresh relocalization: live keyframes cleared, odom reset, "
+                "refining around [%.1f, %.1f]",
+                this->initial_position_[0], this->initial_position_[1]);
+  }
+
   // Scan Context Relocalization (retry up to sc_max_attempts_ scans)
   if (this->use_prior_map_ && this->relocalize_ && !this->relocalized_ && this->dlio_initialized && this->first_valid_scan)
   {
@@ -537,6 +617,14 @@ void dlio::OdomNode::callbackPointCloud(const sensor_msgs::msg::PointCloud2::Sha
 
     if (this->runRelocalization(this->current_scan))
     {
+      if (this->deep_debug_)
+        RCLCPP_INFO(this->get_logger(),
+                    "  [RELOC] callback sees state.p=[%.2f,%.2f,%.2f] yaw=%.1f (should match ACCEPT best_pos)",
+                    this->state.p[0], this->state.p[1], this->state.p[2],
+                    std::atan2(2.f * (this->state.q.w() * this->state.q.z() + this->state.q.x() * this->state.q.y()),
+                               1.f - 2.f * (this->state.q.y() * this->state.q.y() + this->state.q.z() * this->state.q.z())) *
+                        180.f / M_PI);
+
       // Scan Context matched — set pose
       this->T = Eigen::Matrix4f::Identity();
       this->T.block<3, 3>(0, 0) = this->state.q.toRotationMatrix();
@@ -560,6 +648,10 @@ void dlio::OdomNode::callbackPointCloud(const sensor_msgs::msg::PointCloud2::Sha
         this->geo.prev_q = this->state.q;
         this->geo.prev_vel = Eigen::Vector3f(0., 0., 0.);
       }
+
+      // Re-seed GTSAM nav state at the relocalized pose so the IMU thread does
+      // NOT keep dead-reckoning from the old pose and fling the robot away.
+      this->resetGtsamNavState();
 
       // Must set main_loop_running = false before buildSubmap to avoid deadlock
       this->main_loop_running = false;
@@ -620,6 +712,19 @@ void dlio::OdomNode::callbackPointCloud(const sensor_msgs::msg::PointCloud2::Sha
       this->lidarPose.q = this->state.q;
       this->prior_map_pose_set_ = true;
       this->relocalized_ = true;
+
+      // Zero velocity + re-seed GTSAM so the IMU thread doesn't fling the pose.
+      this->state.v.lin.w = Eigen::Vector3f(0., 0., 0.);
+      this->state.v.lin.b = Eigen::Vector3f(0., 0., 0.);
+      this->state.v.ang.w = Eigen::Vector3f(0., 0., 0.);
+      this->state.v.ang.b = Eigen::Vector3f(0., 0., 0.);
+      {
+        std::lock_guard<std::mutex> lock(this->geo.mtx);
+        this->geo.prev_p = this->state.p;
+        this->geo.prev_q = this->state.q;
+        this->geo.prev_vel = Eigen::Vector3f(0., 0., 0.);
+      }
+      this->resetGtsamNavState();
 
       this->main_loop_running = false;
 
@@ -708,7 +813,10 @@ void dlio::OdomNode::callbackPointCloud(const sensor_msgs::msg::PointCloud2::Sha
   if (this->use_prior_map_ && this->prev_scan_stamp == 0.)
   {
     this->prev_scan_stamp = this->scan_stamp;
-    this->initializeInputTarget();
+    // In localization we don't add live keyframes; buildKeyframesAndSubmap still
+    // builds the prior-map ROI target below.
+    if (this->keyframing_enabled_)
+      this->initializeInputTarget();
     this->main_loop_running = false;
     this->submap_future =
         std::async(std::launch::async, &dlio::OdomNode::buildKeyframesAndSubmap, this, this->state);
@@ -763,16 +871,7 @@ void dlio::OdomNode::callbackPointCloud(const sensor_msgs::msg::PointCloud2::Sha
   }
 
   // Reset GTSAM preintegration with corrected state (after LiDAR correction)
-  if (this->imu_preintegration_mode_ == "gtsam" && this->gtsam_imu_initialized_ && this->imu_preintegration_)
-  {
-    std::lock_guard<std::mutex> state_lock(this->state_mtx_);
-    this->gtsam_nav_state_ = gtsam::NavState(
-        gtsam::Pose3(gtsam::Rot3(this->state.q.cast<double>()), this->state.p.cast<double>()),
-        this->state.v.lin.w.cast<double>());
-    // Bias = zero because imu_meas is already bias-corrected in callbackImu()
-    this->gtsam_bias_ = gtsam::imuBias::ConstantBias();
-    this->imu_preintegration_->resetIntegrationAndSetBias(this->gtsam_bias_);
-  }
+  this->resetGtsamNavState();
 
   if (this->deep_debug_)
     RCLCPP_INFO(this->get_logger(), "[DEEP] gate=%s, updateState done",

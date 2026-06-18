@@ -1,7 +1,7 @@
 /**:
   ros__parameters:
     # ---- Map Correction (master switch for loop closure + GPS factors) ----
-    map_correction: true # false = odometry-only graph (no LC, no GPS correction)
+    map_correction: false # false = odometry-only graph (no LC, no GPS correction)
     debug/print_lio_sam_opt: false # printf dashboard with GPS, fused pose, LC stats
 
     # ---- Loop Closure Detection (LIO-SAM style: distance-based KD-tree) ----

@@ -113,12 +113,28 @@ dlio::LioSamMapOptimizationNode::LioSamMapOptimizationNode(const rclcpp::NodeOpt
         std::bind(&dlio::LioSamMapOptimizationNode::publishCorrectedData, this));
 
     // --- Auto-save timer ---
-    if (this->map_mode_ == "mapping" && !this->map_path_.empty() && this->auto_save_interval_ > 0.)
+    // Created regardless of mode; autoSave() itself no-ops while in localization
+    // (mapping_active_ == false) so runtime mode switches need no timer churn.
+    if (!this->map_path_.empty() && this->auto_save_interval_ > 0.)
     {
         this->auto_save_timer_ = this->create_wall_timer(
             std::chrono::duration<double>(this->auto_save_interval_),
             std::bind(&dlio::LioSamMapOptimizationNode::autoSave, this));
     }
+
+    // --- Runtime mode mirror (latched dlio/mode from OdomNode) ---
+    this->mapping_active_.store(this->map_mode_ == "mapping");
+    this->mode_sub_ = this->create_subscription<std_msgs::msg::String>(
+        "dlio/mode", rclcpp::QoS(10),
+        [this](const std_msgs::msg::String::SharedPtr msg)
+        {
+            bool active = (msg->data == "mapping");
+            bool prev = this->mapping_active_.exchange(active);
+            this->map_mode_ = msg->data;
+            if (prev != active)
+                RCLCPP_INFO(this->get_logger(), "[lio_sam_opt] mode → %s (graph/LC/save %s)",
+                            msg->data.c_str(), active ? "ACTIVE" : "PAUSED");
+        });
 
     RCLCPP_INFO(this->get_logger(),
                 "[lio_sam_opt] Initialized (iSAM2, lc_radius=%.1fm, lc_time_diff=%.1fs, "
@@ -324,6 +340,11 @@ Eigen::Isometry3d dlio::LioSamMapOptimizationNode::gtsamPoseToIsometry(const gts
 void dlio::LioSamMapOptimizationNode::callbackKeyframe(
     const direct_lidar_inertial_odometry::msg::KeyframeStamped::SharedPtr msg)
 {
+    // Localization: pause graph growth. (OdomNode also stops emitting keyframes,
+    // but guard here too so a stray message can't extend the graph.)
+    if (!this->mapping_active_.load())
+        return;
+
     // Update KF timing prediction for adaptive GPS buffer
     {
         double kf_stamp = rclcpp::Time(msg->header.stamp).seconds();
@@ -1135,7 +1156,7 @@ void dlio::LioSamMapOptimizationNode::correctPoses()
 
 void dlio::LioSamMapOptimizationNode::loopClosureThread()
 {
-    if (this->map_mode_ != "mapping")
+    if (!this->mapping_active_.load())
         return;
 
     this->performLoopClosure();
@@ -1736,6 +1757,9 @@ void dlio::LioSamMapOptimizationNode::saveGraphMaps(const std::string &save_dir,
 
 void dlio::LioSamMapOptimizationNode::autoSave()
 {
+    // No disk writes while in localization mode.
+    if (!this->mapping_active_.load() || this->map_path_.empty())
+        return;
     std::filesystem::path map_fp(this->map_path_);
     std::string save_dir = map_fp.parent_path().string();
     if (save_dir.empty())
@@ -1837,7 +1861,7 @@ void dlio::LioSamMapOptimizationNode::debugPrint()
 
 void dlio::LioSamMapOptimizationNode::saveOnShutdown()
 {
-    if (this->map_mode_ != "mapping")
+    if (!this->mapping_active_.load())
         return;
     if (this->map_path_.empty())
         return;

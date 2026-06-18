@@ -64,12 +64,14 @@ namespace dlio
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/pose_array.hpp>
 #include <geometry_msgs/msg/twist_with_covariance_stamped.hpp>
+#include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
 #include <nav_msgs/msg/path.hpp>
 #include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/nav_sat_fix.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <std_msgs/msg/float32.hpp>
 #include <std_msgs/msg/bool.hpp>
+#include <std_msgs/msg/string.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
 #include <tf2_ros/transform_broadcaster.h>
 #include <tf2_ros/static_transform_broadcaster.h>
@@ -223,6 +225,9 @@ private:
   void buildSubmap(State vehicle_state);
   void buildKeyframesAndSubmap(State vehicle_state);
   void pauseSubmapBuildIfNeeded();
+  // Localization: build registration target as an ROI of the frozen prior map
+  // around the robot (prior_map_kdtree_ radiusSearch + sliced covariances).
+  bool buildPriorMapRoiSubmap(const State &vehicle_state);
 
   void loadPriorMap();
 
@@ -252,6 +257,16 @@ private:
   void clearAllMapData();
   bool callSavePCD();
   bool callSaveCorrectedPCD();
+
+  // Runtime mapping/localization helpers
+  void applyModeTransition(const std::string &new_mode); // toggle timers/keyframing/target
+  void publishMode();                                    // broadcast current mode (latched)
+  // RViz "2D Pose Estimate": seed clicked pose as a relocalization guess; the
+  // existing SC+GICP path refines it against the prior map and applies it.
+  void callbackInitialPose(const geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr msg);
+  // Re-seed GTSAM preintegration nav state from the current state (pose+vel) so
+  // the IMU thread predicts from the relocalized pose instead of a stale one.
+  void resetGtsamNavState();
   // Continuous localization (map→odom TF correction)
   void continuousLocalize();
   bool verifyLoopWithG2O(int loop_kf_idx,
@@ -373,12 +388,21 @@ private:
   std::vector<int> keyframe_concave;
 
   // Submap
-  std::string submap_method_;
+  std::string submap_method_;        // effective method (may be forced to "prior_map" in localization)
+  std::string submap_method_param_;  // configured value from params (restored when back to mapping)
   pcl::PointCloud<PointType>::ConstPtr submap_cloud;
   std::shared_ptr<const nano_gicp::CovarianceList> submap_normals;
   std::shared_ptr<const nanoflann::KdTreeFLANN<PointType>> submap_kdtree;
   std::unique_ptr<dlio::VoxelHashMap> voxel_map_;
   int voxel_map_last_kf_idx_ = 0;
+
+  // Prior-map ROI submap (localization): registration target = region of the
+  // frozen map around the robot, extracted via prior_map_kdtree_ radiusSearch.
+  // Rebuilt only when the robot moves > loc_roi_refresh_dist_ from last center.
+  Eigen::Vector3f last_roi_center_ = Eigen::Vector3f::Zero();
+  bool roi_initialized_ = false;
+  double loc_roi_radius_ = 60.0;       // ROI radius around robot (m)
+  double loc_roi_refresh_dist_ = 5.0;  // rebuild ROI after this much movement (m)
 
   std::vector<int> submap_kf_idx_curr;
   std::vector<int> submap_kf_idx_prev;
@@ -719,6 +743,35 @@ private:
   std::vector<dlio::AppearanceEntry> sc_database_;
   pcl::PointCloud<PointType>::Ptr prior_map_cloud_;
   std::shared_ptr<nanoflann::KdTreeFLANN<PointType>> prior_map_kdtree_;
+  // Per-point covariances of prior_map_cloud_ (indices aligned), computed once
+  // in loadPriorMap(). Sliced by radiusSearch indices to feed GICP ROI target.
+  std::shared_ptr<const nano_gicp::CovarianceList> prior_map_covariances_;
+
+  // Debug publish of the loaded frozen map (so RViz can show it for 2D Pose
+  // Estimate). interval <= 0 disables. Published in the map frame.
+  // The map is static, so we downsample ONCE to prior_map_debug_cloud_ and
+  // republish that cheap cached cloud (avoids re-filtering a huge map + keeps
+  // RViz light). prior_map_pub_leaf_ controls the debug resolution.
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr prior_map_pub_;
+  rclcpp::TimerBase::SharedPtr prior_map_pub_timer_;
+  int prior_map_pub_interval_ms_ = -1;
+  double prior_map_pub_leaf_ = 1.0;
+  pcl::PointCloud<PointType>::Ptr prior_map_debug_cloud_;
+  void publishPriorMap();
+
+  // Runtime mapping/localization switching: when false (localization), no new
+  // keyframes are created (prevents unbounded memory growth).
+  bool keyframing_enabled_ = true;
+
+  // When true, relocalization refines ONLY around initial_position_ (an explicit
+  // /initialpose click) and skips the global SC candidate search — so the user's
+  // clicked pose is authoritative instead of being outvoted by SC matches.
+  bool reloc_guess_only_ = false;
+
+  // Set by /initialpose; consumed on the odometry thread to do a FRESH start:
+  // drop live keyframes + zero velocity/observer, then relocalize around the
+  // click. Prevents stale float-keyframes/submap from "flinging" the pose.
+  std::atomic<bool> request_fresh_reloc_{false};
 
   // KFDB entries accumulated during mapping
   std::vector<dlio::AppearanceEntry> kfdb_entries_;
@@ -772,6 +825,14 @@ private:
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr global_correction_sub_;
   std::atomic<bool> enable_global_correction_{true};
   float last_confidence_{0.0f};
+
+  // Runtime mode broadcast (latched) — lio_sam_opt subscribes to mirror mode.
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr mode_pub_;
+  // RViz "2D Pose Estimate" → guess refined against the prior map, then applied.
+  // Dedicated callback group so it is never starved by the heavy localization
+  // timers (continuous/submap localize) that share the default group.
+  rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr initialpose_sub_;
+  rclcpp::CallbackGroup::SharedPtr initialpose_cb_group_;
 
   // Occupancy grid
   bool occupancy_grid_enabled_ = false;

@@ -5,15 +5,16 @@
 
 /**:
   ros__parameters:
-
     # --- Map general ---
-    map/mode: "mapping"                     # "mapping" or "localization"
-    map/path: ""                            # empty = defaults to $HOME/.ros/dlio_map.pcd
-    map/use_corrected: true                 # load graph-optimized _corrected files in localization mode
+    map/mode: "mapping" # "mapping" or "localization"
+    map/path: "" # empty = defaults to $HOME/.ros/dlio_map.pcd
+    map/use_corrected: true # load graph-optimized _corrected files in localization mode
     map/voxel_size: 0.25
     map/chunk_size: 20.0
     map/auto_save_interval: 30.0
     map/publish_interval: 5.0
+    map/publish_debug_interval_ms: 3000 # publish loaded frozen map to /dlio/prior_map for RViz; -1 = off
+    map/publish_debug_leaf: 2.0 # downsample (m) for the debug map publish; bigger = lighter RViz
     map/waitUntilMove: true
     map/dense/filtered: false
     map/sparse/leafSize: 0.75
@@ -30,7 +31,7 @@
     map/relocalize/sc_max_attempts: 10
     map/relocalize/sc_ground_height_threshold: 0.3
     map/relocalize/sc_search_window: 7
-    map/appearance_method: "sc++"           # "sc++", "sc++_cuda", "std", "std_cuda"
+    map/appearance_method: "sc++" # "sc++", "sc++_cuda", "std", "std_cuda"
 
     # --- Continuous localization (Bayesian) ---
     map/continuous_localize: true

@@ -71,6 +71,9 @@ void dlio::OdomNode::loadPriorMap()
     tmp_gicp.calculateSourceCovariances();
     all_covs = tmp_gicp.getSourceCovariances();
   }
+  // Persist for the localization ROI submap: indices align with prior_map_cloud_
+  // (same cloud, no further voxel filtering after this point).
+  this->prior_map_covariances_ = all_covs;
 
   // 4. Split into spatial grid chunks
   double cs = this->map_chunk_size_;
@@ -387,12 +390,29 @@ bool dlio::OdomNode::runRelocalization(pcl::PointCloud<PointType>::ConstPtr scan
   // Always try initial_position first (configured by user, likely correct)
   positions.push_back({this->initial_position_, 0.f});
 
-  for (int ci = 0; ci < num_candidates; ci++)
+  // Guess-only (explicit /initialpose click): the clicked pose is authoritative,
+  // so do NOT add SC candidates that could outvote it. Refine around the click
+  // only (with the yaw sweep below).
+  if (!this->reloc_guess_only_)
   {
-    const auto &cand = sc_candidates[ci];
-    Eigen::Vector3f pos = this->sc_database_[cand.db_idx].position;
-    float yaw = this->appearance_.shiftToYaw(cand.shift);
-    positions.push_back({pos, yaw});
+    for (int ci = 0; ci < num_candidates; ci++)
+    {
+      const auto &cand = sc_candidates[ci];
+      Eigen::Vector3f pos = this->sc_database_[cand.db_idx].position;
+      float yaw = this->appearance_.shiftToYaw(cand.shift);
+      positions.push_back({pos, yaw});
+    }
+  }
+  else
+  {
+    // Pure coarse→fine: the click is the single COARSE seed (already pushed
+    // above); registration does the FINE refinement (its convergence basin
+    // tolerates an imprecise click). No ring search, only a tiny yaw sweep
+    // (clicked-yaw ±15°). Result stays at/near the click, refined to the map.
+    RCLCPP_INFO(this->get_logger(),
+                "[/initialpose] guess-only (coarse→fine): seed=clicked pose [%.1f, %.1f], "
+                "clicked-yaw ±15°, registration refines (skipping %d SC matches)",
+                this->initial_position_[0], this->initial_position_[1], num_candidates);
   }
 
   RCLCPP_INFO(this->get_logger(),
@@ -410,8 +430,16 @@ bool dlio::OdomNode::runRelocalization(pcl::PointCloud<PointType>::ConstPtr scan
   Eigen::Matrix4f B2L_T = this->extrinsics.baselink2lidar_T;
   Eigen::Matrix4f L2B_T = B2L_T.inverse(); // baselink frame → lidar frame
 
-  // Yaw hypotheses: base yaw + {0, 60, 120, 180, 240, 300} degrees
-  const float yaw_offsets[] = {0.f, M_PI / 3.f, 2.f * M_PI / 3.f, M_PI, -2.f * M_PI / 3.f, -M_PI / 3.f};
+  // Yaw hypotheses: base yaw + {0, 60, 120, 180, 240, 300} degrees.
+  // Guess-only honors the clicked heading → tiny sweep (clicked yaw ±15°) and
+  // let registration refine the rest. SC relocalization sweeps all 6 to resolve
+  // an unknown heading.
+  const float deg15 = 15.f * M_PI / 180.f;
+  const float yaw_offsets_full[] = {0.f, M_PI / 3.f, 2.f * M_PI / 3.f, M_PI, -2.f * M_PI / 3.f, -M_PI / 3.f};
+  const float yaw_offsets_guess[] = {0.f, deg15, -deg15};
+  const float *yaw_offsets = this->reloc_guess_only_ ? yaw_offsets_guess : yaw_offsets_full;
+  const size_t num_yaw_offsets = this->reloc_guess_only_ ? std::size(yaw_offsets_guess)
+                                                         : std::size(yaw_offsets_full);
 
   for (size_t ci = 0; ci < positions.size(); ci++)
   {
@@ -461,8 +489,9 @@ bool dlio::OdomNode::runRelocalization(pcl::PointCloud<PointType>::ConstPtr scan
     }
 
     // Try multiple yaw hypotheses — fresh GICP per alignment to avoid state corruption
-    for (float yaw_offset : yaw_offsets)
+    for (size_t yi = 0; yi < num_yaw_offsets; ++yi)
     {
+      float yaw_offset = yaw_offsets[yi];
       float yaw = sc_yaw + yaw_offset;
 
       // Build init_guess = world_T_lidar = world_T_baselink * baselink_T_lidar
@@ -486,6 +515,19 @@ bool dlio::OdomNode::runRelocalization(pcl::PointCloud<PointType>::ConstPtr scan
         converged = reg_result.converged;
         fitness = reg_result.fitness;
         T_final = reg_result.transformation;
+      }
+
+      if (this->deep_debug_)
+      {
+        Eigen::Matrix4f wtb = T_final * L2B_T;
+        RCLCPP_INFO(this->get_logger(),
+                    "    [RELOC] cand%zu pos=[%.1f,%.1f] yaw=%.0f: init_guess_t=[%.1f,%.1f,%.1f] "
+                    "conv=%d fit=%.4f T_final_t=[%.1f,%.1f,%.1f] body_t=[%.1f,%.1f,%.1f]",
+                    ci, matched_pos[0], matched_pos[1], yaw * 180.f / M_PI,
+                    init_guess(0, 3), init_guess(1, 3), init_guess(2, 3),
+                    static_cast<int>(converged), fitness,
+                    T_final(0, 3), T_final(1, 3), T_final(2, 3),
+                    wtb(0, 3), wtb(1, 3), wtb(2, 3));
       }
 
       if (!converged)
@@ -517,9 +559,16 @@ accept_result:
   {
     RCLCPP_WARN(this->get_logger(),
                 "ScanContext: best GICP fitness %.4f > 0.5, rejecting (tried %zu positions x %zu yaws)",
-                best_fitness, positions.size(), std::size(yaw_offsets));
+                best_fitness, positions.size(), num_yaw_offsets);
     return false;
   }
+
+  if (this->deep_debug_)
+    RCLCPP_INFO(this->get_logger(),
+                "  [RELOC] ACCEPT best_candidate=%d best_pos=[%.2f,%.2f,%.2f] best_fit=%.4f | "
+                "baselink2lidar_t=[%.2f,%.2f,%.2f] (L2B_t=[%.2f,%.2f,%.2f])",
+                best_candidate, best_pos[0], best_pos[1], best_pos[2], best_fitness,
+                B2L_T(0, 3), B2L_T(1, 3), B2L_T(2, 3), L2B_T(0, 3), L2B_T(1, 3), L2B_T(2, 3));
 
   this->state.p = best_pos;
   this->origin = best_pos;
@@ -535,6 +584,7 @@ accept_result:
               best_pos[0], best_pos[1], best_pos[2],
               refined_yaw * 180.f / M_PI, best_fitness, best_candidate + 1, positions.size());
 
+  this->reloc_guess_only_ = false; // consumed; future auto-relocs may use SC again
   return true;
 }
 

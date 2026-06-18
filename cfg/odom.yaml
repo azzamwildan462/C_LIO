@@ -7,7 +7,7 @@
   ros__parameters:
     # --- Preprocessing ---
     odom/preprocessing/cropBoxFilter/size: 3.0
-    odom/preprocessing/voxelFilter/res: 1.0
+    odom/preprocessing/voxelFilter/res: 0.3
     odom/preprocessing/gpu: true # GPU deskewing + voxel grid filter (requires CUDA)
 
     # Prefilter (noise removal) — applied after deskewing
@@ -22,8 +22,14 @@
     odom/prefilter/dror_min_neighbors: 3
 
     # --- Registration ---
-    odom/registration_method: "gicp_cuda" # "gicp", "gicp_cuda", "ndt", "ndt_cuda", "robust_icp", "robust_icp_cuda"
-    odom/localization/registration_method: "gicp"
+    odom/registration_method: "ndt_cuda" # "gicp", "gicp_cuda", "ndt", "ndt_cuda", "robust_icp", "robust_icp_cuda"
+    odom/localization/registration_method: "ndt_cuda"
+
+    # Localization: scan→frozen-map ROI target (no keyframes, no memory growth).
+    # ROI = prior-map points within roi_radius of the robot; rebuilt only after
+    # the robot has moved roi_refresh_dist from the last ROI center.
+    odom/localization/roi_radius: 60.0 # meters (≈ sensor range + margin)
+    odom/localization/roi_refresh_dist: 5.0 # meters between ROI rebuilds
 
     # GICP
     odom/gicp/minNumPoints: 100

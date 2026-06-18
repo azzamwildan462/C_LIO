@@ -144,6 +144,11 @@ void dlio::OdomNode::computeConcaveHull()
 
 void dlio::OdomNode::updateKeyframes()
 {
+  // Localization: never create new keyframes. The registration target is the
+  // frozen prior-map ROI, so live keyframes are unnecessary and would grow
+  // memory unbounded.
+  if (!this->keyframing_enabled_)
+    return;
 
   // calculate difference in pose and rotation to all poses in trajectory
   float closest_d = std::numeric_limits<float>::infinity();
@@ -277,6 +282,13 @@ void dlio::OdomNode::pushSubmapIndices(std::vector<float> dists, int k, std::vec
 
 void dlio::OdomNode::buildSubmap(State vehicle_state)
 {
+  // Localization: target the frozen prior map directly (ROI around the robot),
+  // not a keyframe submap. No keyframe access, no growth.
+  if (this->submap_method_ == "prior_map")
+  {
+    this->buildPriorMapRoiSubmap(vehicle_state);
+    return;
+  }
 
   // clear vector of keyframe indices to use for submap
   this->submap_kf_idx_curr.clear();
@@ -414,6 +426,93 @@ void dlio::OdomNode::buildSubmap(State vehicle_state)
 
     this->submap_kf_idx_prev = this->submap_kf_idx_curr;
   }
+}
+
+bool dlio::OdomNode::buildPriorMapRoiSubmap(const State &vehicle_state)
+{
+  if (!this->prior_map_cloud_ || this->prior_map_cloud_->empty() || !this->prior_map_kdtree_)
+  {
+    this->submap_hasChanged = false;
+    return false;
+  }
+
+  // Rebuild only when the robot has moved enough from the last ROI center.
+  // NOTE: do NOT clear submap_hasChanged here — getNextPose() consumes it after
+  // registering the target. Clearing it would drop the very first registration
+  // (target gets built on engine_temp_ but never propagated to engine_).
+  if (this->roi_initialized_)
+  {
+    double moved = (vehicle_state.p - this->last_roi_center_).norm();
+    if (moved < this->loc_roi_refresh_dist_)
+      return true; // keep current target; leave submap_hasChanged untouched
+  }
+
+  PointType center;
+  center.x = vehicle_state.p[0];
+  center.y = vehicle_state.p[1];
+  center.z = vehicle_state.p[2];
+
+  std::vector<int> idx;
+  std::vector<float> dist_sq;
+  const float r2 = static_cast<float>(this->loc_roi_radius_ * this->loc_roi_radius_);
+  this->prior_map_kdtree_->radiusSearch(center, r2, idx, dist_sq);
+
+  if (idx.size() < 50)
+  {
+    RCLCPP_WARN(this->get_logger(),
+                "[loc] prior-map ROI has only %zu pts around (%.1f, %.1f) — keeping previous target",
+                idx.size(), center.x, center.y);
+    this->submap_hasChanged = false;
+    return this->roi_initialized_; // fail only if we never built a target
+  }
+
+  // Build ROI cloud + matching covariances (sliced from precomputed map covs).
+  pcl::PointCloud<PointType>::Ptr roi = std::make_shared<pcl::PointCloud<PointType>>();
+  roi->points.resize(idx.size());
+
+  const bool need_cov = this->engine_.needsCovariances();
+  const bool have_precomputed =
+      this->prior_map_covariances_ &&
+      this->prior_map_covariances_->size() == this->prior_map_cloud_->size();
+
+  std::shared_ptr<nano_gicp::CovarianceList> roi_covs;
+  if (need_cov && have_precomputed)
+    roi_covs = std::make_shared<nano_gicp::CovarianceList>(idx.size());
+
+  for (size_t j = 0; j < idx.size(); ++j)
+  {
+    roi->points[j] = this->prior_map_cloud_->points[idx[j]];
+    if (need_cov && have_precomputed)
+      (*roi_covs)[j] = (*this->prior_map_covariances_)[idx[j]];
+  }
+  roi->width = roi->points.size();
+  roi->height = 1;
+  roi->is_dense = true;
+
+  // Defensive fallback: if covariances are needed but weren't precomputed,
+  // compute them on the ROI (mirrors loadPriorMap()).
+  if (need_cov && !have_precomputed)
+  {
+    nano_gicp::NanoGICP<PointType, PointType> tmp_gicp;
+    tmp_gicp.setCorrespondenceRandomness(this->gicp_k_correspondences_);
+    tmp_gicp.setInputSource(roi);
+    tmp_gicp.calculateSourceCovariances();
+    auto covs = tmp_gicp.getSourceCovariances();
+    roi_covs = std::make_shared<nano_gicp::CovarianceList>(*covs);
+  }
+
+  this->submap_cloud = roi;
+  if (need_cov)
+    this->submap_normals = roi_covs;
+
+  this->engine_temp_.setInputTarget(this->submap_cloud);
+  if (this->engine_temp_.needsKdTree())
+    this->submap_kdtree = this->engine_temp_.getTargetKdTree();
+
+  this->last_roi_center_ = vehicle_state.p;
+  this->roi_initialized_ = true;
+  this->submap_hasChanged = true;
+  return true;
 }
 
 void dlio::OdomNode::buildKeyframesAndSubmap(State vehicle_state)
