@@ -56,6 +56,9 @@ void dlio::OdomNode::getNextPose()
   this->T_corr = this->engine_.getFinalTransformation();
   this->last_fitness_ = this->engine_.getFitnessScore(1.0);
   this->gicp_hasConverged = this->engine_.hasConverged();
+  // NOTE: last_fitness_ here is scan↔submap (the robot's OWN keyframes), so it
+  // stays low even when the pose is WRONG relative to the map. The real
+  // scan↔prior-map match score is published from continuousLocalize() instead.
 
   if (this->deep_debug_)
     RCLCPP_INFO(this->get_logger(), "[DEEP] getNextPose: align done, fitness=%.4f", this->last_fitness_);

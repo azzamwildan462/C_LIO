@@ -410,8 +410,9 @@ void dlio::OdomNode::applyModeTransition(const std::string &new_mode)
 
   if (new_mode == "localization")
   {
-    // Keyframing stays ON (like the previous working localization) for robust
-    // tracking; only saving is disabled below. No disk writes in localization.
+    // Keyframe-growth (keyframing ON): robot builds its own submap → immune to
+    // flying even before map alignment; relocalization + SC++ snap it to the map.
+    // Only saving is disabled below.
     this->keyframing_enabled_ = true;
     this->submap_method_ = this->submap_method_param_;
     this->roi_initialized_ = false;
@@ -430,7 +431,8 @@ void dlio::OdomNode::applyModeTransition(const std::string &new_mode)
       if (!this->continuous_localize_timer_)
         this->continuous_localize_timer_ = this->create_wall_timer(
             std::chrono::duration<double>(this->continuous_localize_interval_),
-            std::bind(&dlio::OdomNode::continuousLocalize, this));
+            std::bind(&dlio::OdomNode::continuousLocalize, this),
+            this->continuous_localize_cb_group_);
       if (!this->confidence_pub_)
         this->confidence_pub_ = this->create_publisher<std_msgs::msg::Float32>("localization_confidence", 10);
     }
@@ -452,7 +454,8 @@ void dlio::OdomNode::applyModeTransition(const std::string &new_mode)
           {
             this->saveKeyframeDatabase();
             this->saveCorrectedKeyframeDatabase();
-          });
+          },
+          this->aux_timer_cb_group_);
     }
     RCLCPP_INFO(this->get_logger(), "[mode] mapping: keyframing ON, target=%s, auto-save ON",
                 this->submap_method_.c_str());
@@ -575,7 +578,8 @@ void dlio::OdomNode::srvSetMode(
     {
       this->continuous_localize_timer_ = this->create_wall_timer(
           std::chrono::duration<double>(this->continuous_localize_interval_),
-          std::bind(&dlio::OdomNode::continuousLocalize, this));
+          std::bind(&dlio::OdomNode::continuousLocalize, this),
+          this->continuous_localize_cb_group_);
 
       if (!this->confidence_pub_)
         this->confidence_pub_ = this->create_publisher<std_msgs::msg::Float32>("localization_confidence", 10);
@@ -766,12 +770,36 @@ void dlio::OdomNode::callbackInitialPose(
     guess_q = Eigen::Quaternionf::Identity();
   guess_q.normalize();
 
+  // RViz 2D Pose Estimate is planar (no z). DO NOT inherit the live state z —
+  // if the robot has "flown" (z way off), that poisons the seed and reloc can't
+  // align (scan ends up far below/above the map → inf fitness). Instead pull z
+  // from the MAP: the nearest prior-map point at the clicked (x, y). This makes
+  // /initialpose a reliable recovery regardless of how badly the pose drifted.
+  float seed_z = 0.f;
+  {
+    PointType qp;
+    qp.x = static_cast<float>(p.x);
+    qp.y = static_cast<float>(p.y);
+    qp.z = 0.f;
+    std::vector<int> kidx;
+    std::vector<float> kdist;
+    if (this->prior_map_kdtree_ &&
+        this->prior_map_kdtree_->nearestKSearch(qp, 30, kidx, kdist) > 0)
+    {
+      // median z of the nearest map points ≈ ground level at (x, y)
+      std::vector<float> zs;
+      zs.reserve(kidx.size());
+      for (int id : kidx)
+        zs.push_back(this->prior_map_cloud_->points[id].z);
+      std::nth_element(zs.begin(), zs.begin() + zs.size() / 2, zs.end());
+      seed_z = zs[zs.size() / 2];
+    }
+  }
+
   {
     std::lock_guard<std::mutex> lock(this->state_mtx_);
-    // RViz 2D Pose Estimate is planar — keep last known altitude for z.
     this->initial_position_ = Eigen::Vector3f(static_cast<float>(p.x),
-                                              static_cast<float>(p.y),
-                                              this->state.p[2]);
+                                              static_cast<float>(p.y), seed_z);
     this->state.q = guess_q; // base orientation for the yaw-sweep hypotheses
   }
 
@@ -1308,9 +1336,15 @@ void dlio::OdomNode::publishEarthToMapTF()
 
 void dlio::OdomNode::continuousLocalize()
 {
-  // Prerequisites
-  if (!this->dlio_initialized || !this->relocalized_)
+  // Need at least an initialized pipeline (scans flowing). The relocalized_
+  // gate is applied LATER (after the match score) so the score still publishes
+  // when the robot is NOT yet localized — that's exactly when you want to see a
+  // high residual ("I'm lost"). Only the SC++ correction needs relocalized_.
+  if (!this->dlio_initialized)
     return;
+  if (this->deep_debug_)
+    RCLCPP_INFO(this->get_logger(), "[loc] continuousLocalize tick (relocalized=%d)",
+                static_cast<int>(this->relocalized_));
 
   // Brief lock: copy shared state, then release for heavy computation
   std::vector<dlio::AppearanceEntry> sc_snap;
@@ -1323,8 +1357,8 @@ void dlio::OdomNode::continuousLocalize()
     std::lock_guard<std::mutex> cl_lock(this->continuous_localize_mtx_);
     if (!this->prior_map_cloud_ || !this->prior_map_kdtree_)
       return;
-    if (this->sc_database_.empty())
-      return;
+    // NB: do NOT early-return on empty sc_database_ here — the match score below
+    // only needs the map+scan+pose; the SC correction checks sc_snap later.
     sc_snap = this->sc_database_;
     bayes_snap = this->bayes_posterior_;
     T_map_odom_snap = this->T_map_odom_;
@@ -1349,13 +1383,55 @@ void dlio::OdomNode::continuousLocalize()
     return;
   }
 
-  // Skip if scan is stale (no new data arriving)
+  // ── scan↔PRIOR-MAP match score at the CURRENT pose (no GICP refinement) ──
+  // This is what actually tells "is my pose correct?": transform the live scan
+  // to the map frame with the current pose and measure how far its points are
+  // from the prior map. Pose correct → scan overlaps map → low; pose wrong →
+  // high. (The per-scan odometry fitness can't tell — it matches the robot's
+  // own keyframes, so it stays low even at a wrong pose.) Published as raw
+  // mean residual in metres (ICP-style: lower = better).
+  if (this->scan_match_pub_)
+  {
+    Eigen::Matrix4f T_map_body = T_map_odom_snap * T_odom_body;
+    pcl::PointCloud<PointType> scan_map;
+    pcl::transformPointCloud(*scan_body, scan_map, T_map_body);
+    std::vector<int> nn_idx(1);
+    std::vector<float> nn_dist(1);
+    const float cap = 3.0f; // clamp per-point distance so outliers don't dominate
+    const int step = std::max(1, static_cast<int>(scan_map.size()) / 3000); // subsample for speed
+    double sum = 0.0;
+    int cnt = 0;
+    for (size_t i = 0; i < scan_map.size(); i += step)
+    {
+      const auto &pt = scan_map[i];
+      if (!std::isfinite(pt.x))
+        continue;
+      if (prior_kdtree_snap->nearestKSearch(pt, 1, nn_idx, nn_dist) > 0)
+      {
+        sum += std::min(std::sqrt(nn_dist[0]), cap); // nn_dist is squared
+        ++cnt;
+      }
+    }
+    if (cnt > 0)
+    {
+      std_msgs::msg::Float32 sm;
+      sm.data = static_cast<float>(sum / cnt);
+      this->scan_match_pub_->publish(sm);
+      if (this->debug_ || this->deep_debug_)
+        RCLCPP_INFO(this->get_logger(), "[loc] scan↔map residual=%.3fm (%d pts)", sm.data, cnt);
+    }
+  }
+
+  // ---- below: SC++/GPS correction (the match score above is already published) ----
+  // Correction only once we have a pose to correct, a fresh scan, and SC data.
+  if (!this->relocalized_)
+    return;
   double now_sec = this->now().seconds();
   double scan_age = now_sec - scan_time;
   if (scan_time > 0.0 && scan_age > 3.0 * this->continuous_localize_interval_)
-  {
     return;
-  }
+  if (sc_snap.empty())
+    return;
 
   const int N = static_cast<int>(sc_snap.size());
 

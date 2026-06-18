@@ -457,13 +457,23 @@ bool dlio::OdomNode::buildPriorMapRoiSubmap(const State &vehicle_state)
   const float r2 = static_cast<float>(this->loc_roi_radius_ * this->loc_roi_radius_);
   this->prior_map_kdtree_->radiusSearch(center, r2, idx, dist_sq);
 
+  // Fallback: if the robot is at the edge of / outside the map, radiusSearch
+  // returns too few points. Grab the K nearest map points instead so the target
+  // is NEVER empty (this is what made the KNN keyframe submap robust). The pose
+  // will then be pulled back toward the map by registration / relocalization.
   if (idx.size() < 50)
   {
+    const int k = 20000; // ~ a dense local region; capped by cloud size
+    int found = this->prior_map_kdtree_->nearestKSearch(
+        center, std::min<int>(k, static_cast<int>(this->prior_map_cloud_->size())), idx, dist_sq);
     RCLCPP_WARN(this->get_logger(),
-                "[loc] prior-map ROI has only %zu pts around (%.1f, %.1f) — keeping previous target",
-                idx.size(), center.x, center.y);
-    this->submap_hasChanged = false;
-    return this->roi_initialized_; // fail only if we never built a target
+                "[loc] prior-map ROI sparse around (%.1f, %.1f) — using %d nearest map points instead",
+                center.x, center.y, found);
+    if (idx.size() < 50)
+    {
+      this->submap_hasChanged = false;
+      return this->roi_initialized_;
+    }
   }
 
   // Build ROI cloud + matching covariances (sliced from precomputed map covs).
@@ -585,6 +595,47 @@ void dlio::OdomNode::buildKeyframesAndSubmap(State vehicle_state)
   this->buildSubmap(vehicle_state);
   if (this->deep_debug_)
     RCLCPP_INFO(this->get_logger(), "[DEEP] buildKF&Submap: buildSubmap done");
+
+  // Bound memory in localization: free old live-keyframe clouds/covariances.
+  this->pruneLocalizationKeyframes();
+}
+
+void dlio::OdomNode::pruneLocalizationKeyframes()
+{
+  // Only in localization (mapping needs all keyframes for the saved map) and
+  // when a window is set. Free clouds + covariances of live keyframes older
+  // than the recent window; keep their poses (tiny) so indices stay stable.
+  // The prior-map virtual keyframes (idx < num_prior_keyframes_) are never
+  // touched, and recent live keyframes keep full data — so the KNN submap and
+  // odometry are unaffected, but memory stays bounded.
+  if (this->map_mode_ != "localization" || this->loc_keyframe_window_ <= 0)
+    return;
+
+  std::unique_lock<decltype(this->keyframes_mutex)> lock(this->keyframes_mutex);
+  const int n_total = static_cast<int>(this->keyframes.size());
+  const int first_live = this->num_prior_keyframes_;
+  const int keep_from = n_total - this->loc_keyframe_window_; // keep [keep_from, n_total)
+  if (keep_from <= first_live)
+    return; // nothing old enough to prune
+
+  int freed = 0;
+  auto empty_cloud = std::make_shared<pcl::PointCloud<PointType>>();
+  for (int i = first_live; i < keep_from; ++i)
+  {
+    if (this->keyframes[i].second && !this->keyframes[i].second->empty())
+    {
+      this->keyframes[i].second = empty_cloud; // shared empty placeholder
+      ++freed;
+    }
+    if (i < static_cast<int>(this->keyframe_normals.size()) && this->keyframe_normals[i])
+      this->keyframe_normals[i] = nullptr;
+  }
+  lock.unlock();
+
+  if (freed > 0 && this->deep_debug_)
+    RCLCPP_INFO(this->get_logger(),
+                "[loc] pruned %d old keyframe clouds (kept last %d live + %d prior)",
+                freed, this->loc_keyframe_window_, first_live);
 }
 
 void dlio::OdomNode::pauseSubmapBuildIfNeeded()

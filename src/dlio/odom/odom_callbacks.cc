@@ -575,6 +575,7 @@ void dlio::OdomNode::callbackPointCloud(const sensor_msgs::msg::PointCloud2::Sha
     this->submap_kf_idx_prev.clear();
     this->submap_kf_idx_curr.clear();
     this->voxel_map_last_kf_idx_ = 0;
+    this->roi_initialized_ = false; // rebuild prior-map ROI at the relocalized pose
 
     // Zero velocity / observer so stale motion can't fling the pose.
     this->state.v.lin.w.setZero();

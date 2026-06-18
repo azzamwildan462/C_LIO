@@ -9,7 +9,7 @@
     map/mode: "mapping" # "mapping" or "localization"
     map/path: "" # empty = defaults to $HOME/.ros/dlio_map.pcd
     map/use_corrected: true # load graph-optimized _corrected files in localization mode
-    map/voxel_size: 0.25
+    map/voxel_size: 0.5 # was 0.25 — too dense (submap ~618k pts → GICP ~400ms/scan → jitter, + huge RAM). Live scan is 1.0m so 0.5 map is plenty. Cuts submap size & prior-map memory ~4x.
     map/chunk_size: 20.0
     map/auto_save_interval: 30.0
     map/publish_interval: 5.0
@@ -36,9 +36,9 @@
     # --- Continuous localization (Bayesian) ---
     map/continuous_localize: true
     map/continuous_localize/on_mapping: false
-    map/continuous_localize/interval: 2.0
-    map/continuous_localize/fitness_threshold: 0.10
-    map/continuous_localize/virtual_place_prior: 0.8
+    map/continuous_localize/interval: 1.0 # was 2.0 — faster auto-correction (own callback group now, not blocked). Global SC++ reloc needs ~3 ticks → ~3s instead of 6s.
+    map/continuous_localize/fitness_threshold: 0.30 # was 0.10 — too strict; scan-to-prior-map GICP fitness is ~0.2-0.3, so 0.10 rejected ALL corrections (SC++ never corrected). Bayes filter + g2o still gate bad matches.
+    map/continuous_localize/virtual_place_prior: 0.3 # was 0.8 — prior of being in a NEW place. In localization we're ALWAYS in the map, so 0.8 kept P_loop ~0.2 < thr 0.5 → SC++ never promoted a correction. Low prior → P_loop high → SC++ corrects.
     map/continuous_localize/loop_threshold: 0.5
     map/continuous_localize/min_consecutive: 2
     map/continuous_localize/max_correction: 2000.0
@@ -46,11 +46,15 @@
     map/continuous_localize/sc_distance_threshold: 1.0
     map/continuous_localize/sc_top_k: 3
     map/continuous_localize/g2o_verification: true
-    map/continuous_localize/g2o_chi2_threshold: 1.0
+    map/continuous_localize/g2o_chi2_threshold: 10.0 # was 1.0 — too strict, likely rejected all drift corrections (SC++ never corrected)
     map/continuous_localize/g2o_iterations: 10
 
     # --- Submap localization (GPS-denied) ---
-    map/submap_localize: true
+    # OFF: redundant with SC++ continuousLocalize + /initialpose, and its
+    # concurrent timer raced shared scan/submap buffers with the odom thread →
+    # heap corruption crash (garbage out-of-range index) once timers ran in
+    # parallel callback groups. Re-enable only if its thread-safety is fixed.
+    map/submap_localize: false
     map/submap_localize/interval: 1.0
     map/submap_localize/group_size: 10
     map/submap_localize/search_radius: 50.0

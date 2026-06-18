@@ -102,8 +102,16 @@ dlio::OdomNode::OdomNode(const rclcpp::NodeOptions &options)
 
   this->br = std::make_shared<tf2_ros::TransformBroadcaster>(*this);
 
+  // Per-timer callback groups (see odom.h) so the heavy localization timers and
+  // the 100Hz publish timer don't serialize in the default group.
+  this->continuous_localize_cb_group_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+  this->submap_loc_cb_group_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+  this->fast_pub_cb_group_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+  this->aux_timer_cb_group_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+
   this->publish_timer = this->create_wall_timer(std::chrono::duration<double>(0.01),
-                                                std::bind(&dlio::OdomNode::publishPose, this));
+                                                std::bind(&dlio::OdomNode::publishPose, this),
+                                                this->fast_pub_cb_group_);
 
   // Occupancy grid publisher + timer
   if (this->occupancy_grid_enabled_)
@@ -116,7 +124,8 @@ dlio::OdomNode::OdomNode(const rclcpp::NodeOptions &options)
 
     this->occupancy_grid_timer_ = this->create_wall_timer(
         std::chrono::duration<double>(1.0 / og_rate),
-        std::bind(&dlio::OdomNode::publishOccupancyGrid, this));
+        std::bind(&dlio::OdomNode::publishOccupancyGrid, this),
+        this->aux_timer_cb_group_);
 
     RCLCPP_INFO(this->get_logger(), "Occupancy grid enabled: rate=%.1fHz", og_rate);
   }
@@ -449,6 +458,12 @@ dlio::OdomNode::OdomNode(const rclcpp::NodeOptions &options)
   this->prior_map_pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(
       "dlio/prior_map", rclcpp::QoS(1));
 
+  // scan↔prior-map match score (mean residual in m at the current pose; lower =
+  // better). Published from continuousLocalize(); tells if the pose is correct
+  // relative to the map (unlike odometry fitness, which only checks self-submap).
+  this->scan_match_pub_ = this->create_publisher<std_msgs::msg::Float32>(
+      "dlio/odom_node/scan_match_score", rclcpp::QoS(10));
+
   // Map load
   this->prior_map_pose_set_ = false;
   this->num_prior_keyframes_ = 0;
@@ -509,7 +524,8 @@ dlio::OdomNode::OdomNode(const rclcpp::NodeOptions &options)
 
     this->prior_map_pub_timer_ = this->create_wall_timer(
         std::chrono::milliseconds(this->prior_map_pub_interval_ms_),
-        std::bind(&dlio::OdomNode::publishPriorMap, this));
+        std::bind(&dlio::OdomNode::publishPriorMap, this),
+        this->aux_timer_cb_group_);
   }
 
   // Continuous localization init (Bayesian)
@@ -533,7 +549,8 @@ dlio::OdomNode::OdomNode(const rclcpp::NodeOptions &options)
 
     this->continuous_localize_timer_ = this->create_wall_timer(
         std::chrono::duration<double>(this->continuous_localize_interval_),
-        std::bind(&dlio::OdomNode::continuousLocalize, this));
+        std::bind(&dlio::OdomNode::continuousLocalize, this),
+        this->continuous_localize_cb_group_);
 
     // Publish confidence every tick so other nodes know alignment quality
     this->confidence_pub_ = this->create_publisher<std_msgs::msg::Float32>("localization_confidence", 10);
@@ -575,7 +592,8 @@ dlio::OdomNode::OdomNode(const rclcpp::NodeOptions &options)
     this->initSubmapLocalization();
     this->submap_loc_timer_ = this->create_wall_timer(
         std::chrono::duration<double>(this->submap_loc_interval_),
-        std::bind(&dlio::OdomNode::submapLocalizeTick, this));
+        std::bind(&dlio::OdomNode::submapLocalizeTick, this),
+        this->submap_loc_cb_group_);
     if (!this->confidence_pub_)
       this->confidence_pub_ = this->create_publisher<std_msgs::msg::Float32>("localization_confidence", 10);
     RCLCPP_INFO(this->get_logger(), "Submap relocalization enabled: interval=%.1fs, group_size=%d, search_radius=%.1fm",
@@ -598,7 +616,8 @@ dlio::OdomNode::OdomNode(const rclcpp::NodeOptions &options)
           {
             this->saveKeyframeDatabase();
             this->saveCorrectedKeyframeDatabase();
-          });
+          },
+          this->aux_timer_cb_group_);
       RCLCPP_INFO(this->get_logger(), "[odom] KFDB auto-save enabled: every %.1fs",
                   this->kfdb_auto_save_interval_);
     }
@@ -680,6 +699,9 @@ void dlio::OdomNode::getParams()
   // Localization prior-map ROI submap parameters
   dlio::declare_param(this, "odom/localization/roi_radius", this->loc_roi_radius_, 60.0);
   dlio::declare_param(this, "odom/localization/roi_refresh_dist", this->loc_roi_refresh_dist_, 5.0);
+  // Localization memory bound: # of recent live keyframes to keep clouds for
+  // (older ones are freed). <=0 = unbounded.
+  dlio::declare_param(this, "odom/localization/keyframe_window", this->loc_keyframe_window_, 100);
 
   // NOTE: voxel_hash_map allocation + engine compat check is done in the
   // constructor AFTER engine_.init() (see OdomNode::OdomNode), so that the
@@ -1124,12 +1146,13 @@ void dlio::OdomNode::getParams()
   // Map load/save
   dlio::declare_param(this, "map/mode", this->map_mode_, std::string("localization"));
 
-  // Localization behaves like the previous working version: keyframing ON, so
-  // the robot builds its own local submap (smooth, robust odometry even when
-  // started far from the prior map) and SC++ continuous-localize snaps it onto
-  // the prior map. Disabling keyframing made random-start localization float
-  // (only sparse prior chunks → bad registration). Memory grows during long
-  // runs — see the "recent_keyframes" submap method for a bounded option.
+  // Localization uses keyframe-growth (keyframing ON), like the original
+  // algorithm: the robot builds its OWN submap so odometry stays smooth and is
+  // immune to "flying" even before it is aligned to the map (the prior-map ROI
+  // approach floats when the initial pose is far/unaligned — scan can't match).
+  // Relocalization (/initialpose) + SC++ continuous-localize then snap it onto
+  // the prior map. Trade-off: keyframes accumulate (memory grows on long runs).
+  // The "prior_map" ROI method is still available via odom/submap/method.
   this->keyframing_enabled_ = true;
   this->submap_method_ = this->submap_method_param_;
 

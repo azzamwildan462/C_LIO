@@ -228,6 +228,8 @@ private:
   // Localization: build registration target as an ROI of the frozen prior map
   // around the robot (prior_map_kdtree_ radiusSearch + sliced covariances).
   bool buildPriorMapRoiSubmap(const State &vehicle_state);
+  // Localization memory bound: free clouds/covariances of old live keyframes.
+  void pruneLocalizationKeyframes();
 
   void loadPriorMap();
 
@@ -763,6 +765,12 @@ private:
   // keyframes are created (prevents unbounded memory growth).
   bool keyframing_enabled_ = true;
 
+  // Localization memory bound: keep clouds+covariances only for the most recent
+  // N live keyframes; free older ones (poses kept). The prior-map virtual
+  // keyframes + recent live keyframes cover the KNN submap, so this caps memory
+  // without changing odometry behaviour. <=0 disables (unbounded, mapping-style).
+  int loc_keyframe_window_ = 100;
+
   // When true, relocalization refines ONLY around initial_position_ (an explicit
   // /initialpose click) and skips the global SC candidate search — so the user's
   // clicked pose is authoritative instead of being outvoted by SC matches.
@@ -772,6 +780,16 @@ private:
   // drop live keyframes + zero velocity/observer, then relocalize around the
   // click. Prevents stale float-keyframes/submap from "flinging" the pose.
   std::atomic<bool> request_fresh_reloc_{false};
+
+  // Dedicated callback groups so heavy/periodic timers run concurrently instead
+  // of serializing in the node's default MutuallyExclusive group — that made
+  // continuous-localize (and its match-score publish) fire far slower than its
+  // 2s period because the 100Hz publish + submap-localize GICP + prior-map
+  // publish all queued ahead of it. Shared state stays protected by its mutexes.
+  rclcpp::CallbackGroup::SharedPtr continuous_localize_cb_group_;
+  rclcpp::CallbackGroup::SharedPtr submap_loc_cb_group_;
+  rclcpp::CallbackGroup::SharedPtr fast_pub_cb_group_;
+  rclcpp::CallbackGroup::SharedPtr aux_timer_cb_group_;
 
   // KFDB entries accumulated during mapping
   std::vector<dlio::AppearanceEntry> kfdb_entries_;
@@ -825,6 +843,10 @@ private:
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr global_correction_sub_;
   std::atomic<bool> enable_global_correction_{true};
   float last_confidence_{0.0f};
+
+  // Per-scan scan↔map registration score (raw ICP/GICP fitness; lower = better
+  // match, grows when the scan stops matching the map). One value per scan.
+  rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr scan_match_pub_;
 
   // Runtime mode broadcast (latched) — lio_sam_opt subscribes to mirror mode.
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr mode_pub_;

@@ -71,9 +71,13 @@ void dlio::OdomNode::loadPriorMap()
     tmp_gicp.calculateSourceCovariances();
     all_covs = tmp_gicp.getSourceCovariances();
   }
-  // Persist for the localization ROI submap: indices align with prior_map_cloud_
-  // (same cloud, no further voxel filtering after this point).
-  this->prior_map_covariances_ = all_covs;
+  // NOTE: we deliberately do NOT persist all_covs into prior_map_covariances_
+  // — for a 20M-point map that's ~2.5 GB of RAM, and the active localization
+  // (keyframe-growth) doesn't use it. If the "prior_map" ROI method is ever
+  // re-enabled, buildPriorMapRoiSubmap() recomputes covariances per-ROI on the
+  // fly (its built-in fallback), which is cheap for a 60 m region.
+  // all_covs is still used just below to build the chunk (virtual-keyframe)
+  // covariances, then freed when it goes out of scope.
 
   // 4. Split into spatial grid chunks
   double cs = this->map_chunk_size_;
@@ -555,6 +559,23 @@ bool dlio::OdomNode::runRelocalization(pcl::PointCloud<PointType>::ConstPtr scan
   }
 
 accept_result:
+  // Guess-only honor gate: if GICP pulled the result far from the clicked seed,
+  // the click landed where the scan can't match → don't apply that big (wrong)
+  // translation. Honor the raw click instead (small/no move, clicked heading).
+  if (this->reloc_guess_only_ && best_candidate >= 0)
+  {
+    float dpos = (best_pos - this->initial_position_).norm();
+    if (dpos > 15.0f)
+    {
+      RCLCPP_WARN(this->get_logger(),
+                  "[/initialpose] GICP pulled %.1fm from click (fit=%.3f) — honoring raw click instead",
+                  dpos, best_fitness);
+      best_pos = this->initial_position_;
+      best_q = this->state.q; // clicked yaw (state.q not yet overwritten here)
+      best_fitness = 0.0f;    // accept the honored click
+    }
+  }
+
   if (best_fitness > 0.5f)
   {
     RCLCPP_WARN(this->get_logger(),

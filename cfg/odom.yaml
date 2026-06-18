@@ -22,14 +22,23 @@
     odom/prefilter/dror_min_neighbors: 3
 
     # --- Registration ---
-    odom/registration_method: "ndt_cuda" # "gicp", "gicp_cuda", "ndt", "ndt_cuda", "robust_icp", "robust_icp_cuda"
-    odom/localization/registration_method: "ndt_cuda"
+    # Use plain "gicp" (CPU): tight rotation basin → stable heading for
+    # scan-to-frozen-map. NOTE: "gicp_cuda" is broken here (returns inf fitness →
+    # robot flies); "ndt"/"ndt_cuda" have a wide angular basin → yaw spins. For
+    # busy/dynamic scenes try "robust_icp" (GM kernel rejects outliers).
+    odom/registration_method: "gicp" # "gicp", "gicp_cuda", "ndt", "ndt_cuda", "robust_icp", "robust_icp_cuda"
+    odom/localization/registration_method: "gicp"
 
     # Localization: scan→frozen-map ROI target (no keyframes, no memory growth).
     # ROI = prior-map points within roi_radius of the robot; rebuilt only after
     # the robot has moved roi_refresh_dist from the last ROI center.
     odom/localization/roi_radius: 60.0 # meters (≈ sensor range + margin)
     odom/localization/roi_refresh_dist: 5.0 # meters between ROI rebuilds
+
+    # Localization memory bound (keyframe-growth mode): keep clouds+covariances
+    # for only the last N live keyframes; free older ones (poses kept). Caps RAM
+    # without changing odometry (prior-map keyframes cover far areas). 0 = off.
+    odom/localization/keyframe_window: 100
 
     # GICP
     odom/gicp/minNumPoints: 100
