@@ -4,9 +4,9 @@
   schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
 
-  <name>direct_lidar_inertial_odometry</name>
+  <name>c_lio</name>
   <version>1.1.1</version>
-  <description>Direct LiDAR-Inertial Odometry: Lightweight LIO with Continuous-Time Motion Correction</description>
+  <description>Compact LiDAR-Inertial Odometry: Lightweight LIO with Continuous-Time Motion Correction</description>
 
   <maintainer email="kennyjchen@ucla.edu">Kenny J. Chen</maintainer>
   <maintainer email="ryguyn@ucla.edu">Ryan Nemiroff</maintainer>

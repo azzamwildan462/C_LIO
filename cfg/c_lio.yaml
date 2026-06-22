@@ -1,0 +1,24 @@
+###########################################################
+#                       C_LIO General                      #
+###########################################################
+
+/**:
+  ros__parameters:
+    version: 2.0.0
+    use_sim_time: true
+    adaptive: true
+
+    # Debug
+    deep_debug/odom: true
+    debug/odom: false
+    debug/print_odom: false # Pretty print odom
+
+    # TF source for map->odom: "odom" (OdomNode) or "lio_sam_opt"
+    map/tf_source: "odom"
+
+    # Frames
+    frames/map: map
+    frames/odom: odom
+    frames/baselink: base_link
+    frames/lidar: lidar
+    frames/imu: imu

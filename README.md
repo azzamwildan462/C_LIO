@@ -1,8 +1,16 @@
-# DLIO-SCLC: Direct LiDAR-Inertial Odometry with Scan Context Loop Closure
+# C_LIO: Compact LiDAR-Inertial Odometry
 
-An extended version of [Direct LiDAR-Inertial Odometry (DLIO)](https://github.com/vectr-ucla/direct_lidar_inertial_odometry) with **LIO-SAM-style map optimization**, **CUDA-accelerated registration & preprocessing**, **pluggable fusion filters**, **Scan Context relocalization**, **prior map localization**, and **multiple registration backends**.
+**C_LIO** (Compact LiDAR-Inertial Odometry) is an evolution of [DLIO (Direct LiDAR-Inertial Odometry)](https://github.com/vectr-ucla/direct_lidar_inertial_odometry) by the UCLA VECTR Lab. While DLIO provides a lightweight, real-time LIO frontend with continuous-time motion correction, C_LIO builds on top of it into a complete, production-ready SLAM system:
 
-## What's New
+- **Backend pose graph** — LIO-SAM-style iSAM2 with loop closure (distance + Scan Context++) and optional GPS factors running in a separate process, so pose-graph correction never starves the real-time odometry pipeline
+- **Appearance-based auto localization** — Scan Context++ relocalization for automatic initial pose estimation from a prior map, plus continuous Bayesian global alignment and two-stage submap localization for GPS-denied environments
+- **Multiple registration backends** — six interchangeable backends (`gicp`, `ndt`, `robust_icp`, and their CUDA counterparts) unified under a single `align()` API, selectable at runtime for both odometry and loop closure
+- **Pluggable fusion engine** — switchable IMU/scan-match fusion strategies (geometric observer, Kalman filter, error-state EKF) with a pose safety gate that rejects physically implausible results
+- **CUDA acceleration** — GPU kernels for deskewing, voxel filtering, GICP/RobustICP/NDT registration, and nearest-neighbor search; automatic CPU fallback when CUDA is absent
+- **Keyframe database (KFDB)** — persistent appearance descriptors and body-frame scans saved to disk for session-to-session relocalization
+- **Occupancy grid, multi-sensor support, composable ROS 2 nodes**, and more
+
+## Features
 
 | Feature | Description |
 |---------|-------------|
@@ -33,7 +41,7 @@ An extended version of [Direct LiDAR-Inertial Odometry (DLIO)](https://github.co
 
 ```
 ┌───────────────────────────────────────────────┐
-│           dlio_container (process 1)          │
+│           c_lio_container (process 1)          │
 │                                               │
 │  ┌─────────────────────────────────────┐    │
 │  │            OdomNode                  │    │
@@ -73,8 +81,8 @@ LIO-SAM opt runs in a **separate process** (`nice -n 10`) to prevent heavy ICP/G
 ## Code Structure
 
 ```
-include/dlio/
-├── dlio.h                          # Package-wide defines (DLIO_HAS_CUDA, PointType, etc.)
+include/c_lio/
+├── c_lio.h                          # Package-wide defines (C_LIO_HAS_CUDA, PointType, etc.)
 ├── odom/
 │   ├── odom.h                      # OdomNode class declaration
 │   ├── scan_context.h              # Scan Context utilities (header-only impl)
@@ -101,7 +109,7 @@ include/dlio/
     ├── preprocess_cuda.cuh         # GPU deskew + voxel filter
     └── point_cloud_cuda.cuh        # GPU point cloud container
 
-src/dlio/
+src/c_lio/
 ├── odom/
 │   ├── odom.cc                     # Constructor, getParams(), start()
 │   ├── odom_callbacks.cc           # callbackPointCloud, callbackImu, deskewing
@@ -160,18 +168,18 @@ sudo apt install libomp-dev libpcl-dev libeigen3-dev ros-humble-pcl-ros ros-humb
 ```bash
 cd <your_ws>
 # Build ndt_cuda_ros2 first if the ndt_cuda method is needed:
-colcon build --packages-select ndt_cuda_ros2 direct_lidar_inertial_odometry
+colcon build --packages-select ndt_cuda_ros2 c_lio
 source install/setup.bash
 ```
 
-CUDA is enabled automatically when `CUDAToolkit` is found (`DLIO_HAS_CUDA`). The `ndt_cuda` method is enabled only when `ndt_cuda_ros2` is also found (`DLIO_HAS_NDT_CUDA`); the two are decoupled so a broken `ndt_cuda_ros2` build does not disable DLIO's own CUDA kernels. Build messages report which mode was selected.
+CUDA is enabled automatically when `CUDAToolkit` is found (`C_LIO_HAS_CUDA`). The `ndt_cuda` method is enabled only when `ndt_cuda_ros2` is also found (`C_LIO_HAS_NDT_CUDA`); the two are decoupled so a broken `ndt_cuda_ros2` build does not disable C_LIO's own CUDA kernels. Build messages report which mode was selected.
 
 ## Usage
 
 ### Mapping
 
 ```bash
-ros2 launch direct_lidar_inertial_odometry dlio.launch.py \
+ros2 launch c_lio c_lio.launch.py \
   map_mode:=mapping \
   map_path:=/path/to/my_map.pcd \
   pointcloud_topic:=/your/pointcloud \
@@ -184,12 +192,12 @@ Produces:
 - `my_map_corrected.pcd` — loop-closure corrected map (from lio_sam_opt)
 - `my_map_corrected.kfdb` — corrected keyframe database
 
-> If `map_path` is empty it defaults to `$HOME/.ros/dlio_map.pcd`.
+> If `map_path` is empty it defaults to `$HOME/.ros/c_lio_map.pcd`.
 
 ### Localization
 
 ```bash
-ros2 launch direct_lidar_inertial_odometry dlio.launch.py \
+ros2 launch c_lio c_lio.launch.py \
   map_mode:=localization \
   map_path:=/path/to/my_map.pcd \
   relocalize:=true \
@@ -217,7 +225,7 @@ Parameters are split across seven YAML files in `cfg/` (loaded by the launch fil
 
 | File | Scope |
 |------|-------|
-| `dlio.yaml` | General: version, frames, debug, `map/tf_source` |
+| `c_lio.yaml` | General: version, frames, debug, `map/tf_source` |
 | `sensor.yaml` | IMU, LiDAR, extrinsics, external odom, calibration |
 | `odom.yaml` | Preprocessing, prefilter, registration, keyframes, submap |
 | `fusion.yaml` | Fusion strategy, KF/EKF noise, safety gate, motion model |
@@ -308,7 +316,7 @@ extrinsics/baselink2gps/rpy: [0.0, 0.0, 0.0]   # ENU→odom yaw auto-calibrated 
 | `odom_noise/rotation` / `translation` | `0.2` / `9.0` | Odometry factor variances |
 | `loop_noise/multiplier` | `0.01` | LC noise = fitness × this |
 
-> `map/tf_source` (in `dlio.yaml`) decides who publishes `map->odom`: `odom` (OdomNode) or `lio_sam_opt`. Do **not** override it in `lio_sam_map_optimization.yaml`, or both nodes will publish TF and cause jumping.
+> `map/tf_source` (in `c_lio.yaml`) decides who publishes `map->odom`: `odom` (OdomNode) or `lio_sam_opt`. Do **not** override it in `lio_sam_map_optimization.yaml`, or both nodes will publish TF and cause jumping.
 
 ### Sensor Support
 
@@ -326,23 +334,23 @@ Auto-detected from point cloud fields:
 
 | Topic | Type | Description |
 |-------|------|-------------|
-| `dlio/odom_node/odom` | `nav_msgs/Odometry` | Odometry estimate |
-| `dlio/odom_node/pose` | `geometry_msgs/PoseStamped` | Current pose |
-| `dlio/odom_node/path` | `nav_msgs/Path` | Trajectory path |
-| `dlio/odom_node/pointcloud/deskewed` | `sensor_msgs/PointCloud2` | Deskewed scan |
-| `dlio/odom_node/pointcloud/deskewed_raw` | `sensor_msgs/PointCloud2` | Deskewed scan (pre-voxel) |
-| `dlio/odom_node/pointcloud/keyframe` | `sensor_msgs/PointCloud2` | Keyframe cloud |
-| `dlio/odom_node/keyframes` | `geometry_msgs/PoseArray` | Keyframe poses |
-| `dlio/odom_node/keyframe_stamped` | `KeyframeStamped` | Keyframe → lio_sam_opt |
-| `dlio/odom_node/occupancy_grid` | `nav_msgs/OccupancyGrid` | 2D occupancy grid |
+| `c_lio/odom_node/odom` | `nav_msgs/Odometry` | Odometry estimate |
+| `c_lio/odom_node/pose` | `geometry_msgs/PoseStamped` | Current pose |
+| `c_lio/odom_node/path` | `nav_msgs/Path` | Trajectory path |
+| `c_lio/odom_node/pointcloud/deskewed` | `sensor_msgs/PointCloud2` | Deskewed scan |
+| `c_lio/odom_node/pointcloud/deskewed_raw` | `sensor_msgs/PointCloud2` | Deskewed scan (pre-voxel) |
+| `c_lio/odom_node/pointcloud/keyframe` | `sensor_msgs/PointCloud2` | Keyframe cloud |
+| `c_lio/odom_node/keyframes` | `geometry_msgs/PoseArray` | Keyframe poses |
+| `c_lio/odom_node/keyframe_stamped` | `KeyframeStamped` | Keyframe → lio_sam_opt |
+| `c_lio/odom_node/occupancy_grid` | `nav_msgs/OccupancyGrid` | 2D occupancy grid |
 | `localization_confidence` | `std_msgs/Float32` | Localization confidence |
-| `dlio/map_node/map` | `sensor_msgs/PointCloud2` | Accumulated map |
-| `dlio/lio_sam_opt/corrected_path` | `nav_msgs/Path` | Loop-closure corrected path |
-| `dlio/lio_sam_opt/corrected_map` | `sensor_msgs/PointCloud2` | Corrected full map |
-| `dlio/lio_sam_opt/corrected_kf_poses` | `geometry_msgs/PoseArray` | Corrected keyframe poses |
-| `dlio/lio_sam_opt/corrected_fusion_path` | `nav_msgs/Path` | KF-fused corrected path |
-| `dlio/lio_sam_opt/corrected_fusion_odom` | `nav_msgs/Odometry` | KF-fused corrected odom |
-| `dlio/lio_sam_opt/loop_closures` | `visualization_msgs/MarkerArray` | Loop closure markers |
+| `c_lio/map_node/map` | `sensor_msgs/PointCloud2` | Accumulated map |
+| `c_lio/lio_sam_opt/corrected_path` | `nav_msgs/Path` | Loop-closure corrected path |
+| `c_lio/lio_sam_opt/corrected_map` | `sensor_msgs/PointCloud2` | Corrected full map |
+| `c_lio/lio_sam_opt/corrected_kf_poses` | `geometry_msgs/PoseArray` | Corrected keyframe poses |
+| `c_lio/lio_sam_opt/corrected_fusion_path` | `nav_msgs/Path` | KF-fused corrected path |
+| `c_lio/lio_sam_opt/corrected_fusion_odom` | `nav_msgs/Odometry` | KF-fused corrected odom |
+| `c_lio/lio_sam_opt/loop_closures` | `visualization_msgs/MarkerArray` | Loop closure markers |
 
 ### TF Transforms
 
@@ -357,27 +365,27 @@ Auto-detected from point cloud fields:
 
 | Service | Topic | Description |
 |---------|-------|-------------|
-| `GetState` | `/dlio/odom_node/get_state` | Query state, pose, stats |
-| `SetMode` | `/dlio/odom_node/set_mode` | Switch mapping/localization |
-| `SetPose` | `/dlio/odom_node/set_pose` | Manually set robot pose |
-| `Relocalize` | `/dlio/odom_node/relocalize` | Trigger SC + registration relocalization |
-| `NewMap` | `/dlio/odom_node/new_map` | Clear everything, start fresh |
-| `NewMapWZero` | `/dlio/odom_node/new_map_w_zero` | Clear + reset pose to zero |
-| `SavePCD` | `/dlio/map_node/save_pcd` | Save current map |
-| `SavePCD` | `/dlio/lio_sam_opt/save_corrected_pcd` | Save loop-closure corrected map |
+| `GetState` | `/c_lio/odom_node/get_state` | Query state, pose, stats |
+| `SetMode` | `/c_lio/odom_node/set_mode` | Switch mapping/localization |
+| `SetPose` | `/c_lio/odom_node/set_pose` | Manually set robot pose |
+| `Relocalize` | `/c_lio/odom_node/relocalize` | Trigger SC + registration relocalization |
+| `NewMap` | `/c_lio/odom_node/new_map` | Clear everything, start fresh |
+| `NewMapWZero` | `/c_lio/odom_node/new_map_w_zero` | Clear + reset pose to zero |
+| `SavePCD` | `/c_lio/map_node/save_pcd` | Save current map |
+| `SavePCD` | `/c_lio/lio_sam_opt/save_corrected_pcd` | Save loop-closure corrected map |
 
 ## Debug Tools
 
 | Executable | Description |
 |------------|-------------|
 | `imu_integrator_node` | Integrates raw IMU into a pure-IMU trajectory for sanity checks |
-| `imu_lidar_calib_node` | IMU↔LiDAR extrinsic calibration via pure GICP (no DLIO dependency) |
+| `imu_lidar_calib_node` | IMU↔LiDAR extrinsic calibration via pure GICP (standalone, no SLAM dependency) |
 
-Standalone (non-composable) executables `dlio_odom_node` and `dlio_lio_sam_map_opt_node` are also built for backward compatibility.
+Standalone (non-composable) executables `c_lio_odom_node` and `c_lio_lio_sam_map_opt_node` are also built as convenience wrappers.
 
 ## Based On
 
-This project is built on **Direct LiDAR-Inertial Odometry (DLIO)** by the [VECTR Lab](https://vectr.ucla.edu/) at UCLA.
+C_LIO is built on top of **DLIO (Direct LiDAR-Inertial Odometry)** by the [VECTR Lab](https://vectr.ucla.edu/) at UCLA.
 
 ```bibtex
 @article{chen2022dlio,

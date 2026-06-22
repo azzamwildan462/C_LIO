@@ -7,13 +7,13 @@
   ros__parameters:
     # --- Map general ---
     map/mode: "mapping" # "mapping" or "localization"
-    map/path: "" # empty = defaults to $HOME/.ros/dlio_map.pcd
+    map/path: "" # empty = defaults to $HOME/.ros/c_lio_map.pcd
     map/use_corrected: true # load graph-optimized _corrected files in localization mode
     map/voxel_size: 0.5 # was 0.25 — too dense (submap ~618k pts → GICP ~400ms/scan → jitter, + huge RAM). Live scan is 1.0m so 0.5 map is plenty. Cuts submap size & prior-map memory ~4x.
     map/chunk_size: 20.0
     map/auto_save_interval: 30.0
     map/publish_interval: 5.0
-    map/publish_debug_interval_ms: 3000 # publish loaded frozen map to /dlio/prior_map for RViz; -1 = off
+    map/publish_debug_interval_ms: 3000 # publish loaded frozen map to /c_lio/prior_map for RViz; -1 = off
     map/publish_debug_leaf: 2.0 # downsample (m) for the debug map publish; bigger = lighter RViz
     map/waitUntilMove: true
     map/dense/filtered: false
