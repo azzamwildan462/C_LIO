@@ -310,6 +310,7 @@ private:
 
   // Publishers
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_pub;
+  rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_2d_pub_;
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr pose_pub;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr path_pub;
   rclcpp::Publisher<geometry_msgs::msg::PoseArray>::SharedPtr kf_pose_pub;
@@ -855,6 +856,13 @@ private:
   // timers (continuous/submap localize) that share the default group.
   rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr initialpose_sub_;
   rclcpp::CallbackGroup::SharedPtr initialpose_cb_group_;
+
+  // 2D odometry publish
+  bool publish_2d_odom_enabled_ = false;
+  double odom_2d_pose_cov_xy_  = 1e-2;
+  double odom_2d_pose_cov_yaw_ = 1e-2;
+  double odom_2d_twist_cov_lin_ = 1e-2;
+  double odom_2d_twist_cov_ang_ = 1e-2;
 
   // Occupancy grid
   bool occupancy_grid_enabled_ = false;

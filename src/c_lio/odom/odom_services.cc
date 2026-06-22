@@ -54,6 +54,68 @@ void c_lio::OdomNode::publishPose()
 
   this->odom_pub->publish(this->odom_ros);
 
+  // nav_msgs::msg::Odometry (2D, map→base_link)
+  if (this->publish_2d_odom_enabled_)
+  {
+    // Build T_odom_body from state snapshot, then apply map→odom correction
+    Eigen::Matrix4f T_odom_body = Eigen::Matrix4f::Identity();
+    T_odom_body.block<3, 3>(0, 0) = s_q.toRotationMatrix();
+    T_odom_body.block<3, 1>(0, 3) = s_p;
+
+    Eigen::Matrix4f T_map_odom;
+    {
+      std::lock_guard<std::mutex> lock(this->continuous_localize_mtx_);
+      T_map_odom = this->T_map_odom_;
+    }
+    Eigen::Matrix4f T_map_body = T_map_odom * T_odom_body;
+
+    Eigen::Vector3f map_p = T_map_body.block<3, 1>(0, 3);
+    Eigen::Quaternionf map_q(T_map_body.block<3, 3>(0, 0));
+    map_q.normalize();
+
+    nav_msgs::msg::Odometry odom_2d;
+    odom_2d.header.stamp = this->imu_stamp;
+    odom_2d.header.frame_id = this->map_frame_;
+    odom_2d.child_frame_id = this->baselink_frame;
+
+    odom_2d.pose.pose.position.x = map_p[0];
+    odom_2d.pose.pose.position.y = map_p[1];
+    odom_2d.pose.pose.position.z = 0;
+
+    double siny_cosp = 2 * (map_q.w() * map_q.z() + map_q.x() * map_q.y());
+    double cosy_cosp = 1 - 2 * (map_q.y() * map_q.y() + map_q.z() * map_q.z());
+    double yaw = std::atan2(siny_cosp, cosy_cosp);
+
+    odom_2d.pose.pose.orientation.w = std::cos(yaw * 0.5);
+    odom_2d.pose.pose.orientation.x = 0;
+    odom_2d.pose.pose.orientation.y = 0;
+    odom_2d.pose.pose.orientation.z = std::sin(yaw * 0.5);
+
+    odom_2d.pose.covariance[0]  = this->odom_2d_pose_cov_xy_;
+    odom_2d.pose.covariance[7]  = this->odom_2d_pose_cov_xy_;
+    odom_2d.pose.covariance[14] = 1e6;
+    odom_2d.pose.covariance[21] = 1e6;
+    odom_2d.pose.covariance[28] = 1e6;
+    odom_2d.pose.covariance[35] = this->odom_2d_pose_cov_yaw_;
+
+    odom_2d.twist.twist.linear.x  = s_v_lin_w[0];
+    odom_2d.twist.twist.linear.y  = s_v_lin_w[1];
+    odom_2d.twist.twist.linear.z  = 0;
+
+    odom_2d.twist.twist.angular.x = 0;
+    odom_2d.twist.twist.angular.y = 0;
+    odom_2d.twist.twist.angular.z = s_v_ang_b[2];
+
+    odom_2d.twist.covariance[0]  = this->odom_2d_twist_cov_lin_;
+    odom_2d.twist.covariance[7]  = this->odom_2d_twist_cov_lin_;
+    odom_2d.twist.covariance[14] = 1e6;
+    odom_2d.twist.covariance[21] = 1e6;
+    odom_2d.twist.covariance[28] = 1e6;
+    odom_2d.twist.covariance[35] = this->odom_2d_twist_cov_ang_;
+
+    this->odom_2d_pub_->publish(odom_2d);
+  }
+
   // geometry_msgs::msg::PoseStamped
   this->pose_ros.header.stamp = this->imu_stamp;
   this->pose_ros.header.frame_id = this->odom_frame;

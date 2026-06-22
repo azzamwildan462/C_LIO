@@ -5,6 +5,13 @@
 
 /**:
   ros__parameters:
+    # --- Publish options ---
+    odom/publish_2d_odom: false # publish flattened odometry (z=0, yaw-only) on topic "odom_2d" (map→base_link)
+    odom/odom_2d/pose_cov_xy:   1.0e-2  # diagonal covariance for x, y position
+    odom/odom_2d/pose_cov_yaw:  1.0e-2  # diagonal covariance for yaw
+    odom/odom_2d/twist_cov_lin: 1.0e-2  # diagonal covariance for vx, vy
+    odom/odom_2d/twist_cov_ang: 1.0e-2  # diagonal covariance for angular z
+
     # --- Preprocessing ---
     odom/preprocessing/cropBoxFilter/size: 3.0
     odom/preprocessing/voxelFilter/res: 0.3

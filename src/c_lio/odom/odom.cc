@@ -91,6 +91,8 @@ c_lio::OdomNode::OdomNode(const rclcpp::NodeOptions &options)
                                                                    std::bind(&c_lio::OdomNode::callbackImu, this, std::placeholders::_1), imu_sub_opt);
 
   this->odom_pub = this->create_publisher<nav_msgs::msg::Odometry>("odom", 1);
+  if (this->publish_2d_odom_enabled_)
+    this->odom_2d_pub_ = this->create_publisher<nav_msgs::msg::Odometry>("odom_2d", 1);
   this->pose_pub = this->create_publisher<geometry_msgs::msg::PoseStamped>("pose", 1);
   this->path_pub = this->create_publisher<nav_msgs::msg::Path>("path", 1);
   this->kf_pose_pub = this->create_publisher<geometry_msgs::msg::PoseArray>("kf_pose", 1);
@@ -1295,6 +1297,16 @@ void c_lio::OdomNode::getParams()
   this->gps_min_accuracy_ = static_cast<float>(gps_ma);
   c_lio::declare_param(this, "gps/publish_earth_tf", this->gps_publish_earth_tf_, true);
   c_lio::declare_param(this, "gps/trust_all", this->gps_trust_all_, false);
+
+  // 2D Odometry publish
+  c_lio::declare_param(this, "odom/publish_2d_odom", this->publish_2d_odom_enabled_, false);
+  if (this->publish_2d_odom_enabled_)
+  {
+    c_lio::declare_param(this, "odom/odom_2d/pose_cov_xy",   this->odom_2d_pose_cov_xy_,   1e-2);
+    c_lio::declare_param(this, "odom/odom_2d/pose_cov_yaw",  this->odom_2d_pose_cov_yaw_,  1e-2);
+    c_lio::declare_param(this, "odom/odom_2d/twist_cov_lin", this->odom_2d_twist_cov_lin_, 1e-2);
+    c_lio::declare_param(this, "odom/odom_2d/twist_cov_ang", this->odom_2d_twist_cov_ang_, 1e-2);
+  }
 
   // Occupancy Grid
   c_lio::declare_param(this, "occupancy_grid/enabled", this->occupancy_grid_enabled_, false);
