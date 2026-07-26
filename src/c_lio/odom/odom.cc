@@ -367,6 +367,9 @@ c_lio::OdomNode::OdomNode(const rclcpp::NodeOptions &options)
   this->crop.setMax(Eigen::Vector4f(this->crop_size_, this->crop_size_, this->crop_size_, 1.0));
 
   this->voxel.setLeafSize(this->vf_res_, this->vf_res_, this->vf_res_);
+  // Dedicated instance for classic mode — see classic_voxel_'s comment in
+  // odom.h for why this can't share `voxel` with preprocessPoints().
+  this->classic_voxel_.setLeafSize(this->vf_res_, this->vf_res_, this->vf_res_);
 
   // Reserve capacity for grow-only vectors to prevent reallocation during concurrent access
   // (these are pushed from callbacks and read from other threads)
@@ -563,6 +566,8 @@ c_lio::OdomNode::OdomNode(const rclcpp::NodeOptions &options)
   // Continuous localization init (Bayesian)
   this->T_map_odom_ = Eigen::Matrix4f::Identity();
   this->latest_scan_T_ = Eigen::Matrix4f::Identity();
+  this->latest_scan_state_p_ = Eigen::Vector3f::Zero();
+  this->latest_scan_state_q_ = Eigen::Quaternionf::Identity();
   this->latest_scan_time_ = 0.0;
   this->bayes_consecutive_accepts_ = 0;
   this->bayes_posterior_.clear();
@@ -1240,9 +1245,13 @@ void c_lio::OdomNode::getParams()
   c_lio::declare_param(this, "map/initial_pose/yaw", init_yaw, 0.0);
   this->initial_position_ = Eigen::Vector3f(init_x, init_y, init_z);
   this->initial_yaw_ = init_yaw * M_PI / 180.0;
-  // Default classic-mode seed orientation (yaw-only — no gravity roll/pitch
-  // composed in, unlike state.q, to stay fully independent of it). Overwritten
-  // by callbackInitialPose() on an actual /initialpose click.
+  // Default classic-mode seed pose — starts equal to initial_position_/yaw
+  // but is a SEPARATE variable from here on: callbackInitialPose() only ever
+  // overwrites classic_seed_p_/classic_seed_q_ when classic mode is active,
+  // never initial_position_/state.q, so an /initialpose click can't perturb
+  // the old keyframe pipeline's own state (see classic_seed_p_'s comment in
+  // odom.h).
+  this->classic_seed_p_ = this->initial_position_;
   this->classic_seed_q_ = Eigen::Quaternionf(Eigen::AngleAxisf(this->initial_yaw_, Eigen::Vector3f::UnitZ()));
 
   // Scan Context Relocalization

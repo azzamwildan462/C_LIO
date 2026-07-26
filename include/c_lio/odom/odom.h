@@ -259,8 +259,10 @@ private:
   bool apply_corr_gate(const Eigen::Vector3f &meas_p, const Eigen::Quaternionf &meas_q,
                        double score, bool converged);
   void fuse_odom(const Eigen::Vector3f &meas_p, const Eigen::Quaternionf &meas_q);
-  // (Re-)seed classic_kf_ from initial_position_ + the current state.q — used
-  // both on first bootstrap and after a fresh /initialpose click.
+  // (Re-)seed classic_kf_ from classic_seed_p_ + classic_seed_q_ — used both
+  // on first bootstrap and after a fresh /initialpose click. Deliberately
+  // NOT initial_position_/state.q — see classic_seed_p_/classic_seed_q_'s
+  // comments in odom.h.
   void seedClassicKF();
   void classic_localization_routine();
   // Clone of publishToROS()/publishCloud() sourced from classic_kf_ instead
@@ -876,6 +878,43 @@ private:
   rclcpp::TimerBase::SharedPtr continuous_localize_timer_;
   pcl::PointCloud<PointType>::ConstPtr latest_scan_; // body/sensor frame
   Eigen::Matrix4f latest_scan_T_;                    // T at time of scan (body→odom)
+  // classic mode's registration input. Deliberately NOT latest_scan_
+  // (=original_scan): that is the RAW, un-deskewed sweep — a single point
+  // cloud with no per-point motion compensation. The default pipeline never
+  // registers that directly; it registers current_scan, which
+  // deskewPointcloud() builds by transforming each point with its own
+  // per-point-time-interpolated IMU pose (frames[i]) before matching against
+  // the submap. Feeding classic's GICP the raw sweep instead introduces a
+  // velocity-dependent shear each scan — worse when moving faster — which
+  // GICP "corrects" for inconsistently tick to tick, and fuse_odom() then
+  // blends that noise in (this is why disabling registration/fuse made the
+  // jitter disappear entirely: the distorted-scan path was simply never
+  // exercised).
+  //
+  // Computed as T_prior.inverse() * current_scan: current_scan is already
+  // per-point deskewed into WORLD frame via (frames[i] * baselink2lidar_T)
+  // per point, and T_prior == frames[median_pt_index] by construction (see
+  // deskewPointcloud(), odom_callbacks.cc) — so this bulk un-transform
+  // exactly recovers a body-frame cloud with the intra-sweep motion
+  // compensation already baked in, WITHOUT reusing current_scan directly
+  // (which would still carry the LOCAL pipeline's own T_prior baked into its
+  // absolute frame — the same class of frame-mismatch bug this project hit
+  // once already). classic then applies its OWN T_predicted on top, exactly
+  // like it already does for latest_scan_.
+  pcl::PointCloud<PointType>::ConstPtr latest_scan_deskewed_body_;
+  // classic mode Case A's predict source. Deliberately NOT latest_scan_T_:
+  // this->T (odom_registration.cc: T = T_corr * T_prior) is the RAW
+  // scan-to-local-submap GICP correction, captured BEFORE updateState()'s
+  // KF/EKF fuses it into state.p/state.q — i.e. before the same smoothing
+  // that "keyframe" mode's own published pose (state.p/q, see
+  // publishPose()) actually benefits from. Predicting off latest_scan_T_
+  // instead would feed classic_kf_ a noisier signal than what "keyframe"
+  // mode publishes for the exact same input, producing visible extra jitter
+  // that has nothing to do with classic's own registration/fuse layer.
+  // Captured under geo.mtx (state's own convention), then stored here
+  // alongside latest_scan_T_ under latest_scan_mtx_ — see odom_callbacks.cc.
+  Eigen::Vector3f latest_scan_state_p_;
+  Eigen::Quaternionf latest_scan_state_q_;
   double latest_scan_time_;                          // wall time when scan was stored
   // Plain monotonic counter, incremented alongside latest_scan_T_/
   // latest_scan_time_ above — used by classic mode's staleness check instead
@@ -1020,6 +1059,17 @@ private:
   // caused the click's position to apply but not its orientation).
   // Protected by classic_state_mtx_.
   Eigen::Quaternionf classic_seed_q_ = Eigen::Quaternionf::Identity();
+  // Position to seed classic_kf_ from — same rationale as classic_seed_q_,
+  // but for position: deliberately NOT initial_position_. initial_position_
+  // is shared with the OLD keyframe pipeline (state.p bootstrap, relocalize
+  // recovery, etc in odom_callbacks.cc/odom_relocalization.cc) — writing it
+  // from an /initialpose click while classic mode is active would perturb
+  // the old pipeline's own internal state, which Case A (no external
+  // unlocalized_odom_topic) relies on as its map-agnostic local odom source.
+  // Set to initial_position_'s startup value once at param-load time
+  // (getParams()), then OVERWRITTEN only by callbackInitialPose() — never by
+  // anything belonging to the old pipeline. Protected by classic_state_mtx_.
+  Eigen::Vector3f classic_seed_p_ = Eigen::Vector3f::Zero();
   // Incremented as the very FIRST line of classic_localization_routine(),
   // before any guard/early-return — an unconditional tick counter to verify
   // the timer is actually firing repeatedly, independent of whether any
@@ -1043,6 +1093,20 @@ private:
   std::atomic<bool> classic_submap_hasChanged_{false};
   Eigen::Vector3f classic_last_roi_center_ = Eigen::Vector3f::Zero();
   bool classic_roi_initialized_ = false;
+  // Dedicated voxel filter for registration_to_prior_map()'s scan downsample.
+  // MUST NOT reuse the shared `voxel` member: that one is mutated
+  // (setInputCloud+filter, no mutex) by preprocessPoints() on the scan-
+  // callback thread (lidar_cb_group) every scan, while
+  // registration_to_prior_map() runs on classic_localization_timer_'s own
+  // thread (classic_cb_group_ — a separate MutuallyExclusive group, so it
+  // genuinely runs concurrently with the scan callback under the
+  // multi-threaded container). Two threads calling setInputCloud()/filter()
+  // on the SAME pcl::VoxelGrid instance is a data race — pcl::VoxelGrid is
+  // not reentrant/thread-safe — and was silently corrupting the scan fed to
+  // classic's GICP, producing inconsistent per-tick corrections (visible as
+  // jitter whenever the correction/fuse step was enabled, gone when it was
+  // disabled since the race was then never triggered).
+  pcl::VoxelGrid<PointType> classic_voxel_;
 
   // GPS params
   bool gps_enabled_ = false;

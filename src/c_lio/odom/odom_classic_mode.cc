@@ -17,7 +17,8 @@
  *   2. Differenced against the previous tick's value to get a           *
  *      delta, fed into classic_kf_.predict().                            *
  *   3. registration_to_prior_map() registers the latest scan             *
- *      (latest_scan_) against the frozen prior map ROI, using             *
+ *      (latest_scan_deskewed_body_ — motion-compensated, body frame,      *
+ *      NOT the raw latest_scan_) against the frozen prior map ROI, using  *
  *      DEDICATED classic_engine_/classic_submap_* resources (kept          *
  *      separate from engine_/engine_temp_/submap_* so it never races        *
  *      the local pipeline's own async submap builder running                *
@@ -88,18 +89,20 @@ std::tuple<Eigen::Vector3f, Eigen::Quaternionf, uint64_t> c_lio::OdomNode::updat
   }
 
   // Case A: no odometry hardware wired up — reuse the ORIGINAL keyframe-based
-  // local odometry pipeline's own this->T, snapshotted via latest_scan_T_/
-  // latest_scan_seq_ (already mutex-guarded, populated every scan in
-  // callbackPointCloud()).
-  Eigen::Matrix4f T;
+  // local odometry pipeline's own KF/EKF-smoothed pose (state.p/q, snapshotted
+  // as latest_scan_state_p_/q_ right after updateState() runs each scan — see
+  // odom_callbacks.cc), NOT latest_scan_T_ (the raw pre-fusion GICP
+  // correction — see latest_scan_state_p_'s comment in odom.h for why that
+  // was a source of extra jitter vs "keyframe" mode's own published output).
+  Eigen::Vector3f p;
+  Eigen::Quaternionf q;
   uint64_t seq;
   {
     std::lock_guard<std::mutex> lock(this->latest_scan_mtx_);
-    T = this->latest_scan_T_;
+    p = this->latest_scan_state_p_;
+    q = this->latest_scan_state_q_;
     seq = this->latest_scan_seq_;
   }
-  Eigen::Vector3f p = T.block<3, 1>(0, 3);
-  Eigen::Quaternionf q(Eigen::Matrix3f(T.block<3, 3>(0, 0)));
   q.normalize();
   return {p, q, seq};
 }
@@ -198,10 +201,15 @@ bool c_lio::OdomNode::buildClassicPriorMapRoiSubmap(const State &vehicle_state)
 bool c_lio::OdomNode::registration_to_prior_map(Eigen::Vector3f &meas_p, Eigen::Quaternionf &meas_q,
                                                 double &score, bool &converged)
 {
+  // latest_scan_deskewed_body_ — NOT latest_scan_ (raw/undeskewed). See its
+  // comment in odom.h: it's already motion-compensated and already in
+  // base_link frame (baselink2lidar_T is baked in during its construction),
+  // so unlike latest_scan_ it must NOT be multiplied by baselink2lidar_T
+  // again below.
   pcl::PointCloud<PointType>::ConstPtr scan_body;
   {
     std::lock_guard<std::mutex> lock(this->latest_scan_mtx_);
-    scan_body = this->latest_scan_;
+    scan_body = this->latest_scan_deskewed_body_;
   }
   if (!scan_body || scan_body->empty())
     return false;
@@ -219,12 +227,14 @@ bool c_lio::OdomNode::registration_to_prior_map(Eigen::Vector3f &meas_p, Eigen::
   T_predicted.block<3, 1>(0, 3) = pred_p;
 
   pcl::PointCloud<PointType>::Ptr scan_in_map = std::make_shared<pcl::PointCloud<PointType>>();
-  pcl::transformPointCloud(*scan_body, *scan_in_map, T_predicted * this->extrinsics.baselink2lidar_T);
+  pcl::transformPointCloud(*scan_body, *scan_in_map, T_predicted);
 
   if (this->vf_use_)
   {
-    this->voxel.setInputCloud(scan_in_map);
-    this->voxel.filter(*scan_in_map);
+    // classic_voxel_, NOT voxel — see classic_voxel_'s comment in odom.h
+    // (sharing `voxel` with preprocessPoints() is a cross-thread data race).
+    this->classic_voxel_.setInputCloud(scan_in_map);
+    this->classic_voxel_.filter(*scan_in_map);
   }
 
   State roi_state;
@@ -268,9 +278,9 @@ bool c_lio::OdomNode::apply_corr_gate(const Eigen::Vector3f &meas_p, const Eigen
   if (this->classic_tick_count_.load() % 40 == 1)
   {
     RCLCPP_DEBUG(this->get_logger(),
-                "[classic] gate input: meas=[%.2f, %.2f, %.2f] score=%.4f (max=%.4f) converged=%d",
-                meas_p[0], meas_p[1], meas_p[2], score,
-                this->classic_max_corr_scan_score_threshold_, static_cast<int>(converged));
+                 "[classic] gate input: meas=[%.2f, %.2f, %.2f] score=%.4f (max=%.4f) converged=%d",
+                 meas_p[0], meas_p[1], meas_p[2], score,
+                 this->classic_max_corr_scan_score_threshold_, static_cast<int>(converged));
   }
 
   // Mirrors evaluatePoseGate()'s gate 0/1/3/4 (odom_registration.cc), just
@@ -308,16 +318,17 @@ void c_lio::OdomNode::fuse_odom(const Eigen::Vector3f &meas_p, const Eigen::Quat
 
 void c_lio::OdomNode::seedClassicKF()
 {
-  // Seed from initial_position_ (config default at startup, or the last
-  // /initialpose click's map-frame guess, z pulled from the map) +
-  // classic_seed_q_ (yaw-only config default at startup, or the click's
-  // orientation guess). Deliberately NOT state.q — see classic_seed_q_'s
-  // comment in odom.h for why (state.q gets raced/overwritten by
-  // propagateState()'s 200Hz IMU dead-reckoning before this ever reads it).
-  Eigen::Vector3f p0 = this->initial_position_;
+  // Seed from classic_seed_p_/classic_seed_q_ (config default at startup, or
+  // the last /initialpose click's map-frame guess). Deliberately NOT
+  // initial_position_/state.q — those belong to the OLD keyframe pipeline;
+  // reading them here would mean an /initialpose click while classic mode is
+  // active perturbs the old pipeline's own state (see classic_seed_p_'s
+  // comment in odom.h).
+  Eigen::Vector3f p0;
   Eigen::Quaternionf q0;
 
   std::lock_guard<std::mutex> lock(this->classic_state_mtx_);
+  p0 = this->classic_seed_p_;
   q0 = this->classic_seed_q_;
   q0.normalize();
 
@@ -363,9 +374,14 @@ void c_lio::OdomNode::classic_localization_routine()
   // registration takes over immediately, which is already its normal job).
   if (this->request_fresh_reloc_.exchange(false))
   {
+    Eigen::Vector3f seed_p_log;
+    {
+      std::lock_guard<std::mutex> lock(this->classic_state_mtx_);
+      seed_p_log = this->classic_seed_p_;
+    }
     RCLCPP_INFO(this->get_logger(),
                 "[classic] /initialpose received — snapping to [%.1f, %.1f]",
-                this->initial_position_[0], this->initial_position_[1]);
+                seed_p_log[0], seed_p_log[1]);
     this->classic_roi_initialized_ = false;
     this->seedClassicKF();
 

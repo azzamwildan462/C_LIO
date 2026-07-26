@@ -994,9 +994,36 @@ void c_lio::OdomNode::callbackPointCloud(const sensor_msgs::msg::PointCloud2::Sh
   // its own gravity rotation. Using odom-frame scans causes double-rotation → SC fails.
   if (this->continuous_localize_ || this->occupancy_grid_enabled_ || this->submap_loc_enabled_ || this->submap_method_ == "classic")
   {
+    // classic mode's Case A predict source is the KF/EKF-smoothed state.p/q
+    // (updateState() already ran above, this scan's fusion is final) — NOT
+    // this->T, which is the raw pre-fusion GICP correction. See
+    // latest_scan_state_p_'s comment in odom.h.
+    Eigen::Vector3f state_p;
+    Eigen::Quaternionf state_q;
+    {
+      std::lock_guard<std::mutex> lock(this->geo.mtx);
+      state_p = this->state.p;
+      state_q = this->state.q;
+    }
+
+    // classic mode's registration input — motion-compensated (deskewed) but
+    // frame-agnostic (body frame at this scan's median sweep time). See
+    // latest_scan_deskewed_body_'s comment in odom.h for the math.
+    pcl::PointCloud<PointType>::ConstPtr deskewed_body;
+    if (this->submap_method_ == "classic" && this->current_scan && !this->current_scan->empty())
+    {
+      auto tmp = std::make_shared<pcl::PointCloud<PointType>>();
+      pcl::transformPointCloud(*this->current_scan, *tmp, this->T_prior.inverse());
+      deskewed_body = tmp;
+    }
+
     std::lock_guard<std::mutex> lock(this->latest_scan_mtx_);
     this->latest_scan_ = this->original_scan;
+    if (deskewed_body)
+      this->latest_scan_deskewed_body_ = deskewed_body;
     this->latest_scan_T_ = this->T;
+    this->latest_scan_state_p_ = state_p;
+    this->latest_scan_state_q_ = state_q;
     this->latest_scan_time_ = this->now().seconds();
     this->latest_scan_seq_++;
   }

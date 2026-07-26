@@ -23,20 +23,20 @@
 
     # How often classic_localization_routine() ticks (Hz). Independent of the
     # LiDAR scan rate.
-    odom/classic/routine_rate_hz: 100.0
+    odom/classic/routine_rate_hz: 50.0
 
     # --- Correction gate (apply_corr_gate()) ---
     # A registration correction is rejected (predict-only that tick) unless
     # ALL of these pass: GICP converged, fitness score within threshold, AND
     # the correction's translation/rotation jump is within threshold.
-    odom/classic/max_corr_scan_score_threshold: 1.0 # max GICP fitness score (lower = stricter)
-    odom/classic/max_corr_translation: 0.1 # max position jump per correction (m)
-    odom/classic/max_corr_rotation_deg: 2.0 # max rotation jump per correction (deg)
+    odom/classic/max_corr_scan_score_threshold: 0.9 # max GICP fitness score (lower = stricter)
+    odom/classic/max_corr_translation: 1.0 # max position jump per correction (m)
+    odom/classic/max_corr_rotation_deg: 45.0 # max rotation jump per correction (deg)
 
     # --- Complementary filter blend weight (fuse_odom()) ---
     # Fraction to blend toward the registration measurement each accepted
     # correction: 0 = never trust it (pure dead-reckoning), 1 = snap fully to
     # it every time. Not a covariance-based KF — no process/measurement noise
     # tuning needed, just these two weights.
-    odom/classic/kf/comp_alpha_pos: 0.001
-    odom/classic/kf/comp_alpha_rot: 0.001
+    odom/classic/kf/comp_alpha_pos: 0.05
+    odom/classic/kf/comp_alpha_rot: 0.05

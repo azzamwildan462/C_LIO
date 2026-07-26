@@ -993,6 +993,23 @@ void c_lio::OdomNode::callbackInitialPose(
     }
   }
 
+  if (this->submap_method_ == "classic")
+  {
+    // Classic mode: the click must snap classic_kf_ ONLY — it must NEVER
+    // touch initial_position_/state.q/use_prior_map_, since those belong to
+    // the OLD keyframe pipeline. When unlocalized_odom_topic=="" (Case A),
+    // that old pipeline keeps running unmodified as classic's own local odom
+    // source; writing its state here would perturb it and defeat the point
+    // of Case A being map-agnostic. classic_seed_p_/classic_seed_q_ are
+    // dedicated variables read only by seedClassicKF().
+    {
+      std::lock_guard<std::mutex> lock(this->classic_state_mtx_);
+      this->classic_seed_p_ = Eigen::Vector3f(static_cast<float>(p.x),
+                                              static_cast<float>(p.y), seed_z);
+      this->classic_seed_q_ = guess_q;
+    }
+  }
+  else
   {
     std::lock_guard<std::mutex> lock(this->state_mtx_);
     this->initial_position_ = Eigen::Vector3f(static_cast<float>(p.x),
@@ -1000,22 +1017,20 @@ void c_lio::OdomNode::callbackInitialPose(
     this->state.q = guess_q; // base orientation for the yaw-sweep hypotheses
   }
 
-  // Classic mode's own seed orientation — deliberately a SEPARATE variable
-  // from state.q (see classic_seed_q_'s comment in odom.h): state.q gets
-  // overwritten by propagateState()'s continuous 200Hz IMU dead-reckoning
-  // within milliseconds, since that write isn't excluded by state_mtx_
-  // (different mutex, geo.mtx). classic_localization_routine() reads THIS
-  // instead, so the click's orientation actually sticks for classic mode.
+  // Request a FRESH relocalization. For the old pipeline this drops live
+  // keyframes, zeros velocity/observer/map->odom, then refines ONLY around
+  // the click (guess-only) so SC matches can't override it — done on the
+  // odom thread to avoid racing the live keyframe/submap state. For classic
+  // mode this same flag is instead drained exclusively by
+  // classic_localization_routine() (see odom_callbacks.cc's guard on this
+  // flag), which just re-seeds classic_kf_ from classic_seed_p_/q_ above —
+  // the old pipeline's fresh-reloc block is skipped entirely for classic, so
+  // use_prior_map_ doesn't need touching either (classic reads
+  // prior_map_cloud_/prior_map_kdtree_ directly).
+  if (this->submap_method_ != "classic")
   {
-    std::lock_guard<std::mutex> lock(this->classic_state_mtx_);
-    this->classic_seed_q_ = guess_q;
+    this->use_prior_map_ = true;
   }
-
-  // Request a FRESH relocalization: the odometry thread will drop live keyframes,
-  // zero velocity/observer/map->odom, then refine ONLY around the click
-  // (guess-only) so SC matches can't override it. Doing the reset on the odom
-  // thread avoids racing the live keyframe/submap state.
-  this->use_prior_map_ = true;
   this->request_fresh_reloc_.store(true);
 
   double yaw_deg = std::atan2(2.f * (guess_q.w() * guess_q.z() + guess_q.x() * guess_q.y()),
