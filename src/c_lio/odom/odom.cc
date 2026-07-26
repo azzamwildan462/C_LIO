@@ -145,6 +145,36 @@ c_lio::OdomNode::OdomNode(const rclcpp::NodeOptions &options)
         odom_sub_opt);
   }
 
+  // Classic localization sub-mode: own timer (independent of the scan
+  // callback) + optional unlocalized_odom subscriber (Case B; Case A reads
+  // latest_scan_T_ instead — see odom_classic_mode.cc).
+  if (this->submap_method_param_ == "classic")
+  {
+    this->classic_cb_group_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+    this->classic_localization_timer_ = this->create_wall_timer(
+        std::chrono::duration<double>(1.0 / this->classic_routine_rate_hz_),
+        std::bind(&c_lio::OdomNode::classic_localization_routine, this),
+        this->classic_cb_group_);
+
+    if (!this->classic_unlocalized_odom_topic_.empty())
+    {
+      this->unlocalized_odom_cb_group_ = this->create_callback_group(
+          rclcpp::CallbackGroupType::MutuallyExclusive);
+      auto unlocalized_odom_opt = rclcpp::SubscriptionOptions();
+      unlocalized_odom_opt.callback_group = this->unlocalized_odom_cb_group_;
+      this->unlocalized_odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
+          this->classic_unlocalized_odom_topic_, rclcpp::SensorDataQoS(),
+          std::bind(&c_lio::OdomNode::callbackUnlocalizedOdom, this, std::placeholders::_1),
+          unlocalized_odom_opt);
+
+      RCLCPP_INFO(this->get_logger(), "[classic] subscribing to unlocalized_odom on '%s'",
+                  this->classic_unlocalized_odom_topic_.c_str());
+    }
+
+    RCLCPP_INFO(this->get_logger(), "[classic] routine timer started @ %.1f Hz",
+                this->classic_routine_rate_hz_);
+  }
+
   // GPS subscriber
   if (this->gps_enabled_)
   {
@@ -540,8 +570,12 @@ c_lio::OdomNode::OdomNode(const rclcpp::NodeOptions &options)
   RCLCPP_INFO(this->get_logger(), "[c_lio_odom] map/tf_source='%s', map_mode='%s'",
               this->tf_map_odom_source_.c_str(), this->map_mode_.c_str());
 
+  // Classic mode handles its own frozen-map correction (calc_scan_score()) —
+  // don't also run the old continuous-localize feature while in localization
+  // mode with classic configured (mapping-mode continuous-localize is
+  // unrelated to classic, which is localization-only, so left unguarded).
   bool cl_enabled = this->continuous_localize_ && this->use_prior_map_ &&
-                    (this->map_mode_ == "localization" ||
+                    ((this->map_mode_ == "localization" && this->submap_method_param_ != "classic") ||
                      (this->map_mode_ == "mapping" && this->continuous_localize_on_mapping_));
   if (cl_enabled)
   {
@@ -697,6 +731,19 @@ void c_lio::OdomNode::getParams()
   // Remember the configured method; in localization the effective method is
   // forced to "prior_map" (scan→frozen-map ROI) and restored on switch back.
   this->submap_method_param_ = this->submap_method_;
+
+  // Classic localization sub-mode (odom/submap/method == "classic") params.
+  // unlocalized_odom_topic left "" = no external odometry hardware wired up
+  // yet — Case A reads the local keyframe pipeline's own this->T instead.
+  c_lio::declare_param(this, "odom/classic/unlocalized_odom_topic", this->classic_unlocalized_odom_topic_, std::string(""));
+  c_lio::declare_param(this, "odom/classic/routine_rate_hz", this->classic_routine_rate_hz_, 10.0);
+  c_lio::declare_param(this, "odom/classic/max_corr_scan_score_threshold", this->classic_max_corr_scan_score_threshold_, 1.0);
+  c_lio::declare_param(this, "odom/classic/max_corr_translation", this->classic_max_corr_translation_, 5.0);
+  c_lio::declare_param(this, "odom/classic/max_corr_rotation_deg", this->classic_max_corr_rotation_deg_, 45.0);
+  // Complementary filter blend weight (0..1) applied each fuse_odom() call —
+  // 0 = never trust the registration measurement, 1 = snap fully to it.
+  c_lio::declare_param(this, "odom/classic/kf/comp_alpha_pos", this->classic_kf_params_.comp_alpha_pos, 0.05);
+  c_lio::declare_param(this, "odom/classic/kf/comp_alpha_rot", this->classic_kf_params_.comp_alpha_rot, 0.05);
 
   // Localization prior-map ROI submap parameters
   c_lio::declare_param(this, "odom/localization/roi_radius", this->loc_roi_radius_, 60.0);
@@ -1141,6 +1188,9 @@ void c_lio::OdomNode::getParams()
 
     setupEngine(this->loc_registration_, loc_reg_method, this->gicp_max_corr_dist_);
     setupEngine(this->reloc_registration_, loc_reg_method, 5.0); // wider for relocalization
+    // Classic mode's OWN frozen-map registration (kept separate from
+    // engine_/engine_temp_ — see classic_engine_'s declaration in odom.h).
+    setupEngine(this->classic_engine_, loc_reg_method, this->gicp_max_corr_dist_);
 
     RCLCPP_INFO(this->get_logger(), "[odom] Localization registration: %s", loc_reg_method.c_str());
   }
@@ -1156,7 +1206,11 @@ void c_lio::OdomNode::getParams()
   // the prior map. Trade-off: keyframes accumulate (memory grows on long runs).
   // The "prior_map" ROI method is still available via odom/submap/method.
   this->keyframing_enabled_ = true;
-  this->submap_method_ = this->submap_method_param_;
+  // "classic" is a localization-only sub-mode (see odom_classic_mode.cc);
+  // mapping mode has no meaning for it, so sanitize at startup too.
+  this->submap_method_ = (this->map_mode_ == "mapping" && this->submap_method_param_ == "classic")
+                             ? std::string("keyframe")
+                             : this->submap_method_param_;
 
   c_lio::declare_param(this, "map/tf_source", this->tf_map_odom_source_, std::string("odom"));
   c_lio::declare_param(this, "map/path", this->map_path_, std::string(""));
@@ -1186,6 +1240,10 @@ void c_lio::OdomNode::getParams()
   c_lio::declare_param(this, "map/initial_pose/yaw", init_yaw, 0.0);
   this->initial_position_ = Eigen::Vector3f(init_x, init_y, init_z);
   this->initial_yaw_ = init_yaw * M_PI / 180.0;
+  // Default classic-mode seed orientation (yaw-only — no gravity roll/pitch
+  // composed in, unlike state.q, to stay fully independent of it). Overwritten
+  // by callbackInitialPose() on an actual /initialpose click.
+  this->classic_seed_q_ = Eigen::Quaternionf(Eigen::AngleAxisf(this->initial_yaw_, Eigen::Vector3f::UnitZ()));
 
   // Scan Context Relocalization
   c_lio::declare_param(this, "map/relocalize", this->relocalize_, false);

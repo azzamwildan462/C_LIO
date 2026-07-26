@@ -17,6 +17,7 @@
 #include "c_lio/algorithms/robust_icp.h"
 #include "c_lio/algorithms/voxel_hash_map.h"
 #include "c_lio/algorithms/error_state_ekf.h"
+#include "c_lio/algorithms/classic_mode_kf.h"
 #include "c_lio/engines/registration_engine.h"
 #include "c_lio/engines/prefilter_engine.h"
 // registration_helper.h removed — using registration_engine.h
@@ -87,6 +88,7 @@ namespace c_lio
 
 // STL (explicit for GPS buffer)
 #include <deque>
+#include <tuple>
 
 // BOOST
 #include <boost/format.hpp>
@@ -230,6 +232,45 @@ private:
   bool buildPriorMapRoiSubmap(const State &vehicle_state);
   // Localization memory bound: free clouds/covariances of old live keyframes.
   void pruneLocalizationKeyframes();
+
+  // Classic localization sub-mode (odom/submap/method == "classic"). Runs on
+  // its own timer (classic_localization_timer_), independent of the scan
+  // callback — see src/c_lio/odom/odom_classic_mode.cc.
+  void callbackUnlocalizedOdom(const nav_msgs::msg::Odometry::SharedPtr msg);
+  // Returns (position, orientation, source_sequence_number). The sequence
+  // number lets classic_localization_routine() skip ticks where the
+  // underlying source (latest_scan_seq_ for Case A, classic_unlocalized_
+  // odom_seq_ for Case B) hasn't actually produced new data yet —
+  // classic_localization_timer_ runs at its own configured rate, decoupled
+  // from the scan/topic rate, so without this check a faster timer would
+  // repeatedly read the same stale value (zero delta) between real updates,
+  // then jump — a stair-step pattern that reads as jitter. Deliberately a
+  // plain counter, NOT this->now()-derived — see latest_scan_seq_'s comment.
+  std::tuple<Eigen::Vector3f, Eigen::Quaternionf, uint64_t> update_unlocalized_odom();
+  bool registration_to_prior_map(Eigen::Vector3f &meas_p, Eigen::Quaternionf &meas_q,
+                                 double &score, bool &converged);
+  // Classic-dedicated clone of buildPriorMapRoiSubmap() — writes into
+  // classic_submap_*/classic_roi_initialized_/classic_last_roi_center_ and
+  // uses classic_engine_, so it never touches the buffers the concurrently-
+  // running local keyframe pipeline's own async submap builder may be
+  // writing into.
+  bool buildClassicPriorMapRoiSubmap(const State &vehicle_state);
+  double calc_scan_score();
+  bool apply_corr_gate(const Eigen::Vector3f &meas_p, const Eigen::Quaternionf &meas_q,
+                       double score, bool converged);
+  void fuse_odom(const Eigen::Vector3f &meas_p, const Eigen::Quaternionf &meas_q);
+  // (Re-)seed classic_kf_ from initial_position_ + the current state.q — used
+  // both on first bootstrap and after a fresh /initialpose click.
+  void seedClassicKF();
+  void classic_localization_routine();
+  // Clone of publishToROS()/publishCloud() sourced from classic_kf_ instead
+  // of lidarPose/T. Deliberately takes NO cloud parameters — published_cloud/
+  // deskewed_scan from the scan callback are already in the LOCAL keyframe
+  // pipeline's own frame (via T_prior), which is unrelated to classic_kf_'s
+  // pose; using them here would silently double-transform (the same frame-
+  // mismatch bug an earlier draft hit). Grabs latest_scan_ (raw sensor-frame)
+  // itself instead. See src/c_lio/odom/odom_services.cc.
+  void publishClassicToROS();
 
   void loadPriorMap();
 
@@ -836,6 +877,14 @@ private:
   pcl::PointCloud<PointType>::ConstPtr latest_scan_; // body/sensor frame
   Eigen::Matrix4f latest_scan_T_;                    // T at time of scan (body→odom)
   double latest_scan_time_;                          // wall time when scan was stored
+  // Plain monotonic counter, incremented alongside latest_scan_T_/
+  // latest_scan_time_ above — used by classic mode's staleness check instead
+  // of latest_scan_time_, since that relies on this->now() (ROS/wall clock),
+  // which was observed frozen in at least one deployment environment
+  // (use_sim_time without a working /clock source), silently breaking any
+  // clock-based comparison (including RCLCPP_*_THROTTLE macros, which use
+  // the same clock internally).
+  uint64_t latest_scan_seq_ = 0;
   std::mutex latest_scan_mtx_;
 
   // Confidence publisher + global correction control
@@ -918,6 +967,82 @@ private:
   std::mutex ext_odom_mtx_;
   std::atomic<bool> ext_odom_received_{false};
   double ext_odom_stamp_ = 0.0;
+
+  // Classic localization sub-mode (odom/submap/method == "classic")
+  rclcpp::TimerBase::SharedPtr classic_localization_timer_;
+  rclcpp::CallbackGroup::SharedPtr classic_cb_group_;
+  double classic_routine_rate_hz_ = 10.0;
+
+  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr unlocalized_odom_sub_;
+  rclcpp::CallbackGroup::SharedPtr unlocalized_odom_cb_group_;
+  std::string classic_unlocalized_odom_topic_ = "";
+  std::mutex classic_unlocalized_odom_mtx_;
+  nav_msgs::msg::Odometry::SharedPtr classic_latest_unlocalized_odom_;
+  // Plain monotonic counter, incremented in callbackUnlocalizedOdom() each
+  // time a new message arrives — see latest_scan_seq_'s comment for why this
+  // is used instead of a clock-derived timestamp (Case B equivalent).
+  uint64_t classic_unlocalized_odom_seq_ = 0;
+
+  // "cls_unlocalized_odom" / prev — raw odom input (Case A: local keyframe
+  // pipeline's this->T via latest_scan_T_; Case B: unlocalized_odom topic),
+  // BEFORE fusion. Differenced each tick to drive classic_kf_.predict().
+  Eigen::Vector3f cls_prev_unlocalized_odom_p_ = Eigen::Vector3f::Zero();
+  Eigen::Quaternionf cls_prev_unlocalized_odom_q_ = Eigen::Quaternionf::Identity();
+  // Last source sequence number actually consumed — classic_localization_
+  // routine() skips a tick entirely (no predict, no register) if
+  // update_unlocalized_odom()'s source hasn't produced anything newer than
+  // this, since classic_localization_timer_ runs decoupled from the scan/
+  // topic rate. A plain counter (latest_scan_seq_/classic_unlocalized_odom_
+  // seq_), NOT a clock-derived timestamp — this->now()/get_clock()->now()
+  // were observed frozen in at least one deployment environment
+  // (use_sim_time without a working /clock source), which would otherwise
+  // make this check (and RCLCPP_*_THROTTLE logging) silently never fire.
+  uint64_t classic_last_source_seq_used_ = 0;
+
+  // "cls_odom_filtered" == classic_kf_.position()/orientation() — the final,
+  // fused output. Protected by classic_state_mtx_ since classic_localization_
+  // timer_ (writer) and publishPose()/publishClassicToROS() (readers, called
+  // from different callback groups) can run concurrently.
+  std::mutex classic_state_mtx_;
+  c_lio::ClassicModeKF classic_kf_;
+  c_lio::ClassicModeKFParams classic_kf_params_;
+  bool classic_kf_initialized_ = false;
+  // Orientation to seed classic_kf_ from — set to AngleAxisf(initial_yaw_,
+  // UnitZ()) once at param-load time (getParams()), and OVERWRITTEN by
+  // callbackInitialPose() with the /initialpose click's own orientation.
+  // Deliberately NOT read from state.q: callbackInitialPose() writes
+  // state.q under state_mtx_, but propagateState() (200Hz, from
+  // callbackImu()) ALSO writes state.q continuously under geo.mtx — a
+  // different mutex that provides no exclusion between the two. Without a
+  // dedicated variable, propagateState()'s continuing dead-reckoning
+  // overwrites the click's orientation within milliseconds, before
+  // classic_localization_routine()'s next tick ever reads it (this is what
+  // caused the click's position to apply but not its orientation).
+  // Protected by classic_state_mtx_.
+  Eigen::Quaternionf classic_seed_q_ = Eigen::Quaternionf::Identity();
+  // Incremented as the very FIRST line of classic_localization_routine(),
+  // before any guard/early-return — an unconditional tick counter to verify
+  // the timer is actually firing repeatedly, independent of whether any
+  // throttled log inside the routine itself is visible/being seen.
+  std::atomic<uint64_t> classic_tick_count_{0};
+
+  // Gate thresholds (mirror gate_fitness_threshold_/gate_max_translation_/
+  // gate_max_rotation_deg_ — see apply_corr_gate())
+  double classic_max_corr_scan_score_threshold_ = 1.0;
+  double classic_max_corr_translation_ = 5.0;
+  double classic_max_corr_rotation_deg_ = 45.0;
+
+  // Dedicated registration resources for classic's OWN frozen-map ROI
+  // registration — MUST be separate from engine_/engine_temp_/submap_*/
+  // roi_initialized_/last_roi_center_, which the concurrently-active local
+  // keyframe pipeline (Case A) and its async submap-build thread also use.
+  c_lio::RegistrationEngine classic_engine_;
+  pcl::PointCloud<PointType>::ConstPtr classic_submap_cloud_;
+  std::shared_ptr<const nano_gicp::CovarianceList> classic_submap_normals_;
+  std::shared_ptr<const nanoflann::KdTreeFLANN<PointType>> classic_submap_kdtree_;
+  std::atomic<bool> classic_submap_hasChanged_{false};
+  Eigen::Vector3f classic_last_roi_center_ = Eigen::Vector3f::Zero();
+  bool classic_roi_initialized_ = false;
 
   // GPS params
   bool gps_enabled_ = false;

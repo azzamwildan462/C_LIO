@@ -61,82 +61,106 @@ void c_lio::OdomNode::loadPriorMap()
   RCLCPP_INFO(this->get_logger(), "Prior map cloud stored: %zu pts, KdTree built",
               this->prior_map_cloud_->size());
 
-  // 3. Compute covariances for all points (GICP only)
-  std::shared_ptr<const nano_gicp::CovarianceList> all_covs;
-  if (this->engine_.needsCovariances())
+  // Classic mode's local odometry (used when classic_unlocalized_odom_topic_
+  // is empty) must stay map-agnostic: don't inject the frozen map's virtual
+  // keyframes into `keyframes` (steps 3-5 below), and don't seed state.p from
+  // initial_position_/build an initial submap from them (steps 7-8) — that
+  // would pull the local keyframe pipeline toward the map, contradicting
+  // "no relation to the map". classic_kf_'s own seeding/ROI target are
+  // handled separately by seedClassicKF()/buildClassicPriorMapRoiSubmap(),
+  // using prior_map_cloud_/prior_map_kdtree_ (still stored above) directly.
+  if (this->submap_method_ == "classic")
   {
-    nano_gicp::NanoGICP<PointType, PointType> tmp_gicp;
-    tmp_gicp.setCorrespondenceRandomness(this->gicp_k_correspondences_);
-    tmp_gicp.setInputSource(cloud);
-    tmp_gicp.calculateSourceCovariances();
-    all_covs = tmp_gicp.getSourceCovariances();
+    this->num_processed_keyframes = 0;
+    this->num_prior_keyframes_ = 0;
   }
-  // NOTE: we deliberately do NOT persist all_covs into prior_map_covariances_
-  // — for a 20M-point map that's ~2.5 GB of RAM, and the active localization
-  // (keyframe-growth) doesn't use it. If the "prior_map" ROI method is ever
-  // re-enabled, buildPriorMapRoiSubmap() recomputes covariances per-ROI on the
-  // fly (its built-in fallback), which is cheap for a 60 m region.
-  // all_covs is still used just below to build the chunk (virtual-keyframe)
-  // covariances, then freed when it goes out of scope.
-
-  // 4. Split into spatial grid chunks
-  double cs = this->map_chunk_size_;
-  std::map<std::pair<int, int>, std::vector<int>> grid;
-
-  for (size_t i = 0; i < cloud->points.size(); i++)
+  else
   {
-    int gx = static_cast<int>(std::floor(cloud->points[i].x / cs));
-    int gy = static_cast<int>(std::floor(cloud->points[i].y / cs));
-    grid[{gx, gy}].push_back(static_cast<int>(i));
-  }
-
-  // 5. Create virtual keyframes from each chunk
-  int min_points_per_chunk = 50;
-  rclcpp::Time placeholder_stamp(0, 0, RCL_ROS_TIME);
-  Eigen::Quaternionf identity_q(1.f, 0.f, 0.f, 0.f);
-  Eigen::Matrix4f identity_T = Eigen::Matrix4f::Identity();
-
-  for (auto &[cell, indices] : grid)
-  {
-    if (static_cast<int>(indices.size()) < min_points_per_chunk)
-      continue;
-
-    // Build chunk cloud and covariances
-    pcl::PointCloud<PointType>::Ptr chunk_cloud = std::make_shared<pcl::PointCloud<PointType>>();
-    chunk_cloud->points.resize(indices.size());
-    std::shared_ptr<nano_gicp::CovarianceList> chunk_covs;
+    // 3. Compute covariances for all points (GICP only)
+    std::shared_ptr<const nano_gicp::CovarianceList> all_covs;
     if (this->engine_.needsCovariances())
     {
-      chunk_covs = std::make_shared<nano_gicp::CovarianceList>(indices.size());
+      nano_gicp::NanoGICP<PointType, PointType> tmp_gicp;
+      tmp_gicp.setCorrespondenceRandomness(this->gicp_k_correspondences_);
+      tmp_gicp.setInputSource(cloud);
+      tmp_gicp.calculateSourceCovariances();
+      all_covs = tmp_gicp.getSourceCovariances();
+    }
+    // NOTE: we deliberately do NOT persist all_covs into prior_map_covariances_
+    // — for a 20M-point map that's ~2.5 GB of RAM, and the active localization
+    // (keyframe-growth) doesn't use it. If the "prior_map" ROI method is ever
+    // re-enabled, buildPriorMapRoiSubmap() recomputes covariances per-ROI on the
+    // fly (its built-in fallback), which is cheap for a 60 m region.
+    // all_covs is still used just below to build the chunk (virtual-keyframe)
+    // covariances, then freed when it goes out of scope.
+
+    // 4. Split into spatial grid chunks
+    double cs = this->map_chunk_size_;
+    std::map<std::pair<int, int>, std::vector<int>> grid;
+
+    for (size_t i = 0; i < cloud->points.size(); i++)
+    {
+      int gx = static_cast<int>(std::floor(cloud->points[i].x / cs));
+      int gy = static_cast<int>(std::floor(cloud->points[i].y / cs));
+      grid[{gx, gy}].push_back(static_cast<int>(i));
     }
 
-    Eigen::Vector3f centroid(0.f, 0.f, 0.f);
-    for (size_t j = 0; j < indices.size(); j++)
+    // 5. Create virtual keyframes from each chunk
+    int min_points_per_chunk = 50;
+    rclcpp::Time placeholder_stamp(0, 0, RCL_ROS_TIME);
+    Eigen::Quaternionf identity_q(1.f, 0.f, 0.f, 0.f);
+    Eigen::Matrix4f identity_T = Eigen::Matrix4f::Identity();
+
+    for (auto &[cell, indices] : grid)
     {
-      chunk_cloud->points[j] = cloud->points[indices[j]];
+      if (static_cast<int>(indices.size()) < min_points_per_chunk)
+        continue;
+
+      // Build chunk cloud and covariances
+      pcl::PointCloud<PointType>::Ptr chunk_cloud = std::make_shared<pcl::PointCloud<PointType>>();
+      chunk_cloud->points.resize(indices.size());
+      std::shared_ptr<nano_gicp::CovarianceList> chunk_covs;
       if (this->engine_.needsCovariances())
       {
-        (*chunk_covs)[j] = (*all_covs)[indices[j]];
+        chunk_covs = std::make_shared<nano_gicp::CovarianceList>(indices.size());
       }
-      centroid += chunk_cloud->points[j].getVector3fMap();
+
+      Eigen::Vector3f centroid(0.f, 0.f, 0.f);
+      for (size_t j = 0; j < indices.size(); j++)
+      {
+        chunk_cloud->points[j] = cloud->points[indices[j]];
+        if (this->engine_.needsCovariances())
+        {
+          (*chunk_covs)[j] = (*all_covs)[indices[j]];
+        }
+        centroid += chunk_cloud->points[j].getVector3fMap();
+      }
+      centroid /= static_cast<float>(indices.size());
+      chunk_cloud->width = chunk_cloud->points.size();
+      chunk_cloud->height = 1;
+      chunk_cloud->is_dense = true;
+
+      // Add as keyframe (cloud is already in world frame)
+      this->keyframes.push_back(std::make_pair(
+          std::make_pair(centroid, identity_q),
+          pcl::PointCloud<PointType>::ConstPtr(chunk_cloud)));
+      this->keyframe_timestamps.push_back(placeholder_stamp);
+      this->keyframe_normals.push_back(chunk_covs);
+      this->keyframe_transformations.push_back(identity_T);
     }
-    centroid /= static_cast<float>(indices.size());
-    chunk_cloud->width = chunk_cloud->points.size();
-    chunk_cloud->height = 1;
-    chunk_cloud->is_dense = true;
 
-    // Add as keyframe (cloud is already in world frame)
-    this->keyframes.push_back(std::make_pair(
-        std::make_pair(centroid, identity_q),
-        pcl::PointCloud<PointType>::ConstPtr(chunk_cloud)));
-    this->keyframe_timestamps.push_back(placeholder_stamp);
-    this->keyframe_normals.push_back(chunk_covs);
-    this->keyframe_transformations.push_back(identity_T);
+    // 6. Mark all loaded keyframes as already processed (they're in world frame)
+    this->num_processed_keyframes = this->keyframes.size();
+    this->num_prior_keyframes_ = this->keyframes.size();
+
+    // 7. Set initial state
+    this->state.p = this->initial_position_;
+    this->origin = this->initial_position_;
+
+    // 8. Build initial submap synchronously
+    this->buildSubmap(this->state);
+    this->new_submap_is_ready = true;
   }
-
-  // 6. Mark all loaded keyframes as already processed (they're in world frame)
-  this->num_processed_keyframes = this->keyframes.size();
-  this->num_prior_keyframes_ = this->keyframes.size();
 
   // 6b. Load KFDB (real keyframe SC descriptors) if available, else fall back to chunk-based SC
   if (this->loadKeyframeDatabase())
@@ -150,14 +174,6 @@ void c_lio::OdomNode::loadPriorMap()
     RCLCPP_INFO(this->get_logger(), "ScanContext: built database with %zu entries from %d map chunks (no KFDB found)",
                 this->sc_database_.size(), this->num_prior_keyframes_);
   }
-
-  // 7. Set initial state
-  this->state.p = this->initial_position_;
-  this->origin = this->initial_position_;
-
-  // 8. Build initial submap synchronously
-  this->buildSubmap(this->state);
-  this->new_submap_is_ready = true;
 
   RCLCPP_INFO(this->get_logger(),
               "Prior map loaded: %d chunks (%zu total points), initial pose=[%.1f, %.1f, %.1f]",

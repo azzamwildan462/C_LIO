@@ -1,0 +1,42 @@
+###########################################################
+# Classic Localization Sub-Mode                            #
+# (odom/submap/method: "classic") — odom-delta              #
+# complementary-filter fusion against the frozen prior map.  #
+# Runs on its own timer (classic_localization_routine, see   #
+# odom_classic_mode.cc), independent of the scan callback.   #
+#                                                             #
+# NOTE: this sub-mode does NOT support ScanContext            #
+# relocalization or the old "auto relocalize"/continuous-      #
+# localize feature — it always anchors from                    #
+# map/initial_position/map/initial_yaw at startup, and snaps    #
+# directly to /initialpose clicks. Localization-only; ignored    #
+# while map/mode == "mapping".                                    #
+###########################################################
+
+/**:
+  ros__parameters:
+    # Un-localized odometry input (e.g. wheel/visual odom in its own frame).
+    # Leave "" if no odometry hardware is wired up yet (e.g. trial rosbag) —
+    # classic mode still runs, predicting instead from the ORIGINAL keyframe-
+    # based local odometry pipeline's own motion (differenced each tick).
+    odom/classic/unlocalized_odom_topic: ""
+
+    # How often classic_localization_routine() ticks (Hz). Independent of the
+    # LiDAR scan rate.
+    odom/classic/routine_rate_hz: 100.0
+
+    # --- Correction gate (apply_corr_gate()) ---
+    # A registration correction is rejected (predict-only that tick) unless
+    # ALL of these pass: GICP converged, fitness score within threshold, AND
+    # the correction's translation/rotation jump is within threshold.
+    odom/classic/max_corr_scan_score_threshold: 1.0 # max GICP fitness score (lower = stricter)
+    odom/classic/max_corr_translation: 0.1 # max position jump per correction (m)
+    odom/classic/max_corr_rotation_deg: 2.0 # max rotation jump per correction (deg)
+
+    # --- Complementary filter blend weight (fuse_odom()) ---
+    # Fraction to blend toward the registration measurement each accepted
+    # correction: 0 = never trust it (pure dead-reckoning), 1 = snap fully to
+    # it every time. Not a covariance-based KF — no process/measurement noise
+    # tuning needed, just these two weights.
+    odom/classic/kf/comp_alpha_pos: 0.001
+    odom/classic/kf/comp_alpha_rot: 0.001

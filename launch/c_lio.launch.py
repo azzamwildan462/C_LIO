@@ -84,6 +84,7 @@ def generate_launch_description():
     fusion_yaml_path = PathJoinSubstitution([current_pkg, 'cfg', 'fusion.yaml'])
     map_yaml_path = PathJoinSubstitution([current_pkg, 'cfg', 'map.yaml'])
     occupancy_yaml_path = PathJoinSubstitution([current_pkg, 'cfg', 'occupancy_grid.yaml'])
+    classic_mode_yaml_path = PathJoinSubstitution([current_pkg, 'cfg', 'classic_mode.yaml'])
     lio_sam_opt_yaml_path = PathJoinSubstitution([current_pkg, 'cfg', 'lio_sam_map_optimization.yaml'])
 
     # Map params override (passed to both OdomNode and MapNode)
@@ -102,7 +103,7 @@ def generate_launch_description():
                 package='c_lio',
                 plugin='c_lio::OdomNode',
                 name='c_lio_odom',
-                parameters=[c_lio_yaml_path, sensor_yaml_path, odom_yaml_path, fusion_yaml_path, map_yaml_path, occupancy_yaml_path, map_params, odom_extra_params, {'gps/topic': gps_topic, 'odom/external_odom/topic': ext_odom_topic}],
+                parameters=[c_lio_yaml_path, sensor_yaml_path, odom_yaml_path, fusion_yaml_path, map_yaml_path, occupancy_yaml_path, classic_mode_yaml_path, map_params, odom_extra_params, {'gps/topic': gps_topic, 'odom/external_odom/topic': ext_odom_topic}],
                 remappings=[
                     ('pointcloud', pointcloud_topic),
                     ('imu', imu_topic),

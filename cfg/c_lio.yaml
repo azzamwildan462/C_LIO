@@ -9,7 +9,7 @@
     adaptive: true
 
     # Debug
-    deep_debug/odom: true
+    deep_debug/odom: false
     debug/odom: false
     debug/print_odom: false # Pretty print odom
 

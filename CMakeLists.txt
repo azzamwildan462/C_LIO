@@ -185,6 +185,7 @@ add_library(c_lio_odom_component SHARED
   src/c_lio/odom/odom_relocalization.cc
   src/c_lio/odom/odom_services.cc
   src/c_lio/odom/odom_submap_localization.cc
+  src/c_lio/odom/odom_classic_mode.cc
   src/c_lio/odom/kfdb_io.cc
   src/c_lio/odom/occupancy_grid.cc
   src/c_lio/engines/registration_engine.cc
@@ -193,6 +194,7 @@ add_library(c_lio_odom_component SHARED
   src/c_lio/algorithms/robust_icp.cc
   src/c_lio/algorithms/voxel_hash_map.cc
   src/c_lio/algorithms/error_state_ekf.cc
+  src/c_lio/algorithms/classic_mode_kf.cc
 )
 target_compile_options(c_lio_odom_component PRIVATE ${OpenMP_FLAGS})
 target_compile_definitions(c_lio_odom_component PRIVATE ${_C_LIO_CUDA_DEF})

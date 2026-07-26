@@ -34,10 +34,10 @@
     # extrinsics/baselink2imu/t: [0.990, -0.035, 1.230]
     # extrinsics/baselink2imu/rpy: [0.415, -0.414, 1.369]
     extrinsics/baselink2imu/t: [0.0, 0.0, 0.0]
-    extrinsics/baselink2imu/rpy: [0.0, 0.0, 0.00]
+    extrinsics/baselink2imu/rpy: [0.0, 0.00, 1.57]
 
-    extrinsics/baselink2lidar/t: [0.0, 0.0, 0.0]
-    extrinsics/baselink2lidar/rpy: [0.0, 0.0, 0.0]
+    extrinsics/baselink2lidar/t: [1.33, 0.00, 1.470]
+    extrinsics/baselink2lidar/rpy: [0.0, 0.0698132, 0.0]
 
     extrinsics/baselink2gps/t: [0.00, 0.0, 0.00] # same as IMU (Applanix POS LVX)
     extrinsics/baselink2gps/rpy: [0.0, 0.0, 0.0] # ENU→odom yaw auto-calibrated at startup
@@ -48,6 +48,6 @@
     # --- External velocity source (wheel encoder / INS twist) ---
     # Subscribes to geometry_msgs/msg/TwistWithCovarianceStamped
     # Replaces IMU accelerometer for velocity — gyro still from IMU
-    odom/external_odom/enabled: true
+    odom/external_odom/enabled: false
     odom/external_odom/topic: "/applanix/lvx_client/twist"
     odom/external_odom/odom2meter: [1.0, 1.0, 1.0]

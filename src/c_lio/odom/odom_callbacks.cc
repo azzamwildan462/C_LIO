@@ -550,7 +550,13 @@ void c_lio::OdomNode::callbackPointCloud(const sensor_msgs::msg::PointCloud2::Sh
   // state so the post-reloc submap can't collide with stale float-keyframes,
   // then arm a guess-only relocalization around the clicked pose. Done here on
   // the odometry thread so we don't race the keyframe/submap structures.
-  if (this->request_fresh_reloc_.exchange(false))
+  // SKIPPED entirely in classic mode (submap_method_=="classic") — the
+  // short-circuit means request_fresh_reloc_ is left untouched for
+  // classic_localization_routine() to drain and handle itself (a direct
+  // snap, not this reset+SC-search flow, which would also corrupt the
+  // "local, unrelated-to-map" keyframe pipeline used when
+  // classic_unlocalized_odom_topic_ is empty).
+  if (this->submap_method_ != "classic" && this->request_fresh_reloc_.exchange(false))
   {
     size_t kf_before = 0, kf_after = 0;
     {
@@ -610,8 +616,14 @@ void c_lio::OdomNode::callbackPointCloud(const sensor_msgs::msg::PointCloud2::Sh
                 this->initial_position_[0], this->initial_position_[1]);
   }
 
-  // Scan Context Relocalization (retry up to sc_max_attempts_ scans)
-  if (this->use_prior_map_ && this->relocalize_ && !this->relocalized_ && this->c_lio_initialized && this->first_valid_scan)
+  // Scan Context Relocalization (retry up to sc_max_attempts_ scans). SKIPPED
+  // entirely in classic mode — every branch of this block `return`s, which
+  // would otherwise run SC search against the map on what's supposed to be a
+  // map-agnostic local keyframe pipeline (when classic_unlocalized_odom_
+  // topic_ is empty), and would prevent later code in this function from
+  // running normally.
+  if (this->submap_method_ != "classic" &&
+      this->use_prior_map_ && this->relocalize_ && !this->relocalized_ && this->c_lio_initialized && this->first_valid_scan)
   {
 
     this->sc_attempt_count_++;
@@ -962,20 +974,31 @@ void c_lio::OdomNode::callbackPointCloud(const sensor_msgs::msg::PointCloud2::Sh
   }
   // Capture raw (unfiltered) deskewed scan for graph SLAM SC computation
   pcl::PointCloud<PointType>::ConstPtr raw_deskewed = this->deskewed_scan;
-  // Publish to ROS (detached thread, publish_mtx_ prevents concurrent push_back on path_ros.poses)
-  this->publish_thread = std::thread(&c_lio::OdomNode::publishToROS, this, published_cloud, raw_deskewed, this->T_corr);
-  this->publish_thread.detach();
+  // Publish to ROS (detached thread, publish_mtx_ prevents concurrent push_back on path_ros.poses).
+  // Classic mode: publish from classic_kf_ instead (published_cloud/raw_deskewed
+  // are in the local keyframe pipeline's own T_prior frame, unrelated to
+  // classic_kf_'s pose — see publishClassicToROS()'s comment).
+  if (this->submap_method_ != "classic")
+  {
+    this->publish_thread = std::thread(&c_lio::OdomNode::publishToROS, this, published_cloud, raw_deskewed, this->T_corr);
+    this->publish_thread.detach();
+  }
+  else
+  {
+    this->publishClassicToROS();
+  }
 
   // Store latest scan (sensor/body frame) + its T for continuous localization
   // IMPORTANT: use original_scan (sensor frame), NOT current_scan (odom/world frame).
   // The SC computation in continuousLocalize() assumes body-frame input and applies
   // its own gravity rotation. Using odom-frame scans causes double-rotation → SC fails.
-  if (this->continuous_localize_ || this->occupancy_grid_enabled_ || this->submap_loc_enabled_)
+  if (this->continuous_localize_ || this->occupancy_grid_enabled_ || this->submap_loc_enabled_ || this->submap_method_ == "classic")
   {
     std::lock_guard<std::mutex> lock(this->latest_scan_mtx_);
     this->latest_scan_ = this->original_scan;
     this->latest_scan_T_ = this->T;
     this->latest_scan_time_ = this->now().seconds();
+    this->latest_scan_seq_++;
   }
 
   // Update some statistics

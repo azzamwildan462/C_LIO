@@ -20,8 +20,21 @@ void c_lio::OdomNode::publishPose()
   // callbackPointCloud) pakai geo.mtx. state_mtx_ hanya serialize callback
   // level, TIDAK block propagateState → torn read masih bisa terjadi.
   // Fix: pakai geo.mtx untuk benar-benar exclude IMU propagation writes.
+  //
+  // Classic localization sub-mode: source from classic_kf_ (cls_odom_filtered)
+  // instead — the local keyframe pipeline's own `state` isn't the final
+  // output when classic mode is active (see odom_classic_mode.cc).
   Eigen::Vector3f s_p, s_v_lin_w, s_v_ang_b;
   Eigen::Quaternionf s_q;
+  if (this->submap_method_ == "classic")
+  {
+    std::lock_guard<std::mutex> lock(this->classic_state_mtx_);
+    s_p = this->classic_kf_.position();
+    s_q = this->classic_kf_.orientation();
+    s_v_lin_w = Eigen::Vector3f::Zero();
+    s_v_ang_b = Eigen::Vector3f::Zero();
+  }
+  else
   {
     std::lock_guard<std::mutex> lock(this->geo.mtx);
     s_p = this->state.p;
@@ -382,6 +395,127 @@ void c_lio::OdomNode::publishCloud(pcl::PointCloud<PointType>::ConstPtr publishe
   }
 }
 
+void c_lio::OdomNode::publishClassicToROS()
+{
+  // Clone of publishToROS()/publishCloud(), sourced from classic_kf_
+  // ("cls_odom_filtered") instead of lidarPose/T. Publishes to the SAME
+  // topics/TF frames as the default pipeline — no separate "_classic"
+  // topics — so /odom, /odom_2d (via publishPose()), /path, /deskewed and TF
+  // all reflect classic_kf_ while submap_method_=="classic".
+  Eigen::Vector3f c_p;
+  Eigen::Quaternionf c_q;
+  {
+    std::lock_guard<std::mutex> lock(this->classic_state_mtx_);
+    c_p = this->classic_kf_.position();
+    c_q = this->classic_kf_.orientation();
+  }
+
+  Eigen::Matrix4f T_final = Eigen::Matrix4f::Identity();
+  T_final.block<3, 3>(0, 0) = c_q.toRotationMatrix();
+  T_final.block<3, 1>(0, 3) = c_p;
+
+  // Cloud: use latest_scan_ (raw sensor-frame, NOT current_scan/deskewed_scan
+  // — those are already in the LOCAL keyframe pipeline's own T_prior frame,
+  // unrelated to classic_kf_'s pose).
+  pcl::PointCloud<PointType>::ConstPtr scan_body;
+  {
+    std::lock_guard<std::mutex> lock(this->latest_scan_mtx_);
+    scan_body = this->latest_scan_;
+  }
+  if (scan_body && !scan_body->empty())
+  {
+    pcl::PointCloud<PointType>::Ptr scan_final = std::make_shared<pcl::PointCloud<PointType>>();
+    pcl::transformPointCloud(*scan_body, *scan_final, T_final * this->extrinsics.baselink2lidar_T);
+
+    auto deskewed_ros = std::make_unique<sensor_msgs::msg::PointCloud2>();
+    pcl::toROSMsg(*scan_final, *deskewed_ros);
+    deskewed_ros->header.stamp = this->scan_header_stamp;
+    deskewed_ros->header.frame_id = this->odom_frame;
+    this->deskewed_pub->publish(std::move(deskewed_ros));
+  }
+
+  // Path
+  this->path_ros.header.stamp = this->imu_stamp;
+  this->path_ros.header.frame_id = this->odom_frame;
+
+  geometry_msgs::msg::PoseStamped p;
+  p.header.stamp = this->imu_stamp;
+  p.header.frame_id = this->odom_frame;
+  p.pose.position.x = c_p[0];
+  p.pose.position.y = c_p[1];
+  p.pose.position.z = c_p[2];
+  p.pose.orientation.w = c_q.w();
+  p.pose.orientation.x = c_q.x();
+  p.pose.orientation.y = c_q.y();
+  p.pose.orientation.z = c_q.z();
+
+  {
+    std::lock_guard<std::mutex> lock(this->publish_mtx_);
+    this->path_ros.poses.push_back(p);
+    this->path_pub->publish(this->path_ros);
+  }
+
+  // TF: map->odom (identity — classic_kf_ only tracks one fused pose, no
+  // separate raw-odometry-only estimate to put a real map->odom correction
+  // on) -> base_link (classic pose) -> imu/lidar (static extrinsics, same as
+  // the default pipeline). Broadcasting the odom hop (not just map->baselink
+  // directly) keeps the standard odom->base_link transform other tooling
+  // (RViz TF display, robot_state_publisher) expects.
+  geometry_msgs::msg::TransformStamped tf_map_odom;
+  tf_map_odom.header.stamp = this->imu_stamp;
+  tf_map_odom.header.frame_id = this->map_frame_;
+  tf_map_odom.child_frame_id = this->odom_frame;
+  tf_map_odom.transform.translation.x = 0.0;
+  tf_map_odom.transform.translation.y = 0.0;
+  tf_map_odom.transform.translation.z = 0.0;
+  tf_map_odom.transform.rotation.w = 1.0;
+  tf_map_odom.transform.rotation.x = 0.0;
+  tf_map_odom.transform.rotation.y = 0.0;
+  tf_map_odom.transform.rotation.z = 0.0;
+  this->br->sendTransform(tf_map_odom);
+
+  geometry_msgs::msg::TransformStamped tf_odom_base;
+  tf_odom_base.header.stamp = this->imu_stamp;
+  tf_odom_base.header.frame_id = this->odom_frame;
+  tf_odom_base.child_frame_id = this->baselink_frame;
+  tf_odom_base.transform.translation.x = c_p[0];
+  tf_odom_base.transform.translation.y = c_p[1];
+  tf_odom_base.transform.translation.z = c_p[2];
+  tf_odom_base.transform.rotation.w = c_q.w();
+  tf_odom_base.transform.rotation.x = c_q.x();
+  tf_odom_base.transform.rotation.y = c_q.y();
+  tf_odom_base.transform.rotation.z = c_q.z();
+  this->br->sendTransform(tf_odom_base);
+
+  geometry_msgs::msg::TransformStamped tf_base_imu;
+  tf_base_imu.header.stamp = this->imu_stamp;
+  tf_base_imu.header.frame_id = this->baselink_frame;
+  tf_base_imu.child_frame_id = this->imu_frame;
+  tf_base_imu.transform.translation.x = this->extrinsics.baselink2imu.t[0];
+  tf_base_imu.transform.translation.y = this->extrinsics.baselink2imu.t[1];
+  tf_base_imu.transform.translation.z = this->extrinsics.baselink2imu.t[2];
+  Eigen::Quaternionf q_imu(this->extrinsics.baselink2imu.R);
+  tf_base_imu.transform.rotation.w = q_imu.w();
+  tf_base_imu.transform.rotation.x = q_imu.x();
+  tf_base_imu.transform.rotation.y = q_imu.y();
+  tf_base_imu.transform.rotation.z = q_imu.z();
+  this->br->sendTransform(tf_base_imu);
+
+  geometry_msgs::msg::TransformStamped tf_base_lidar;
+  tf_base_lidar.header.stamp = this->imu_stamp;
+  tf_base_lidar.header.frame_id = this->baselink_frame;
+  tf_base_lidar.child_frame_id = this->lidar_frame;
+  tf_base_lidar.transform.translation.x = this->extrinsics.baselink2lidar.t[0];
+  tf_base_lidar.transform.translation.y = this->extrinsics.baselink2lidar.t[1];
+  tf_base_lidar.transform.translation.z = this->extrinsics.baselink2lidar.t[2];
+  Eigen::Quaternionf q_lidar(this->extrinsics.baselink2lidar.R);
+  tf_base_lidar.transform.rotation.w = q_lidar.w();
+  tf_base_lidar.transform.rotation.x = q_lidar.x();
+  tf_base_lidar.transform.rotation.y = q_lidar.y();
+  tf_base_lidar.transform.rotation.z = q_lidar.z();
+  this->br->sendTransform(tf_base_lidar);
+}
+
 void c_lio::OdomNode::publishKeyframe(std::pair<std::pair<Eigen::Vector3f, Eigen::Quaternionf>, pcl::PointCloud<PointType>::ConstPtr> kf, rclcpp::Time timestamp,
                                       pcl::PointCloud<PointType>::ConstPtr local_cloud)
 {
@@ -487,8 +621,9 @@ void c_lio::OdomNode::applyModeTransition(const std::string &new_mode)
     }
     g_odom_node.store(nullptr); // disable atexit save in localization
 
-    // SC++ automatic correction
-    if (this->continuous_localize_ && this->use_prior_map_)
+    // SC++ automatic correction — classic mode handles its own frozen-map
+    // correction (calc_scan_score()) instead, don't run both.
+    if (this->continuous_localize_ && this->use_prior_map_ && this->submap_method_param_ != "classic")
     {
       if (!this->continuous_localize_timer_)
         this->continuous_localize_timer_ = this->create_wall_timer(
@@ -863,6 +998,17 @@ void c_lio::OdomNode::callbackInitialPose(
     this->initial_position_ = Eigen::Vector3f(static_cast<float>(p.x),
                                               static_cast<float>(p.y), seed_z);
     this->state.q = guess_q; // base orientation for the yaw-sweep hypotheses
+  }
+
+  // Classic mode's own seed orientation — deliberately a SEPARATE variable
+  // from state.q (see classic_seed_q_'s comment in odom.h): state.q gets
+  // overwritten by propagateState()'s continuous 200Hz IMU dead-reckoning
+  // within milliseconds, since that write isn't excluded by state_mtx_
+  // (different mutex, geo.mtx). classic_localization_routine() reads THIS
+  // instead, so the click's orientation actually sticks for classic mode.
+  {
+    std::lock_guard<std::mutex> lock(this->classic_state_mtx_);
+    this->classic_seed_q_ = guess_q;
   }
 
   // Request a FRESH relocalization: the odometry thread will drop live keyframes,
