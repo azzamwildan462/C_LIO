@@ -1014,7 +1014,16 @@ void c_lio::OdomNode::callbackInitialPose(
     std::lock_guard<std::mutex> lock(this->state_mtx_);
     this->initial_position_ = Eigen::Vector3f(static_cast<float>(p.x),
                                               static_cast<float>(p.y), seed_z);
-    this->state.q = guess_q; // base orientation for the yaw-sweep hypotheses
+    // reloc_seed_q_, NOT state.q directly — state.q is racy against
+    // propagateState()'s 200Hz geo.mtx-guarded writes (see reloc_seed_q_'s
+    // comment in odom.h). runRelocalization() and the exhausted-retries
+    // fallback both read reloc_seed_q_ for the click's orientation instead.
+    this->reloc_seed_q_ = guess_q;
+    // initial_yaw_ is in RADIANS (consumed as AngleAxisf(initial_yaw_, UnitZ())
+    // elsewhere) — keep it in sync with the click so the exhausted-retries
+    // fallback's initial_yaw_-based reconstruction matches what was clicked.
+    this->initial_yaw_ = std::atan2(2.f * (guess_q.w() * guess_q.z() + guess_q.x() * guess_q.y()),
+                                    1.f - 2.f * (guess_q.y() * guess_q.y() + guess_q.z() * guess_q.z()));
   }
 
   // Request a FRESH relocalization. For the old pipeline this drops live

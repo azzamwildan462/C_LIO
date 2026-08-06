@@ -20,6 +20,7 @@
     # classic mode still runs, predicting instead from the ORIGINAL keyframe-
     # based local odometry pipeline's own motion (differenced each tick).
     odom/classic/unlocalized_odom_topic: ""
+    # odom/classic/unlocalized_odom_topic: "/hardware/odom"
 
     # How often classic_localization_routine() ticks (Hz). Independent of the
     # LiDAR scan rate.
@@ -29,8 +30,8 @@
     # A registration correction is rejected (predict-only that tick) unless
     # ALL of these pass: GICP converged, fitness score within threshold, AND
     # the correction's translation/rotation jump is within threshold.
-    odom/classic/max_corr_scan_score_threshold: 0.9 # max GICP fitness score (lower = stricter)
-    odom/classic/max_corr_translation: 1.0 # max position jump per correction (m)
+    odom/classic/max_corr_scan_score_threshold: 1.0 # max GICP fitness score (lower = stricter)
+    odom/classic/max_corr_translation: 10.0 # max position jump per correction (m)
     odom/classic/max_corr_rotation_deg: 45.0 # max rotation jump per correction (deg)
 
     # --- Complementary filter blend weight (fuse_odom()) ---

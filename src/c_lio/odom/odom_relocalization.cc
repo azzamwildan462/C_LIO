@@ -399,6 +399,16 @@ bool c_lio::OdomNode::runRelocalization(pcl::PointCloud<PointType>::ConstPtr sca
 
   float refine_radius_sq = 50.f * 50.f;
 
+  // Snapshot the click's orientation once, from reloc_seed_q_ — NOT state.q,
+  // which races against propagateState()'s 200Hz geo.mtx-guarded writes (see
+  // reloc_seed_q_'s comment in odom.h). Used below as the base orientation for
+  // the yaw-sweep GICP hypotheses and the guess-only honor-gate fallback.
+  Eigen::Quaternionf seed_q;
+  {
+    std::lock_guard<std::mutex> lock(this->state_mtx_);
+    seed_q = this->reloc_seed_q_;
+  }
+
   // 4. Build list of candidate positions: initial_position first, then SC candidates
   struct GICPCandidate
   {
@@ -516,10 +526,10 @@ bool c_lio::OdomNode::runRelocalization(pcl::PointCloud<PointType>::ConstPtr sca
 
       // Build init_guess = world_T_lidar = world_T_baselink * baselink_T_lidar
       // raw_scan is in lidar frame; init_guess transforms it to world frame
-      // Note: use state.q (map frame orientation) for GICP, NOT gravity_q (SC frame only)
+      // Note: use seed_q (map frame orientation) for GICP, NOT gravity_q (SC frame only)
       Eigen::Matrix4f world_T_baselink = Eigen::Matrix4f::Identity();
       Eigen::Quaternionf yaw_q(Eigen::AngleAxisf(yaw, Eigen::Vector3f::UnitZ()));
-      Eigen::Quaternionf init_q = yaw_q * this->state.q;
+      Eigen::Quaternionf init_q = yaw_q * seed_q;
       world_T_baselink.block<3, 3>(0, 0) = init_q.toRotationMatrix();
       world_T_baselink.block<3, 1>(0, 3) = matched_pos;
       Eigen::Matrix4f init_guess = world_T_baselink * B2L_T;
@@ -587,7 +597,7 @@ accept_result:
                   "[/initialpose] GICP pulled %.1fm from click (fit=%.3f) — honoring raw click instead",
                   dpos, best_fitness);
       best_pos = this->initial_position_;
-      best_q = this->state.q; // clicked yaw (state.q not yet overwritten here)
+      best_q = seed_q; // clicked yaw, read race-free from reloc_seed_q_
       best_fitness = 0.0f;    // accept the honored click
     }
   }

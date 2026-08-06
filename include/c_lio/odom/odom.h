@@ -772,6 +772,18 @@ private:
   bool use_prior_map_;
   Eigen::Vector3f initial_position_;
   float initial_yaw_;
+  // Orientation seed for the non-classic reloc path, set by callbackInitialPose()
+  // from the /initialpose click's own orientation. Deliberately NOT written into
+  // state.q directly: state.q is also written by propagateState() (200Hz, from
+  // callbackImu()) under geo.mtx, a different mutex than the one guarding this
+  // click handler (state_mtx_) — with no exclusion between the two, the IMU
+  // thread's continuing dead-reckoning clobbers the click's orientation within
+  // milliseconds (this is the exact bug already found and fixed for classic mode
+  // via classic_seed_q_; see its comment below). runRelocalization() and the
+  // exhausted-retries fallback in callbackPointCloud() both read this instead of
+  // state.q so the click's orientation survives regardless of that race.
+  // Protected by state_mtx_.
+  Eigen::Quaternionf reloc_seed_q_ = Eigen::Quaternionf::Identity();
   bool prior_map_pose_set_;
   int num_prior_keyframes_;
 

@@ -36,7 +36,7 @@
     # --- Continuous localization (Bayesian) ---
     map/continuous_localize: true
     map/continuous_localize/on_mapping: false
-    map/continuous_localize/interval: 1.0 # was 2.0 — faster auto-correction (own callback group now, not blocked). Global SC++ reloc needs ~3 ticks → ~3s instead of 6s.
+    map/continuous_localize/interval: 30.0 # was 2.0 — faster auto-correction (own callback group now, not blocked). Global SC++ reloc needs ~3 ticks → ~3s instead of 6s.
     map/continuous_localize/fitness_threshold: 0.30 # was 0.10 — too strict; scan-to-prior-map GICP fitness is ~0.2-0.3, so 0.10 rejected ALL corrections (SC++ never corrected). Bayes filter + g2o still gate bad matches.
     map/continuous_localize/virtual_place_prior: 0.3 # was 0.8 — prior of being in a NEW place. In localization we're ALWAYS in the map, so 0.8 kept P_loop ~0.2 < thr 0.5 → SC++ never promoted a correction. Low prior → P_loop high → SC++ corrects.
     map/continuous_localize/loop_threshold: 0.5

@@ -714,8 +714,24 @@ void c_lio::OdomNode::callbackPointCloud(const sensor_msgs::msg::PointCloud2::Sh
 
       this->state.p = this->initial_position_;
       this->origin = this->initial_position_;
-      Eigen::Quaternionf yaw_q(Eigen::AngleAxisf(this->initial_yaw_, Eigen::Vector3f::UnitZ()));
-      this->state.q = yaw_q * this->state.q;
+      if (this->reloc_guess_only_)
+      {
+        // Servicing an /initialpose click that never converged: honor the
+        // exact clicked orientation from reloc_seed_q_, which is race-free
+        // (see its comment in odom.h) — unlike state.q, which
+        // propagateState() (200Hz) keeps overwriting concurrently, so
+        // recomposing from it here would silently discard the click's yaw.
+        std::lock_guard<std::mutex> lock(this->state_mtx_);
+        this->state.q = this->reloc_seed_q_;
+      }
+      else
+      {
+        // Pure auto-relocalization (no click involved): keep the original
+        // behavior — configured initial_yaw_ on top of state.q's current
+        // gravity-aligned roll/pitch.
+        Eigen::Quaternionf yaw_q(Eigen::AngleAxisf(this->initial_yaw_, Eigen::Vector3f::UnitZ()));
+        this->state.q = yaw_q * this->state.q;
+      }
 
       this->T = Eigen::Matrix4f::Identity();
       this->T.block<3, 3>(0, 0) = this->state.q.toRotationMatrix();
