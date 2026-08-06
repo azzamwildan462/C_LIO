@@ -22,6 +22,13 @@
     odom/classic/unlocalized_odom_topic: ""
     # odom/classic/unlocalized_odom_topic: "/hardware/odom"
 
+    # Multiplier applied to the unlocalized odom's per-tick translation delta
+    # before it's fed into classic mode's predict step. Use to correct a
+    # constant scale error in the odom hardware (e.g. wheel radius
+    # miscalibration making distance traveled read consistently short/long).
+    # 1.0 = no correction.
+    odom/classic/unlocalized_odom_scale: 1.0
+
     # How often classic_localization_routine() ticks (Hz). Independent of the
     # LiDAR scan rate.
     odom/classic/routine_rate_hz: 50.0

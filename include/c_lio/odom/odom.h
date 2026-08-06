@@ -1027,6 +1027,11 @@ private:
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr unlocalized_odom_sub_;
   rclcpp::CallbackGroup::SharedPtr unlocalized_odom_cb_group_;
   std::string classic_unlocalized_odom_topic_ = "";
+  // Multiplier applied to the unlocalized odom's per-tick translation delta
+  // in classic_localization_routine(), to correct a constant scale error in
+  // the odom hardware (e.g. wheel radius miscalibration). 1.0 = no
+  // correction. Rotation delta is left unscaled.
+  double classic_unlocalized_odom_scale_ = 1.0;
   std::mutex classic_unlocalized_odom_mtx_;
   nav_msgs::msg::Odometry::SharedPtr classic_latest_unlocalized_odom_;
   // Plain monotonic counter, incremented in callbackUnlocalizedOdom() each

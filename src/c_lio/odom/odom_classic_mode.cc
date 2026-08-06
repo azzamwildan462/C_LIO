@@ -441,6 +441,10 @@ void c_lio::OdomNode::classic_localization_routine()
 
   Eigen::Isometry3d delta = prev_iso.inverse() * curr_iso;
   Eigen::Vector3f delta_p = delta.translation().cast<float>();
+  // Corrects a constant odom-hardware scale error (e.g. wheel radius
+  // miscalibration); default 1.0 leaves the delta untouched. Rotation is
+  // deliberately not scaled — see classic_unlocalized_odom_scale_'s comment.
+  delta_p *= static_cast<float>(this->classic_unlocalized_odom_scale_);
   Eigen::Quaternionf delta_q(Eigen::Matrix3f(delta.rotation().cast<float>()));
   delta_q.normalize();
 

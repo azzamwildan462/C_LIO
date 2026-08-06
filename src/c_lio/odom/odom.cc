@@ -741,6 +741,7 @@ void c_lio::OdomNode::getParams()
   // unlocalized_odom_topic left "" = no external odometry hardware wired up
   // yet — Case A reads the local keyframe pipeline's own this->T instead.
   c_lio::declare_param(this, "odom/classic/unlocalized_odom_topic", this->classic_unlocalized_odom_topic_, std::string(""));
+  c_lio::declare_param(this, "odom/classic/unlocalized_odom_scale", this->classic_unlocalized_odom_scale_, 1.0);
   c_lio::declare_param(this, "odom/classic/routine_rate_hz", this->classic_routine_rate_hz_, 10.0);
   c_lio::declare_param(this, "odom/classic/max_corr_scan_score_threshold", this->classic_max_corr_scan_score_threshold_, 1.0);
   c_lio::declare_param(this, "odom/classic/max_corr_translation", this->classic_max_corr_translation_, 5.0);
