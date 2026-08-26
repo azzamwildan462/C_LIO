@@ -546,6 +546,41 @@ void c_lio::OdomNode::callbackPointCloud(const sensor_msgs::msg::PointCloud2::Sh
     return;
   }
 
+  // Case B (external unlocalized_odom hardware): the old local GICP pipeline
+  // (this->T/this->state/keyframes/submap, driven by setInputSource()/
+  // getNextPose()/updateState()/buildKeyframesAndSubmap() below) is never
+  // consumed by classic mode's own localization — classic_kf_ predicts from
+  // the external topic instead (see update_unlocalized_odom()'s Case B
+  // branch in odom_classic_mode.cc), and /odom, /odom_2d, /path, /deskewed
+  // all come from classic_kf_ via publishClassicToROS()/publishPose(). Skip
+  // the old pipeline entirely here to avoid burning CPU (GICP scan-to-submap
+  // alignment) on a result nothing reads. Only populate what classic mode's
+  // OWN registration_to_prior_map() actually needs: latest_scan_ (raw) and
+  // latest_scan_deskewed_body_ (this scan, deskewed, transformed back to
+  // body frame via T_prior — the IMU-only prior computed in
+  // preprocessPoints() above; classic's own registration only needs a
+  // roughly-deskewed body-frame cloud, not a globally-correct pose, so this
+  // is fine even though GICP never ran this tick). Case A (topic empty)
+  // takes none of this — the old pipeline keeps running unmodified, since
+  // Case A relies on this->T as its own local motion source.
+  if (this->submap_method_ == "classic" && !this->classic_unlocalized_odom_topic_.empty())
+  {
+    std::lock_guard<std::mutex> lock(this->latest_scan_mtx_);
+    this->latest_scan_ = this->original_scan;
+    if (this->current_scan && !this->current_scan->empty())
+    {
+      auto tmp = std::make_shared<pcl::PointCloud<PointType>>();
+      pcl::transformPointCloud(*this->current_scan, *tmp, this->T_prior.inverse());
+      this->latest_scan_deskewed_body_ = tmp;
+    }
+    this->latest_scan_T_ = this->T;
+    this->latest_scan_time_ = this->now().seconds();
+    this->latest_scan_seq_++;
+    this->prev_scan_stamp = this->scan_stamp;
+    this->main_loop_running = false;
+    return;
+  }
+
   // Fresh relocalization request (RViz 2D Pose Estimate). Wipe live odometry
   // state so the post-reloc submap can't collide with stale float-keyframes,
   // then arm a guess-only relocalization around the clicked pose. Done here on
